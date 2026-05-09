@@ -1,0 +1,60 @@
+name: daily-customs-brief
+
+on:
+  schedule:
+    # 07:00 KST = 22:00 UTC (previous day)
+    - cron: "0 23 * * *"
+  workflow_dispatch:
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Prepare out dir
+        run: |
+          mkdir -p out
+
+      - name: Run script
+        env:
+          SMTP_SERVER: ${{ secrets.SMTP_SERVER }}
+          SMTP_PORT: ${{ secrets.SMTP_PORT }}
+          SMTP_EMAIL: ${{ secrets.SMTP_EMAIL }}
+          SMTP_PASSWORD: ${{ secrets.SMTP_PASSWORD }}
+          RECIPIENTS: ${{ secrets.RECIPIENTS }}
+          RECIPIENTS_EXEC: ${{ secrets.RECIPIENTS_EXEC }}
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+          GEMINI_ENABLED: "1"
+          GEMINI_MODEL: "gemini-1.5-flash"
+          BASE_DIR: ${{ github.workspace }}/out
+          CUSTOM_QUERIES_FILE: ${{ github.workspace }}/custom_queries.TXT
+          SITES_FILE: ${{ github.workspace }}/sites.xlsx
+          WINDOW_START_HOUR_KST: "7"
+          NEWS_LOOKBACK_HOURS: "24"
+          MAX_ITEMS_PER_QUERY: "10"
+        run: |
+          python daily_brief.py
+
+      - name: Upload outputs
+        uses: actions/upload-artifact@v4
+        with:
+          name: outputs-${{ github.run_id }}
+          path: out
+
+      - name: Commit & push outputs to repo
+        run: |
+          git config user.name "actions-user"
+          git config user.email "actions@users.noreply.github.com"
+          git add out || true
+          git commit -m "Daily outputs: $(date -u +%Y-%m-%d)" || echo "No changes"
+          git push
