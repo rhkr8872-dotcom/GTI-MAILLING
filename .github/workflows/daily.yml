@@ -2,7 +2,7 @@ name: daily-customs-brief
 
 on:
   schedule:
-    # 07:00 KST = 22:00 UTC (previous day)
+    # 06:00 KST = 21:00 UTC (previous day)
     - cron: "0 23 * * *"
   workflow_dispatch:
 
@@ -43,7 +43,7 @@ jobs:
           NEWS_LOOKBACK_HOURS: "24"
           MAX_ITEMS_PER_QUERY: "10"
         run: |
-          python daily_brief.py
+          python 7.run_gti_pipeline.py
 
       - name: Upload outputs
         uses: actions/upload-artifact@v4
