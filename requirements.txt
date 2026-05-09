@@ -1,6 +1,0 @@
-pandas
-feedparser
-openpyxl
-requests
-google-generativeai
-beautifulsoup4
