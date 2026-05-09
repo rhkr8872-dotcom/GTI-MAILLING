@@ -4,8 +4,8 @@ r"""
 GTI Radar STEP5 Mail Engine
 
 Input
-- C:\temp\news_raw.xlsx
-- C:\temp\news_cumulative.xlsx (optional)
+- C:\temp\4.news_raw.xlsx
+- C:\temp\4.news_cumulative.xlsx (optional)
 - C:\temp\mail.xlsx (recipient list, optional)
 
 Output
@@ -51,8 +51,8 @@ from openpyxl.utils import get_column_letter
 # 0. CONFIG
 # =========================
 BASE_DIR = r"C:\temp"
-INPUT_RAW = os.path.join(BASE_DIR, "news_raw.xlsx")
-INPUT_CUMULATIVE = os.path.join(BASE_DIR, "news_cumulative.xlsx")
+INPUT_RAW = os.path.join(BASE_DIR, "4.news_raw.xlsx")
+INPUT_CUMULATIVE = os.path.join(BASE_DIR, "4.news_cumulative.xlsx")
 RECIPIENT_FILE = os.path.join(BASE_DIR, "00.xlsx")
 OUTPUT_DIR = BASE_DIR
 MAIL_CUMULATIVE = os.path.join(BASE_DIR, "mail_cumulative.xlsx")
