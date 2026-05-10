@@ -1,6 +1,26 @@
 # =========================================================
 # GTI RSS Collector FINAL (5-COLUMN VERSION)
 # =========================================================
+from pathlib import Path
+
+BASE_DIR = Path(__file__).resolve().parent
+DATA_DIR = BASE_DIR / "data"
+OUT_DIR = BASE_DIR / "output"
+
+OUT_DIR.mkdir(exist_ok=True)
+
+SITE_FILE = DATA_DIR / "site.xlsx"
+KEYWORD_FILE = DATA_DIR / "keyword.xlsx"
+MAIL_FILE = DATA_DIR / "00.xlsx"
+
+RAW1 = OUT_DIR / "1.site_news_raw.xlsx"
+RAW2 = OUT_DIR / "2-1.naver_news_raw.xlsx"
+RAW3 = OUT_DIR / "2-2.google_news_raw.xlsx"
+RAW4 = OUT_DIR / "2-3.rss_news_raw.xlsx"
+
+MERGED = OUT_DIR / "news_ai_summary.xlsx"
+FINAL = OUT_DIR / "news_raw.xlsx"
+
 
 import os
 import re
