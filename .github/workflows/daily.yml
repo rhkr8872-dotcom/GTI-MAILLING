@@ -1,4 +1,4 @@
-name: daily-customs-brief
+name: GTI Daily Mail
 
 on:
   schedule:
@@ -7,54 +7,51 @@ on:
   workflow_dispatch:
 
 jobs:
-  run:
+  run-gti:
     runs-on: ubuntu-latest
+
+    env:
+      GTI_SEND_EMAIL: "Y"
+      GTI_SMTP_USER: ${{ secrets.GTI_SMTP_USER }}
+      GTI_SMTP_PASS: ${{ secrets.GTI_SMTP_PASS }}
+      GTI_MAIL_TO: ${{ secrets.GTI_MAIL_TO }}
+
     steps:
-      - uses: actions/checkout@v4
+      - name: Checkout
+        uses: actions/checkout@v4
 
-      - uses: actions/setup-python@v5
+      - name: Set up Python
+        uses: actions/setup-python@v5
         with:
-          python-version: "3.11"
+          python-version: "3.12"
 
-      - name: Install dependencies
+      - name: Install packages
         run: |
           python -m pip install --upgrade pip
           pip install -r requirements.txt
 
-      - name: Prepare out dir
-        run: |
-          mkdir -p out
+      - name: Run STEP1 site collector
+        run: python "1.site_news_collector.py"
 
-      - name: Run script
-        env:
-          SMTP_SERVER: ${{ secrets.SMTP_SERVER }}
-          SMTP_PORT: ${{ secrets.SMTP_PORT }}
-          SMTP_EMAIL: ${{ secrets.SMTP_EMAIL }}
-          SMTP_PASSWORD: ${{ secrets.SMTP_PASSWORD }}
-          RECIPIENTS: ${{ secrets.RECIPIENTS }}
-          RECIPIENTS_EXEC: ${{ secrets.RECIPIENTS_EXEC }}
-          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
-          GEMINI_ENABLED: "1"
-          GEMINI_MODEL: "gemini-1.5-flash"
-          BASE_DIR: ${{ github.workspace }}/out
-          CUSTOM_QUERIES_FILE: ${{ github.workspace }}/custom_queries.TXT
-          SITES_FILE: ${{ github.workspace }}/sites.xlsx
-          WINDOW_START_HOUR_KST: "7"
-          NEWS_LOOKBACK_HOURS: "24"
-          MAX_ITEMS_PER_QUERY: "10"
-        run: |
-          python 7.run_gti_pipeline.py
+      - name: Run STEP2-1 Naver collector
+        run: python "2-1.naver_news_collector.py"
 
-      - name: Upload outputs
+      - name: Run STEP2-2 Google collector
+        run: python "2-2.google_news_collector.py"
+
+      - name: Run STEP2-3 RSS collector
+        run: python "2-3.rss_news_collector.py"
+
+      - name: Run STEP3 merge
+        run: python "3.merge_news.py"
+
+      - name: Run STEP5 mail engine
+        run: python "5.GTI Mail Engine.py"
+
+      - name: Upload result files
         uses: actions/upload-artifact@v4
         with:
-          name: outputs-${{ github.run_id }}
-          path: out
-
-      - name: Commit & push outputs to repo
-        run: |
-          git config user.name "actions-user"
-          git config user.email "actions@users.noreply.github.com"
-          git add out || true
-          git commit -m "Daily outputs: $(date -u +%Y-%m-%d)" || echo "No changes"
-          git push
+          name: GTI-Radar-Results
+          path: |
+            output/*.xlsx
+            output/*.html
