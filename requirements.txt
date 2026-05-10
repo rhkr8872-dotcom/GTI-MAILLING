@@ -1,0 +1,8 @@
+pandas
+openpyxl
+xlsxwriter
+requests
+beautifulsoup4
+lxml
+feedparser
+python-dateutil
