@@ -28,6 +28,8 @@ Input
 - C:\temp\4.news_cumulative.xlsx (optional)
 - C:\temp\00.xlsx or C:\temp\mail.xlsx (recipient list, optional)
 
+INPUT_FILE = OUT_DIR / "news_raw.xlsx"
+
 Output
 - C:\temp\GTI_Radar_YYYY-MM-DD_Top25.xlsx
 - C:\temp\GTI_Radar_YYYY-MM-DD_Top25_Email.html
