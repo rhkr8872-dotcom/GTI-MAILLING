@@ -15,7 +15,7 @@ print("🚀 GTI STEP2 GOOGLE RSS START v2.1")
 
 # =====================================================
 
-BASE_DIR = Path(**file**).resolve().parent
+BASE_DIR = Path(__file__).resolve().parent
 
 DATA_DIR = BASE_DIR / "data"
 OUTPUT_DIR = BASE_DIR / "output"
