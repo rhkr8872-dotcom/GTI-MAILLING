@@ -27,7 +27,9 @@ from difflib import SequenceMatcher
 from sklearn.feature_extraction.text import TfidfVectorizer
 from sklearn.metrics.pairwise import cosine_similarity
 
-BASE_DIR = r"C:\temp"
+from pathlib import Path
+
+BASE_DIR = Path(".")
 
 INPUT_FILES = [
     "1.site_news_raw.xlsx",
