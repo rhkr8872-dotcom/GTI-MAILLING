@@ -43,7 +43,9 @@ from bs4 import BeautifulSoup, XMLParsedAsHTMLWarning
 
 warnings.filterwarnings("ignore", category=XMLParsedAsHTMLWarning)
 
-BASE_DIR = Path(r"C:\temp")
+from pathlib import Path
+
+BASE_DIR = Path(".")
 SITE_FILE = BASE_DIR / "sites.xlsx"
 OUT_FILE = BASE_DIR / "1.site_news_raw.xlsx"
 REJECT_FILE = BASE_DIR / "1.site_news_reject_debug.xlsx"
