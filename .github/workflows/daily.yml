@@ -3,7 +3,7 @@ name: run-gti
 on:
   workflow_dispatch:
   schedule:
-    - cron: "0 21 * * *"
+    - cron: "0 21 * * *" # Korea 06:00
 
 jobs:
   run-gti:
@@ -17,19 +17,25 @@ jobs:
       GTI_SMTP_USER: ${{ secrets.GTI_SMTP_USER }}
       GTI_SMTP_PASS: ${{ secrets.GTI_SMTP_PASS }}
       GTI_MAIL_TO: ${{ secrets.GTI_MAIL_TO }}
+      NAVER_CLIENT_ID: ${{ secrets.NAVER_CLIENT_ID }}
+      NAVER_CLIENT_SECRET: ${{ secrets.NAVER_CLIENT_SECRET }}
+      SERPAPI_KEY: ${{ secrets.SERPAPI_KEY }}
+      GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
 
     steps:
-      - uses: actions/checkout@v4
+      - name: Checkout
+        uses: actions/checkout@v4
 
-      - uses: actions/setup-python@v5
+      - name: Setup Python
+        uses: actions/setup-python@v5
         with:
           python-version: "3.12"
 
-      - name: Show files
+      - name: Show repository files
         run: |
           pwd
-          ls -la
-          find . -maxdepth 2 -type f | sort
+          echo "===== FILE LIST ====="
+          find . -maxdepth 3 -type f | sort
 
       - name: Install packages
         run: |
@@ -48,21 +54,40 @@ jobs:
             python "1.site_news_collector.py"
           else
             echo "❌ STEP1 파일 없음"
-            ls -la
-            exit 2
+            find . -maxdepth 2 -type f | sort
+            exit 1
           fi
 
       - name: Run STEP2-1 Naver
         run: |
-          if [ -f "2-1.naver_news_collector.py" ]; then python "2-1.naver_news_collector.py"; else echo "STEP2-1 skip"; fi
+          if [ -f "2-1.naver_news_collector.py" ]; then
+            python "2-1.naver_news_collector.py"
+          else
+            echo "STEP2-1 skip"
+          fi
 
       - name: Run STEP2-2 Google
         run: |
-          if [ -f "2-2.google_news_collector.py" ]; then python "2-2.google_news_collector.py"; else echo "STEP2-2 skip"; fi
+          if [ -f "2-2.google_news_collector.py" ]; then
+            python "2-2.google_news_collector.py"
+          else
+            echo "STEP2-2 skip"
+          fi
 
       - name: Run STEP2-3 RSS
         run: |
-          if [ -f "2-3.rss_news_collector.py" ]; then python "2-3.rss_news_collector.py"; else echo "STEP2-3 skip"; fi
+          if [ -f "2-3.rss_news_collector.py" ]; then
+            python "2-3.rss_news_collector.py"
+          else
+            echo "STEP2-3 skip"
+          fi
+
+      - name: Show output after STEP1-2
+        if: always()
+        run: |
+          echo "===== OUTPUT AFTER STEP1-2 ====="
+          ls -la output || true
+          find output -maxdepth 1 -type f | sort || true
 
       - name: Run STEP3
         run: |
@@ -70,8 +95,23 @@ jobs:
             python "3.merge_news.py"
           else
             echo "❌ STEP3 파일 없음"
-            ls -la
-            exit 2
+            find . -maxdepth 2 -type f | sort
+            exit 1
+          fi
+
+      - name: Check STEP3 result
+        run: |
+          echo "===== OUTPUT BEFORE STEP5 ====="
+          ls -la output || true
+          find output -maxdepth 1 -type f | sort || true
+
+          if [ ! -f "output/3.news_ai_summary.xlsx" ] && \
+             [ ! -f "output/news_ai_summary.xlsx" ] && \
+             [ ! -f "output/4.news_raw.xlsx" ] && \
+             [ ! -f "output/news_raw.xlsx" ]; then
+            echo "❌ STEP5 입력파일 없음"
+            echo "STEP3가 news_ai_summary.xlsx 또는 news_raw.xlsx를 만들지 못했습니다."
+            exit 1
           fi
 
       - name: Run STEP5
@@ -80,14 +120,22 @@ jobs:
             python "5.GTI Mail Engine.py"
           else
             echo "❌ STEP5 파일 없음"
-            ls -la
-            exit 2
+            find . -maxdepth 2 -type f | sort
+            exit 1
           fi
 
-      - uses: actions/upload-artifact@v4
+      - name: Show final output files
         if: always()
+        run: |
+          echo "===== FINAL OUTPUT FILES ====="
+          ls -la output || true
+          find output -maxdepth 2 -type f | sort || true
+
+      - name: Upload result files
+        if: always()
+        uses: actions/upload-artifact@v4
         with:
           name: GTI-result
           path: |
-            output/*.xlsx
-            output/*.html
+            output/**
+          if-no-files-found: warn
