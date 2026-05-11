@@ -35,7 +35,9 @@ print("🚀 GTI STEP2 GOOGLE RSS START v2.0")
 # =============================
 # PATH
 # =============================
-BASE_PATH = "C:\\temp\\"
+from pathlib import Path
+
+BASE_DIR = Path(".")
 KEYWORD_FILE = BASE_PATH + "keyword.xlsx"
 RAW_FILE = BASE_PATH + "2-2.google_news_raw.xlsx"
 
