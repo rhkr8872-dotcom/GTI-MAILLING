@@ -1,23 +1,3 @@
-from pathlib import Path
-
-BASE_DIR = Path(__file__).resolve().parent
-DATA_DIR = BASE_DIR / "data"
-OUT_DIR = BASE_DIR / "output"
-
-OUT_DIR.mkdir(exist_ok=True)
-
-SITE_FILE = DATA_DIR / "site.xlsx"
-KEYWORD_FILE = DATA_DIR / "keyword.xlsx"
-MAIL_FILE = DATA_DIR / "00.xlsx"
-
-RAW1 = OUT_DIR / "1.site_news_raw.xlsx"
-RAW2 = OUT_DIR / "2-1.naver_news_raw.xlsx"
-RAW3 = OUT_DIR / "2-2.google_news_raw.xlsx"
-RAW4 = OUT_DIR / "2-3.rss_news_raw.xlsx"
-
-MERGED = OUT_DIR / "news_ai_summary.xlsx"
-FINAL = OUT_DIR / "news_raw.xlsx"
-
 # -*- coding: utf-8 -*-
 r"""
 5.GTI Mail Engine.py
@@ -57,6 +37,8 @@ Environment Variables
 
 from __future__ import annotations
 
+from pathlib import Path
+
 import os
 import re
 import ssl
@@ -73,21 +55,47 @@ from openpyxl import Workbook
 from openpyxl.styles import Font, PatternFill, Border, Side, Alignment
 
 # =========================
-# 0. CONFIG
+# 0. CONFIG - GitHub / Windows 공통 상대경로
 # =========================
-BASE_DIR = r"C:\temp"
-INPUT_RAW = os.path.join(BASE_DIR, "news_raw.xlsx")
-INPUT_CUMULATIVE = os.path.join(BASE_DIR, "news_cumulative.xlsx")
-RECIPIENT_FILE_1 = os.path.join(BASE_DIR, "00.xlsx")
-RECIPIENT_FILE_2 = os.path.join(BASE_DIR, "mail.xlsx")
-OUTPUT_DIR = BASE_DIR
-MAIL_CUMULATIVE = os.path.join(BASE_DIR, "mail_cumulative.xlsx")
+BASE_DIR = Path(__file__).resolve().parent
+DATA_DIR = BASE_DIR / "data"
+OUTPUT_DIR = BASE_DIR / "output"
+
+DATA_DIR.mkdir(exist_ok=True)
+OUTPUT_DIR.mkdir(exist_ok=True)
+
+# STEP5 입력 우선순위
+# 1) STEP3 결과: output/3.news_ai_summary.xlsx
+# 2) STEP3 호환: output/news_ai_summary.xlsx
+# 3) STEP4 결과: output/4.news_raw.xlsx
+# 4) STEP4 호환: output/news_raw.xlsx
+INPUT_CANDIDATES = [
+    OUTPUT_DIR / "3.news_ai_summary.xlsx",
+    OUTPUT_DIR / "news_ai_summary.xlsx",
+    OUTPUT_DIR / "4.news_raw.xlsx",
+    OUTPUT_DIR / "news_raw.xlsx",
+]
+
+def find_input_file() -> Path:
+    for fp in INPUT_CANDIDATES:
+        if fp.exists():
+            return fp
+    raise FileNotFoundError(
+        "STEP5 입력 파일 없음. 아래 파일 중 하나가 필요합니다:\n"
+        + "\n".join(str(x) for x in INPUT_CANDIDATES)
+    )
+
+INPUT_RAW = find_input_file()
+INPUT_CUMULATIVE = OUTPUT_DIR / "news_cumulative.xlsx"
+RECIPIENT_FILE_1 = DATA_DIR / "00.xlsx"
+RECIPIENT_FILE_2 = DATA_DIR / "mail.xlsx"
+MAIL_CUMULATIVE = OUTPUT_DIR / "mail_cumulative.xlsx"
 
 TODAY = datetime.now().strftime("%Y-%m-%d")
 SUBJECT = f"[GTI Radar] Global Trade Intelligence | {TODAY}"
 
-OUTPUT_XLSX = os.path.join(OUTPUT_DIR, f"GTI_Radar_{TODAY}_Top25.xlsx")
-OUTPUT_HTML = os.path.join(OUTPUT_DIR, f"GTI_Radar_{TODAY}_Top25_Email.html")
+OUTPUT_XLSX = OUTPUT_DIR / f"GTI_Radar_{TODAY}_Top25.xlsx"
+OUTPUT_HTML = OUTPUT_DIR / f"GTI_Radar_{TODAY}_Top25_Email.html"
 
 SMTP_HOST = os.getenv("GTI_SMTP_HOST", "smtp.naver.com")
 SMTP_PORT = int(os.getenv("GTI_SMTP_PORT", "465"))
@@ -598,7 +606,7 @@ def load_recipients() -> list[str]:
 def send_email(html_body: str, attachments: list[str]) -> None:
     recipients = load_recipients()
     if not recipients:
-        print("[MAIL SKIP] 수신자 없음: C:\\temp\\00.xlsx 또는 C:\\temp\\mail.xlsx 또는 GTI_MAIL_TO 환경변수를 확인하세요.")
+        print("[MAIL SKIP] 수신자 없음: data/00.xlsx 또는 data/mail.xlsx 또는 GTI_MAIL_TO 환경변수를 확인하세요.")
         return
     if not SMTP_USER or not SMTP_PASS:
         print("[MAIL SKIP] SMTP 계정/비밀번호 없음: GTI_SMTP_USER/GTI_SMTP_PASS 또는 GTI_MAIL_ID/GTI_MAIL_PW 환경변수를 설정하세요.")
@@ -649,12 +657,11 @@ def update_mail_cumulative(top25: pd.DataFrame) -> None:
 # 7. MAIN
 # =========================
 def main() -> None:
-    print("[START] GTI Mail Engine")
+    print("[START] GTI Mail Engine - GitHub Compatible FINAL")
     print(f"[DEBUG] GTI_SEND_EMAIL={os.getenv('GTI_SEND_EMAIL')}, SEND_EMAIL={SEND_EMAIL}")
     print(f"[DEBUG] SMTP_USER={SMTP_USER if SMTP_USER else 'NONE'}, SMTP_PASS={'OK' if SMTP_PASS else 'NONE'}")
 
-    if not os.path.exists(INPUT_RAW):
-        raise FileNotFoundError(f"입력 파일 없음: {INPUT_RAW}")
+    print(f"[INPUT SELECTED] {INPUT_RAW}")
 
     raw = pd.read_excel(INPUT_RAW)
     print(f"[LOAD] {INPUT_RAW} rows={len(raw)}")
@@ -662,7 +669,7 @@ def main() -> None:
     top25 = prepare_top25(raw)
     print(f"[SELECT] Top rows={len(top25)}")
 
-    os.makedirs(OUTPUT_DIR, exist_ok=True)
+    OUTPUT_DIR.mkdir(exist_ok=True)
     save_excel(top25, OUTPUT_XLSX)
     print(f"[SAVE] Excel: {OUTPUT_XLSX}")
 
