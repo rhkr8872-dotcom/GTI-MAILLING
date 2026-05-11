@@ -1,205 +1,126 @@
-# =========================================================
-# GTI STEP2 - GOOGLE NEWS RAW (RSS ONLY FINAL v2.0)
-# 기존 Form 유지 + Keyword Metadata 추가
-# =========================================================
+# 2-2.google_news_collector.py
+
+# GitHub / Windows Compatible FINAL
 
 from pathlib import Path
-
-BASE_DIR = Path(__file__).resolve().parent
-DATA_DIR = BASE_DIR / "data"
-OUT_DIR = BASE_DIR / "output"
-
-OUT_DIR.mkdir(exist_ok=True)
-
-SITE_FILE = DATA_DIR / "site.xlsx"
-KEYWORD_FILE = DATA_DIR / "keyword.xlsx"
-MAIL_FILE = DATA_DIR / "00.xlsx"
-
-RAW1 = OUT_DIR / "1.site_news_raw.xlsx"
-RAW2 = OUT_DIR / "2-1.naver_news_raw.xlsx"
-RAW3 = OUT_DIR / "2-2.google_news_raw.xlsx"
-RAW4 = OUT_DIR / "2-3.rss_news_raw.xlsx"
-
-MERGED = OUT_DIR / "news_ai_summary.xlsx"
-FINAL = OUT_DIR / "news_raw.xlsx"
-
-
 import pandas as pd
-import re
-from datetime import datetime, timedelta
 import feedparser
-from urllib.parse import quote
+from datetime import datetime
 
-print("🚀 GTI STEP2 GOOGLE RSS START v2.0")
+print("🚀 GTI STEP2 GOOGLE RSS START v2.1")
 
-# =============================
-# PATH
-# =============================
-from pathlib import Path
+# =====================================================
 
-BASE_DIR = Path(".")
-KEYWORD_FILE = BASE_PATH + "keyword.xlsx"
-RAW_FILE = BASE_PATH + "2-2.google_news_raw.xlsx"
+# PATH CONFIG
 
-# =============================
-# CLEAN
-# =============================
-def clean_html(text):
-    return re.sub("<.*?>", "", str(text)).strip()
+# =====================================================
 
-def is_recent(dt):
-    return dt >= datetime.now() - timedelta(days=1)
+BASE_DIR = Path(**file**).resolve().parent
 
-def extract_publisher(title):
-    """
-    Google News RSS title 예:
-    'Police probe major customs data breach - The Times of India'
-    """
-    try:
-        if " - " in title:
-            return title.split(" - ")[-1].strip()
-        return ""
-    except:
-        return ""
+DATA_DIR = BASE_DIR / "data"
+OUTPUT_DIR = BASE_DIR / "output"
 
-def get_google_locale(language):
-    lang = str(language).upper().strip()
+DATA_DIR.mkdir(exist_ok=True)
+OUTPUT_DIR.mkdir(exist_ok=True)
 
-    locale_map = {
-        "EN": {"hl": "en", "gl": "US", "ceid": "US:en"},
-        "KR": {"hl": "ko", "gl": "KR", "ceid": "KR:ko"},
-        "CN": {"hl": "zh-CN", "gl": "CN", "ceid": "CN:zh-Hans"},
-        "ES": {"hl": "es", "gl": "ES", "ceid": "ES:es"},
-        "PT": {"hl": "pt", "gl": "BR", "ceid": "BR:pt-419"},
-        "TR": {"hl": "tr", "gl": "TR", "ceid": "TR:tr"},
-        "VI": {"hl": "vi", "gl": "VN", "ceid": "VN:vi"},
-        "HI": {"hl": "hi", "gl": "IN", "ceid": "IN:hi"},
-    }
+KEYWORD_FILE = DATA_DIR / "keyword.xlsx"
+OUTPUT_FILE = OUTPUT_DIR / "2-2.google_news_raw.xlsx"
 
-    return locale_map.get(lang, locale_map["EN"])
+# =====================================================
 
-# =============================
-# KEYWORD LOAD
-# =============================
-keywords = pd.read_excel(KEYWORD_FILE)
+# LOAD KEYWORDS
 
-# 컬럼명 정리
-keywords.columns = [str(c).strip().lower() for c in keywords.columns]
+# =====================================================
 
-required_cols = ["keyword", "language", "category", "importance", "active"]
-for col in required_cols:
-    if col not in keywords.columns:
-        raise Exception(f"❌ KEYWORD 파일 필수 컬럼 없음: {col}")
+if not KEYWORD_FILE.exists():
+raise FileNotFoundError(f"❌ keyword file not found: {KEYWORD_FILE}")
 
-# active = Y 만 사용
-keywords = keywords[keywords["active"].astype(str).str.upper().str.strip() == "Y"]
+kw_df = pd.read_excel(KEYWORD_FILE)
 
-# keyword 공백 제거
-keywords = keywords.dropna(subset=["keyword"])
-keywords["keyword"] = keywords["keyword"].astype(str).str.strip()
-keywords = keywords[keywords["keyword"] != ""]
+keyword_col = None
 
-print(f"🔎 active keywords: {len(keywords)}")
+for c in kw_df.columns:
+if str(c).strip().lower() in [
+"keyword",
+"keywords",
+"키워드"
+]:
+keyword_col = c
+break
 
-# =============================
+if keyword_col is None:
+keyword_col = kw_df.columns[0]
+
+keywords = (
+kw_df[keyword_col]
+.dropna()
+.astype(str)
+.str.strip()
+.unique()
+.tolist()
+)
+
+print(f"✅ Keywords Loaded: {len(keywords)}")
+
+# =====================================================
+
 # GOOGLE RSS COLLECT
-# =============================
-def collect_google_rss():
-    results = []
 
-    for _, row in keywords.iterrows():
-        kw = str(row.get("keyword", "")).strip()
-        lang = str(row.get("language", "EN")).strip().upper()
-        category = str(row.get("category", "")).strip()
-        importance = str(row.get("importance", "")).strip()
+# =====================================================
 
-        locale = get_google_locale(lang)
+rows = []
 
-        query = quote(kw)
-        rss_url = (
-            f"https://news.google.com/rss/search?"
-            f"q={query}"
-            f"&hl={locale['hl']}"
-            f"&gl={locale['gl']}"
-            f"&ceid={locale['ceid']}"
-        )
+for kw in keywords:
 
-        feed = feedparser.parse(rss_url)
+```
+try:
 
-        for entry in feed.entries:
-            try:
-                dt = datetime(*entry.published_parsed[:6])
-            except:
-                dt = datetime.now()
+    rss_url = (
+        "https://news.google.com/rss/search?q="
+        + kw
+        + "&hl=ko&gl=KR&ceid=KR:ko"
+    )
 
-            title = clean_html(entry.title)
-            publisher = extract_publisher(title)
+    feed = feedparser.parse(rss_url)
 
-            results.append({
-                "date": dt,
-                "title": title,
-                "url": entry.link,
-                "source": entry.link,
-                "collected_at": datetime.now(),
+    print(f"🔍 {kw} → {len(feed.entries)}")
 
-                # 추가 컬럼
-                "keyword": kw,
-                "language": lang,
-                "publisher": publisher,
-                "category": category,
-                "importance": importance
-            })
+    for e in feed.entries:
 
-    print(f"🟢 GOOGLE RSS collected: {len(results)}")
-    return results
+        rows.append({
+            "date": getattr(e, "published", ""),
+            "title": getattr(e, "title", ""),
+            "url": getattr(e, "link", ""),
+            "source": "GoogleNews",
+            "keyword": kw,
+            "collected_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        })
 
-# =============================
-# MAIN
-# =============================
-data = collect_google_rss()
-df = pd.DataFrame(data)
+except Exception as ex:
+    print(f"❌ ERROR {kw}: {ex}")
+```
 
-if df.empty:
-    print("❌ No data collected")
-    df = pd.DataFrame(columns=[
-        "date", "title", "url", "source", "collected_at",
-        "keyword", "language", "publisher", "category", "importance"
-    ])
-    df.to_excel(RAW_FILE, index=False)
-    print("💾 saved empty file:", RAW_FILE)
-    raise SystemExit
+# =====================================================
 
-print(f"📊 TOTAL RAW: {len(df)}")
+# SAVE
 
-# 24시간 필터
-before_24h = len(df)
-df = df[df["date"].apply(is_recent)]
-print(f"📊 24h FILTER: {before_24h} → {len(df)}")
+# =====================================================
 
-# URL 중복 제거
-before_dedup = len(df)
-df = df.drop_duplicates(subset=["url"])
-print(f"📊 URL DEDUP: {before_dedup} → {len(df)}")
+df = pd.DataFrame(rows)
 
-# 최종 컬럼 순서
-final_cols = [
-    "date",
-    "title",
-    "url",
-    "source",
-    "collected_at",
-    "keyword",
-    "language",
-    "publisher",
-    "category",
-    "importance"
-]
+if len(df) == 0:
+print("❌ No Google news collected")
+else:
 
-df = df[final_cols]
+```
+df = df.drop_duplicates(
+    subset=["title"]
+).reset_index(drop=True)
 
-# 저장
-df.to_excel(RAW_FILE, index=False)
+df.to_excel(OUTPUT_FILE, index=False)
 
-print("💾 saved:", RAW_FILE)
-print(f"✅ FINAL SAVE ROWS: {len(df)}")
-print("✅ GOOGLE RSS DONE v2.0")
+print(f"✅ SAVED: {OUTPUT_FILE}")
+print(f"✅ ROWS : {len(df)}")
+```
+
+print("🏁 GTI STEP2 GOOGLE RSS END")
