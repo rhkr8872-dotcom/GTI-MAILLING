@@ -16,5 +16,6 @@ def run(script: str) -> None:
 
 
 if __name__ == "__main__":
+    run("1.collect_gti_news.py")
     run("4.policy_ai_analyzer.py")
     run("5.GTI_Mail_Engine.py")
