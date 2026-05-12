@@ -15,12 +15,19 @@ jobs:
     env:
       GTI_BASE_DIR: data
       GTI_OUTPUT_DIR: outputs
+      GTI_LOOKBACK_HOURS: "24"
+      GTI_MAX_PER_SOURCE: "50"
       GTI_SEND_EMAIL: ${{ secrets.GTI_SEND_EMAIL }}
       GTI_SMTP_HOST: ${{ secrets.GTI_SMTP_HOST }}
       GTI_SMTP_PORT: ${{ secrets.GTI_SMTP_PORT }}
       GTI_SMTP_USER: ${{ secrets.GTI_SMTP_USER }}
       GTI_SMTP_PASS: ${{ secrets.GTI_SMTP_PASS }}
       GTI_MAIL_TO: ${{ secrets.GTI_MAIL_TO }}
+      NAVER_CLIENT_ID: ${{ secrets.NAVER_CLIENT_ID }}
+      NAVER_CLIENT_SECRET: ${{ secrets.NAVER_CLIENT_SECRET }}
+      SERPAPI_KEY: ${{ secrets.SERPAPI_KEY }}
+      NEWS_API: ${{ secrets.NEWS_API }}
+      NEWS_KEY: ${{ secrets.NEWS_KEY }}
       GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
       GEMINI_MODEL: ${{ secrets.GEMINI_MODEL }}
 
