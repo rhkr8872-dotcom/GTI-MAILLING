@@ -42,12 +42,15 @@ jobs:
 
       - name: Install dependencies
         run: pip install -r requirements.txt
-          
-      - name: Run GTI PIPELINE
+
+      - name: RUN GTI PIPELINE
         run: python 7.run_gti_pipeline.py
 
-      - name: Upload GTI outputs
         uses: actions/upload-artifact@v4
         with:
           name: gti-radar-output
           path: outputs/
+          name: RUN GTI PIPELINE
+          run: python 7.run_gti_pipeline.py
+```
+
