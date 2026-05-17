@@ -2,7 +2,6 @@ name: GTI Daily Mail
 
 on:
   schedule:
-    # 06:00 KST = 21:00 UTC on the previous day
     - cron: "0 21 * * *"
   push:
     branches: [ "main" ]
@@ -50,12 +49,24 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r requirements.txt
 
+      - name: Prepare folders
+        run: |
+          mkdir -p outputs
+          mkdir -p logs
+          echo "PWD:"
+          pwd
+          echo "Repository files:"
+          ls -la
+
       - name: RUN GTI PIPELINE
-        run: python 7.run_gti_pipeline.py
+        run: |
+          python 7.run_gti_pipeline.py 2>&1 | tee logs/gti_pipeline_error.log
 
       - name: Upload Artifacts
         if: always()
         uses: actions/upload-artifact@v4
         with:
           name: gti-radar-output
-          path: outputs/
+          path: |
+            outputs/
+            logs/
