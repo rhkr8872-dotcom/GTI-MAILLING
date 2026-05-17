@@ -12,26 +12,30 @@ env:
 
 jobs:
   gti-mail:
-    runs-on: ubuntu-latest
+    runs-on: windows-latest
+
     permissions:
       contents: read
 
     env:
-      GTI_BASE_DIR: data
+      GTI_BASE_DIR: C:\temp
       GTI_OUTPUT_DIR: outputs
       GTI_LOOKBACK_HOURS: "24"
       GTI_MAX_PER_SOURCE: "50"
+
       GTI_SEND_EMAIL: ${{ secrets.GTI_SEND_EMAIL }}
       GTI_SMTP_HOST: ${{ secrets.GTI_SMTP_HOST }}
       GTI_SMTP_PORT: ${{ secrets.GTI_SMTP_PORT }}
       GTI_SMTP_USER: ${{ secrets.GTI_SMTP_USER }}
       GTI_SMTP_PASS: ${{ secrets.GTI_SMTP_PASS }}
       GTI_MAIL_TO: ${{ secrets.GTI_MAIL_TO }}
+
       NAVER_CLIENT_ID: ${{ secrets.NAVER_CLIENT_ID }}
       NAVER_CLIENT_SECRET: ${{ secrets.NAVER_CLIENT_SECRET }}
       SERPAPI_KEY: ${{ secrets.SERPAPI_KEY }}
       NEWS_API: ${{ secrets.NEWS_API }}
       NEWS_KEY: ${{ secrets.NEWS_KEY }}
+
       GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
       GEMINI_MODEL: ${{ secrets.GEMINI_MODEL }}
 
@@ -42,25 +46,28 @@ jobs:
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
-          python-version: "3.11"
+          python-version: "3.12"
+
+      - name: Create folders
+        run: |
+          mkdir C:\temp
+          mkdir C:\temp\logs
+          mkdir outputs
 
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
           pip install -r requirements.txt
 
-      - name: Prepare folders
+      - name: Show Files
         run: |
-          mkdir -p outputs
-          mkdir -p logs
-          echo "PWD:"
-          pwd
-          echo "Repository files:"
-          ls -la
+          dir
+          echo ======================
+          dir C:\temp
 
       - name: RUN GTI PIPELINE
         run: |
-          python 7.run_gti_pipeline.py 2>&1 | tee logs/gti_pipeline_error.log
+          python 7.run_gti_pipeline.py
 
       - name: Upload Artifacts
         if: always()
@@ -68,5 +75,5 @@ jobs:
         with:
           name: gti-radar-output
           path: |
-            outputs/
-            logs/
+            outputs
+            C:\temp\logs
