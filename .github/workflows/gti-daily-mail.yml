@@ -5,6 +5,15 @@ on:
     # 06:00 KST = 21:00 UTC on the previous day
     - cron: "0 21 * * *"
   workflow_dispatch:
+on:
+  # 기존에 있던 push나 schedule 설정
+  push:
+    branches: [ "main" ]
+  
+  # 수동 실행 버튼을 활성화하는 코드 (아무 옵션을 적지 않아도 됩니다)
+  workflow_dispatch: 
+
+jobs:
 
 jobs:
   gti-mail:
