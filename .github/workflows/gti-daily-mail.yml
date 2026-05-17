@@ -4,16 +4,9 @@ on:
   schedule:
     # 06:00 KST = 21:00 UTC on the previous day
     - cron: "0 21 * * *"
-  workflow_dispatch:
-on:
-  # 기존에 있던 push나 schedule 설정
   push:
     branches: [ "main" ]
-  
-  # 수동 실행 버튼을 활성화하는 코드 (아무 옵션을 적지 않아도 됩니다)
-  workflow_dispatch: 
-
-jobs:
+  workflow_dispatch: # 수동 실행 버튼 활성화
 
 jobs:
   gti-mail:
@@ -55,11 +48,8 @@ jobs:
       - name: RUN GTI PIPELINE
         run: python 7.run_gti_pipeline.py
 
+      - name: Upload Artifacts
         uses: actions/upload-artifact@v4
         with:
           name: gti-radar-output
           path: outputs/
-          name: RUN GTI PIPELINE
-          run: python 7.run_gti_pipeline.py
-```
-
