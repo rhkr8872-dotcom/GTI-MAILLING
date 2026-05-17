@@ -48,6 +48,10 @@ jobs:
         with:
           python-version: "3.12"
 
+      - name: Copy Python Files
+        run: |
+          copy *.py C:\temp\
+          
       - name: Create folders
         run: |
           mkdir C:\temp
