@@ -48,15 +48,18 @@ jobs:
         with:
           python-version: "3.12"
 
+      - name: Create folders
+        shell: cmd
+        run: |
+          if not exist C:\temp mkdir C:\temp
+          if not exist C:\temp\logs mkdir C:\temp\logs
+          if not exist C:\temp\archive mkdir C:\temp\archive
+          if not exist outputs mkdir outputs
+
       - name: Copy Python Files
+        shell: cmd
         run: |
           copy *.py C:\temp\
-          
-      - name: Create folders
-        run: |
-          mkdir C:\temp
-          mkdir C:\temp\logs
-          mkdir outputs
 
       - name: Install dependencies
         run: |
@@ -64,14 +67,16 @@ jobs:
           pip install -r requirements.txt
 
       - name: Show Files
+        shell: cmd
         run: |
           dir
           echo ======================
           dir C:\temp
 
       - name: RUN GTI PIPELINE
+        shell: cmd
         run: |
-          python 7.run_gti_pipeline.py
+          python C:\temp\7.run_gti_pipeline.py
 
       - name: Upload Artifacts
         if: always()
@@ -81,3 +86,4 @@ jobs:
           path: |
             outputs
             C:\temp\logs
+            C:\temp\archive
