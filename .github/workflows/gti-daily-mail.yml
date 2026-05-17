@@ -9,6 +9,8 @@ on:
 
 env:
   FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+  PYTHONIOENCODING: utf-8
+  PYTHONUTF8: "1"
 
 jobs:
   gti-mail:
@@ -55,6 +57,8 @@ jobs:
           if not exist C:\temp\logs mkdir C:\temp\logs
           if not exist C:\temp\archive mkdir C:\temp\archive
           if not exist outputs mkdir outputs
+          if not exist outputs\logs mkdir outputs\logs
+          if not exist outputs\archive mkdir outputs\archive
 
       - name: Copy Python Files
         shell: cmd
@@ -78,12 +82,16 @@ jobs:
         run: |
           python C:\temp\7.run_gti_pipeline.py
 
+      - name: Copy logs to outputs
+        if: always()
+        shell: cmd
+        run: |
+          xcopy C:\temp\logs outputs\logs\ /E /I /Y
+          xcopy C:\temp\archive outputs\archive\ /E /I /Y
+
       - name: Upload Artifacts
         if: always()
         uses: actions/upload-artifact@v4
         with:
           name: gti-radar-output
-          path: |
-            outputs
-            C:\temp\logs
-            C:\temp\archive
+          path: outputs
