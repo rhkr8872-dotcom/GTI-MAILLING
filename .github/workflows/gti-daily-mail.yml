@@ -60,12 +60,17 @@ jobs:
           if not exist outputs\logs mkdir outputs\logs
           if not exist outputs\archive mkdir outputs\archive
 
-      - name: Copy Python Files
+      - name: Copy GTI Files
         shell: cmd
         run: |
           copy *.py C:\temp\
+          if exist *.xlsx copy *.xlsx C:\temp\
+          if exist *.csv copy *.csv C:\temp\
+          if exist *.json copy *.json C:\temp\
+          if exist *.txt copy *.txt C:\temp\
 
       - name: Install dependencies
+        shell: cmd
         run: |
           python -m pip install --upgrade pip
           pip install -r requirements.txt
@@ -73,21 +78,26 @@ jobs:
       - name: Show Files
         shell: cmd
         run: |
+          echo ===== Repository Files =====
           dir
-          echo ======================
+          echo ===== C:\temp Files =====
           dir C:\temp
 
       - name: RUN GTI PIPELINE
         shell: cmd
         run: |
-          python C:\temp\7.run_gti_pipeline.py
+          python C:\temp\7.run_gti_pipeline.py > outputs\pipeline_console.log 2>&1
+          type outputs\pipeline_console.log
 
-      - name: Copy logs to outputs
+      - name: Copy results to outputs
         if: always()
         shell: cmd
         run: |
-          xcopy C:\temp\logs outputs\logs\ /E /I /Y
-          xcopy C:\temp\archive outputs\archive\ /E /I /Y
+          if exist C:\temp\logs xcopy C:\temp\logs outputs\logs\ /E /I /Y
+          if exist C:\temp\archive xcopy C:\temp\archive outputs\archive\ /E /I /Y
+          if exist C:\temp\*.xlsx copy C:\temp\*.xlsx outputs\
+          if exist C:\temp\*.html copy C:\temp\*.html outputs\
+          if exist C:\temp\*.log copy C:\temp\*.log outputs\logs\
 
       - name: Upload Artifacts
         if: always()
