@@ -1,29 +1,10 @@
 # -*- coding: utf-8 -*-
-# GTI STEP1 FINAL - sites.xlsx 운영형
-# input : C:\temp\sites.xlsx
-# output: C:\temp\1.site_news_raw.xlsx
-# form  : date / title / url / source / collected_at / agency
-
-from pathlib import Path
-
-BASE_DIR = Path(__file__).resolve().parent
-DATA_DIR = BASE_DIR / "data"
-OUT_DIR = BASE_DIR / "output"
-
-OUT_DIR.mkdir(exist_ok=True)
-
-SITE_FILE = DATA_DIR / "site.xlsx"
-KEYWORD_FILE = DATA_DIR / "keyword.xlsx"
-MAIL_FILE = DATA_DIR / "00.xlsx"
-
-RAW1 = OUT_DIR / "1.site_news_raw.xlsx"
-RAW2 = OUT_DIR / "2-1.naver_news_raw.xlsx"
-RAW3 = OUT_DIR / "2-2.google_news_raw.xlsx"
-RAW4 = OUT_DIR / "2-3.rss_news_raw.xlsx"
-
-MERGED = OUT_DIR / "news_ai_summary.xlsx"
-FINAL = OUT_DIR / "news_raw.xlsx"
-
+"""
+GTI STEP1 FINAL COMPLETE
+- sites.xlsx 기반 글로벌 관세/통상 사이트 수집
+- output: C:\temp\1.site_news_raw.xlsx
+- columns: date / title / url / source / collected_at / agency / date_status
+"""
 
 import re
 import time
@@ -43,15 +24,14 @@ from bs4 import BeautifulSoup, XMLParsedAsHTMLWarning
 
 warnings.filterwarnings("ignore", category=XMLParsedAsHTMLWarning)
 
-from pathlib import Path
-
-BASE_DIR = Path(".")
+BASE_DIR = Path(r"C:\temp")
 SITE_FILE = BASE_DIR / "sites.xlsx"
 OUT_FILE = BASE_DIR / "1.site_news_raw.xlsx"
 REJECT_FILE = BASE_DIR / "1.site_news_reject_debug.xlsx"
 
-DAYS_BACK = 7
+HOURS_BACK = 24
 MAX_PER_SITE = 20
+SLEEP_SEC = 0.5
 
 results = []
 rejects = []
@@ -66,22 +46,46 @@ BAD_TITLE_CONTAINS = [
     "관보보기", "일자별 기간별", "마이페이지", "관심 관보",
     "발행예고보기", "내일관보", "관보분석",
     "등록·채용 신고", "관세사 · 법인 징계현황",
-    "개인정보처리방침", "이메일무단수집거부"
+    "개인정보처리방침", "이메일무단수집거부",
+    "copyright", "sitemap", "language", "print", "share",
+    "Policies, Procedures and Directives",
+    "General Aviation Airport Fact Sheets",
+    "Media Releases",
+    "Announcements",
+    "Spotlights",
+    "Press Officers",
+    "Social Media Directory",
+    "Accountability and Transparency",
+    "FOIA Reading Room",
+    "Stats and Summaries",
+    "Documents Library",
+    "Legal Notices",
+    "Frontline Digital Magazine",
+    "Comunicados de Prensa",
+    "Publications Catalog",
+    "최초 사용자", "가이드", "공직자 재산공개", "병역사항 공개",
+    "관인", "목차 다운로드", "전체 다운로드", "타임스탬프"
 ]
 
 BAD_TITLE_EXACT = {
     "", "-", "0", "new", "more", "보기", "상세보기", "검색",
     "공지사항", "보도자료", "고시", "공고", "훈령", "예규",
-    "뉴스", "news", "home", "menu", "목록"
+    "뉴스", "news", "home", "menu", "목록", "english", "한국어",
+    "media releases", "announcements", "spotlights", "press officers"
 }
 
 TRADE_WORDS = [
     "관세", "통관", "수입", "수출", "무역", "통상", "고시", "공고",
     "훈령", "예규", "입법예고", "행정예고", "FTA", "원산지",
     "customs", "tariff", "trade", "import", "export", "notice",
-    "regulation", "announcement", "directive", "policy"
+    "regulation", "announcement", "directive", "policy",
+    "news", "press", "release", "commission", "investigation"
 ]
 
+
+# =========================================================
+# Common utils
+# =========================================================
 
 def clean_text(value: str) -> str:
     return re.sub(r"\s+", " ", unescape(str(value))).strip()
@@ -91,7 +95,7 @@ def now_str() -> str:
     return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
 
-def is_active_value(value) -> bool:
+def is_active_value(value):
     if pd.isna(value):
         return False
     if isinstance(value, (int, float)):
@@ -118,6 +122,7 @@ def normalize_date(value):
 
 def extract_date_from_text(text):
     text = clean_text(text)
+    now = datetime.now()
 
     patterns = [
         r"(20\d{2}[-/.]\s*\d{1,2}[-/.]\s*\d{1,2}\s+\d{1,2}:\d{2}(:\d{2})?)",
@@ -125,8 +130,11 @@ def extract_date_from_text(text):
         r"(20\d{2}\.\s*\d{1,2}\.\s*\d{1,2}\.?)",
         r"(20\d{2}년\s*\d{1,2}월\s*\d{1,2}일)",
         r"([A-Z][a-z]{2,9}\s+\d{1,2},\s*20\d{2})",
+        r"([A-Z][a-z]{2,9}\s+\d{1,2}\s+20\d{2})",
         r"(\d{1,2}\s+[A-Z][a-z]{2,9}\s+20\d{2})",
         r"(\d{1,2}\s+[A-Z][a-z]{2,9},?\s+20\d{2})",
+        r"(\d{1,2}-[A-Z][a-z]{2}-\d{2,4})",
+        r"(\d{1,2}-[A-Z][a-z]{2,9}-\d{2,4})",
     ]
 
     for p in patterns:
@@ -140,6 +148,20 @@ def extract_date_from_text(text):
         dt = normalize_date(s)
         if dt is not None:
             return dt
+
+    m = re.search(r"(\d{1,2})\s*월\s*(\d{1,2})\s*일", text)
+    if m:
+        try:
+            return datetime(now.year, int(m.group(1)), int(m.group(2)))
+        except Exception:
+            return None
+
+    m = re.search(r"(^|\s)(\d{1,2})[./-](\d{1,2})(\s|$)", text)
+    if m:
+        try:
+            return datetime(now.year, int(m.group(2)), int(m.group(3)))
+        except Exception:
+            return None
 
     return None
 
@@ -177,12 +199,25 @@ def extract_date_from_tag(tag):
     return extract_date_from_text(tag.get_text(" ", strip=True))
 
 
+def find_date_near_anchor(a):
+    cur = a
+    for _ in range(7):
+        if cur is None:
+            break
+        text = clean_text(cur.get_text(" ", strip=True))
+        dt = extract_date_from_text(text)
+        if dt:
+            return dt
+        cur = cur.find_parent(["tr", "li", "div", "article", "section"])
+    return None
+
+
 def is_recent(dt):
     if dt is None:
         return False
-    cutoff = datetime.now() - timedelta(days=DAYS_BACK)
     if isinstance(dt, date) and not isinstance(dt, datetime):
         dt = datetime.combine(dt, datetime.min.time())
+    cutoff = datetime.now() - timedelta(hours=HOURS_BACK)
     return dt >= cutoff
 
 
@@ -200,7 +235,6 @@ def is_valid_title(title):
         return False
     if any(x.lower() in low for x in BAD_TITLE_CONTAINS):
         return False
-
     return True
 
 
@@ -235,20 +269,20 @@ def add_result(date_value, title, url, source, agency):
         dt = extract_date_from_text(str(date_value))
 
     if dt is None:
-        add_reject("no_date", date_value, title, url, source, agency)
-        return False
-
-    if not is_recent(dt):
-        add_reject("old_date", date_value, title, url, source, agency)
-        return False
+        date_out = ""
+        date_status = "no_date"
+    else:
+        date_out = dt.strftime("%Y-%m-%d %H:%M:%S") if isinstance(dt, datetime) else dt.strftime("%Y-%m-%d")
+        date_status = "recent" if is_recent(dt) else "old_date"
 
     results.append({
-        "date": dt.strftime("%Y-%m-%d"),
+        "date": date_out,
         "title": title,
         "url": url,
         "source": source,
         "collected_at": now_str(),
-        "agency": agency
+        "agency": agency,
+        "date_status": date_status
     })
     return True
 
@@ -262,10 +296,11 @@ def fetch_html(url):
                 "Accept-Language": "ko-KR,ko;q=0.9,en-US;q=0.8",
                 "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
             },
-            timeout=20,
+            timeout=25,
         )
         if r.status_code >= 400:
             return None
+        r.encoding = r.apparent_encoding or r.encoding
         return r
     except Exception:
         return None
@@ -311,6 +346,68 @@ def find_best_anchor(container, base_url, href_keyword=None):
 
     return None, None
 
+
+def crawl_fallback_links(source_url, agency, allow_keywords=None, block_keywords=None):
+    before = len(results)
+
+    res = fetch_html(source_url)
+    if not res:
+        return 0
+
+    soup = BeautifulSoup(res.text, "html.parser")
+    count = 0
+
+    allow_keywords = allow_keywords or []
+    block_keywords = block_keywords or BAD_TITLE_CONTAINS
+
+    for a in soup.find_all("a", href=True):
+        title = clean_text(a.get_text(" ", strip=True))
+        href = a.get("href", "")
+        link = urljoin(source_url, href)
+
+        if not is_valid_title(title):
+            continue
+
+        if any(b.lower() in title.lower() for b in block_keywords):
+            continue
+
+        if any(b.lower() in link.lower() for b in [
+            "facebook", "twitter", "youtube", "instagram",
+            "linkedin", "blog.naver.com"
+        ]):
+            continue
+
+        check_text = (title + " " + link).lower()
+
+        if allow_keywords:
+            if not any(k.lower() in check_text for k in allow_keywords):
+                continue
+
+        post_date = find_date_near_anchor(a)
+
+        if add_result(post_date, title, link, source_url, agency):
+            count += 1
+
+        if count >= MAX_PER_SITE:
+            break
+
+    return len(results) - before
+
+
+def crawl_site_hint(row, source_url, agency):
+    for col in ["최근게시일", "latest_date", "last_post_date"]:
+        if col in row.index and str(row.get(col, "")).strip():
+            hint_date = row.get(col, "")
+            title = f"{agency} 최신 게시물 확인 필요"
+            before = len(results)
+            add_result(hint_date, title, source_url, source_url, agency)
+            return len(results) - before
+    return 0
+
+
+# =========================================================
+# Korea Customs parser
+# =========================================================
 
 KOREA_LIST_URL = "https://www.customs.go.kr/kcs/na/ntt/selectNttList.do"
 KOREA_DETAIL_URL = "https://www.customs.go.kr/kcs/na/ntt/selectNttInfo.do"
@@ -460,8 +557,19 @@ def crawl_korea(source_url, agency):
     except Exception as e:
         print("   ERROR:", e)
 
+    if len(results) - before == 0:
+        return crawl_fallback_links(
+            source_url,
+            agency,
+            allow_keywords=["ntt", "notice", "공지", "공고", "보도", "행정", "fta", "customs"]
+        )
+
     return len(results) - before
 
+
+# =========================================================
+# Generic parsers
+# =========================================================
 
 def crawl_rss(source_url, agency):
     before = len(results)
@@ -492,6 +600,13 @@ def crawl_rss(source_url, agency):
         dt = date_tag.get_text(strip=True) if date_tag else ""
         add_result(dt, title, urljoin(source_url, link), source_url, agency)
 
+    if len(results) - before == 0:
+        return crawl_fallback_links(
+            source_url,
+            agency,
+            allow_keywords=["news", "notice", "공지", "공고", "rss", "article"]
+        )
+
     return len(results) - before
 
 
@@ -510,10 +625,7 @@ def crawl_table(source_url, agency):
         if len(row_text) < 15:
             continue
 
-        post_date = extract_date_from_tag(row)
-        if post_date is None:
-            continue
-
+        post_date = extract_date_from_tag(row) or extract_date_from_text(row_text)
         title, link = find_best_anchor(row, source_url)
         if not title or not link:
             continue
@@ -530,10 +642,7 @@ def crawl_table(source_url, agency):
             if len(text) < 20:
                 continue
 
-            post_date = extract_date_from_tag(tag)
-            if post_date is None:
-                continue
-
+            post_date = extract_date_from_tag(tag) or extract_date_from_text(text)
             title, link = find_best_anchor(tag, source_url)
             if not title or not link:
                 continue
@@ -543,6 +652,13 @@ def crawl_table(source_url, agency):
 
             if count >= MAX_PER_SITE:
                 break
+
+    if len(results) - before == 0:
+        return crawl_fallback_links(
+            source_url,
+            agency,
+            allow_keywords=["법령", "고시", "공고", "시행", "개정", "law", "notice", "news", "article", "research", "kctdi"]
+        )
 
     return len(results) - before
 
@@ -562,13 +678,75 @@ def crawl_card(source_url, agency):
         if len(text) < 20:
             continue
 
-        post_date = extract_date_from_tag(c)
-        if post_date is None:
-            continue
-
+        post_date = extract_date_from_tag(c) or extract_date_from_text(text)
         title, link = find_best_anchor(c, source_url)
         if not title or not link:
             continue
+
+        if add_result(post_date, title, link, source_url, agency):
+            count += 1
+
+        if count >= MAX_PER_SITE:
+            break
+
+    if len(results) - before == 0:
+        return crawl_fallback_links(
+            source_url,
+            agency,
+            allow_keywords=["news", "notice", "customs", "announcement", "trade", "tariff", "article", "press", "release"]
+        )
+
+    return len(results) - before
+
+
+# =========================================================
+# Site-specific parsers
+# =========================================================
+
+def crawl_cbp(source_url, agency):
+    before = len(results)
+
+    res = fetch_html(source_url)
+    if not res:
+        return 0
+
+    soup = BeautifulSoup(res.text, "html.parser")
+    count = 0
+    seen = set()
+
+    for a in soup.find_all("a", href=True):
+        title = clean_text(a.get_text(" ", strip=True))
+        href = a.get("href", "")
+        link = urljoin(source_url, href)
+        link_l = link.lower()
+
+        if not is_valid_title(title):
+            continue
+
+        if "/newsroom/" not in link_l:
+            continue
+
+        if not (
+            "/national-media-release/" in link_l
+            or "/local-media-release/" in link_l
+            or "/media-release/" in link_l
+            or "/frontline/" in link_l
+        ):
+            continue
+
+        if any(b.lower() in title.lower() for b in BAD_TITLE_CONTAINS):
+            continue
+
+        post_date = find_date_near_anchor(a)
+        if post_date is None:
+            parent = a.find_parent(["tr", "li", "div", "article", "section"])
+            if parent:
+                post_date = extract_date_from_text(parent.get_text(" ", strip=True))
+
+        key = title + link
+        if key in seen:
+            continue
+        seen.add(key)
 
         if add_result(post_date, title, link, source_url, agency):
             count += 1
@@ -581,7 +759,6 @@ def crawl_card(source_url, agency):
 
 def crawl_ustr(source_url, agency):
     before = len(results)
-
     res = fetch_html(source_url)
     if not res:
         return 0
@@ -591,9 +768,6 @@ def crawl_ustr(source_url, agency):
 
     for c in soup.find_all(["article", "li", "div", "tr"]):
         post_date = extract_date_from_tag(c)
-        if post_date is None:
-            continue
-
         title, link = find_best_anchor(c, source_url, "/press-releases/")
         if not title:
             continue
@@ -604,35 +778,28 @@ def crawl_ustr(source_url, agency):
         if count >= MAX_PER_SITE:
             break
 
-    return len(results) - before
-
-
-def crawl_cbp(source_url, agency):
-    before = len(results)
-
-    res = fetch_html(source_url)
-    if not res:
-        return 0
-
-    soup = BeautifulSoup(res.text, "html.parser")
-    count = 0
-
-    for c in soup.find_all(["article", "li", "div", "tr"]):
-        post_date = extract_date_from_tag(c)
-        if post_date is None:
-            continue
-
-        title, link = find_best_anchor(c, source_url, "/newsroom/")
-        if not title:
-            continue
-
-        if add_result(post_date, title, link, source_url, agency):
-            count += 1
-
-        if count >= MAX_PER_SITE:
-            break
+    if len(results) - before == 0:
+        return crawl_fallback_links(
+            source_url,
+            agency,
+            allow_keywords=["press-releases", "trade", "tariff", "ustr", "news"]
+        )
 
     return len(results) - before
+
+
+def crawl_wto(source_url, agency):
+    if "rss" in source_url.lower() or source_url.lower().endswith(".xml"):
+        return crawl_rss(source_url, agency)
+
+    count = crawl_table(source_url, agency)
+    if count == 0:
+        return crawl_fallback_links(
+            source_url,
+            agency,
+            allow_keywords=["news", "news_e", "trade", "wto"]
+        )
+    return count
 
 
 def crawl_eu(source_url, agency):
@@ -640,7 +807,6 @@ def crawl_eu(source_url, agency):
         return crawl_rss(source_url, agency)
 
     before = len(results)
-
     res = fetch_html(source_url)
     if not res:
         return 0
@@ -650,9 +816,6 @@ def crawl_eu(source_url, agency):
 
     for c in soup.find_all(["article", "li", "div", "section"]):
         post_date = extract_date_from_tag(c)
-        if post_date is None:
-            continue
-
         title, link = find_best_anchor(c, source_url)
         if not title:
             continue
@@ -663,13 +826,14 @@ def crawl_eu(source_url, agency):
         if count >= MAX_PER_SITE:
             break
 
+    if len(results) - before == 0:
+        return crawl_fallback_links(
+            source_url,
+            agency,
+            allow_keywords=["news", "taxation", "customs", "trade", "article"]
+        )
+
     return len(results) - before
-
-
-def crawl_wto(source_url, agency):
-    if "rss" in source_url.lower() or source_url.lower().endswith(".xml"):
-        return crawl_rss(source_url, agency)
-    return crawl_table(source_url, agency)
 
 
 def crawl_gwanbo(source_url, agency):
@@ -681,18 +845,26 @@ def crawl_gwanbo(source_url, agency):
 
     soup = BeautifulSoup(res.text, "html.parser")
     text = clean_text(soup.get_text("\n", strip=True))
+
     page_date = extract_date_from_text(text) or datetime.now()
+
+    bad_words = [
+        "최초 사용자", "가이드", "공직자 재산공개", "병역사항 공개",
+        "관인", "마이페이지", "관보보기", "관보분석", "관심 관보",
+        "일자별", "기간별", "호수별", "인기관보", "정정관보",
+        "취소관보", "목차 다운로드", "전체 다운로드", "타임스탬프"
+    ]
 
     patterns = [
         r"(법률제\d+호\s*\([^)]+\))",
         r"(대통령령제\d+호\s*\([^)]+\))",
         r"(총리령제\d+호\s*\([^)]+\))",
-        r"(부령제\d+호\s*\([^)]+\))",
+        r"([가-힣]+령제\d+호\s*\([^)]+\))",
         r"([가-힣]+부령제\d+호\s*\([^)]+\))",
-        r"(고시제[\d\-]+호\s*\([^)]+\))",
-        r"(공고제[\d\-]+호\s*\([^)]+\))",
-        r"(훈령제\d+호\s*\([^)]+\))",
-        r"(예규제\d+호\s*\([^)]+\))",
+        r"([가-힣]+고시제[\d\-]+호\s*[^\n]{0,120})",
+        r"([가-힣]+공고제[\d\-]+호\s*[^\n]{0,120})",
+        r"([가-힣]+훈령제\d+호\s*[^\n]{0,120})",
+        r"([가-힣]+예규제\d+호\s*[^\n]{0,120})",
     ]
 
     seen = set()
@@ -700,11 +872,30 @@ def crawl_gwanbo(source_url, agency):
     for p in patterns:
         for m in re.finditer(p, text):
             title = clean_text(m.group(1))
+
+            if any(b in title for b in bad_words):
+                continue
+
+            if len(title) < 10:
+                continue
+
+            title = re.split(
+                r"(헌법|법률|조약|대통령령|총리령|부령|고시|공고|국회|법원|상훈|기타)\s*총\s*\d+건",
+                title
+            )[0].strip()
+
             if title in seen:
                 continue
+
             seen.add(title)
 
-            add_result(page_date, title, source_url, source_url, agency)
+            add_result(
+                date_value=page_date,
+                title=title,
+                url=source_url,
+                source=source_url,
+                agency=agency
+            )
 
             if len(seen) >= MAX_PER_SITE:
                 break
@@ -714,7 +905,6 @@ def crawl_gwanbo(source_url, agency):
 
 def crawl_motie(source_url, agency):
     before = len(results)
-
     res = fetch_html(source_url)
     if not res:
         return 0
@@ -728,9 +918,7 @@ def crawl_motie(source_url, agency):
     ]
 
     for row in soup.find_all(["tr", "li", "div", "article"]):
-        post_date = extract_date_from_tag(row)
-        if post_date is None:
-            continue
+        post_date = extract_date_from_tag(row) or extract_date_from_text(row.get_text(" ", strip=True))
 
         for a in row.find_all("a", href=True):
             title = clean_text(a.get_text(" ", strip=True))
@@ -753,12 +941,51 @@ def crawl_motie(source_url, agency):
         if count >= MAX_PER_SITE:
             break
 
+    if len(results) - before == 0:
+        return crawl_fallback_links(
+            source_url,
+            agency,
+            allow_keywords=["/kor/article/", "article", "보도", "고시", "공고", "입법", "행정", "훈령", "예규"]
+        )
+
     return len(results) - before
+
+
+def crawl_custra(source_url, agency):
+    count = crawl_table(source_url, agency)
+    if count == 0:
+        return crawl_fallback_links(
+            source_url,
+            agency,
+            allow_keywords=["research", "kctdi", "관세", "무역", "통상", "보고서", "동향", "customs", "trade"]
+        )
+    return count
+
+
+def crawl_oecd(source_url, agency):
+    count = crawl_card(source_url, agency)
+    if count == 0:
+        return crawl_fallback_links(
+            source_url,
+            agency,
+            allow_keywords=["news", "press", "trade", "oecd", "tax", "policy"]
+        )
+    return count
+
+
+def crawl_usitc(source_url, agency):
+    count = crawl_card(source_url, agency)
+    if count == 0:
+        return crawl_fallback_links(
+            source_url,
+            agency,
+            allow_keywords=["news", "release", "commission", "notice", "usitc", "investigation"]
+        )
+    return count
 
 
 def crawl_law(source_url, agency):
     before = len(results)
-
     res = fetch_html(source_url)
     if not res:
         return 0
@@ -776,9 +1003,7 @@ def crawl_law(source_url, agency):
         if len(row_text) < 15:
             continue
 
-        post_date = extract_date_from_tag(row)
-        if post_date is None:
-            continue
+        post_date = extract_date_from_tag(row) or extract_date_from_text(row_text)
 
         if not any(k in row_text for k in law_keywords):
             continue
@@ -787,21 +1012,24 @@ def crawl_law(source_url, agency):
         if not title or not link:
             continue
 
-        if not any(k in title for k in law_keywords):
-            continue
-
         if add_result(post_date, title, link, source_url, agency):
             count += 1
 
         if count >= MAX_PER_SITE:
             break
 
+    if len(results) - before == 0:
+        return crawl_fallback_links(
+            source_url,
+            agency,
+            allow_keywords=["law", "법률", "시행령", "시행규칙", "고시", "훈령", "예규", "행정규칙", "공포", "개정"]
+        )
+
     return len(results) - before
 
 
 def crawl_krcaa(source_url, agency):
     before = len(results)
-
     res = fetch_html(source_url)
     if not res:
         return 0
@@ -821,9 +1049,7 @@ def crawl_krcaa(source_url, agency):
     ]
 
     for row in soup.find_all(["tr", "li", "div"]):
-        post_date = extract_date_from_tag(row)
-        if post_date is None:
-            continue
+        post_date = extract_date_from_tag(row) or extract_date_from_text(row.get_text(" ", strip=True))
 
         title, link = find_best_anchor(row, source_url)
         if not title or not link:
@@ -841,12 +1067,23 @@ def crawl_krcaa(source_url, agency):
         if count >= MAX_PER_SITE:
             break
 
+    if len(results) - before == 0:
+        return crawl_fallback_links(
+            source_url,
+            agency,
+            allow_keywords=["notify", "공지", "뉴스", "관세", "세관", "customs"]
+        )
+
     return len(results) - before
 
 
 def crawl_generic(source_url, agency):
     return crawl_card(source_url, agency)
 
+
+# =========================================================
+# Parser router
+# =========================================================
 
 def infer_parser(site_type, parser):
     p = str(parser or "").strip().lower()
@@ -875,6 +1112,12 @@ def infer_parser(site_type, parser):
         return "law_parser"
     if t == "krcaa":
         return "krcaa_parser"
+    if t == "custra":
+        return "custra_parser"
+    if t == "oecd":
+        return "oecd_parser"
+    if t == "usitc":
+        return "usitc_parser"
     if t == "table":
         return "table_date"
 
@@ -888,6 +1131,10 @@ def get_status(count):
         return "CHECK"
     return "OK"
 
+
+# =========================================================
+# MAIN
+# =========================================================
 
 def main():
     print("🚀 GTI STEP1 SITES MODE START")
@@ -961,6 +1208,12 @@ def main():
                 count = crawl_law(source_url, agency)
             elif parser == "krcaa_parser":
                 count = crawl_krcaa(source_url, agency)
+            elif parser == "custra_parser":
+                count = crawl_custra(source_url, agency)
+            elif parser == "oecd_parser":
+                count = crawl_oecd(source_url, agency)
+            elif parser == "usitc_parser":
+                count = crawl_usitc(source_url, agency)
             elif parser == "table_date":
                 count = crawl_table(source_url, agency)
             else:
@@ -969,6 +1222,12 @@ def main():
         except Exception as e:
             print("   ERROR:", e)
             count = 0
+
+        if count == 0:
+            hint_count = crawl_site_hint(row, source_url, agency)
+            if hint_count > 0:
+                print(f"   [HINT FALLBACK] 최근게시일 기준 {hint_count}건")
+                count = hint_count
 
         print(f" → {count}건")
 
@@ -981,8 +1240,10 @@ def main():
         sites.at[idx, "last_checked"] = now_str()
         sites.at[idx, "status"] = get_status(count)
 
+        time.sleep(SLEEP_SEC)
+
     df = pd.DataFrame(results, columns=[
-        "date", "title", "url", "source", "collected_at", "agency"
+        "date", "title", "url", "source", "collected_at", "agency", "date_status"
     ])
 
     raw_count = len(df)
@@ -1001,7 +1262,7 @@ def main():
     final_count = len(df)
     dup_removed = raw_count - final_count
 
-    df = df[["date", "title", "url", "source", "collected_at", "agency"]]
+    df = df[["date", "title", "url", "source", "collected_at", "agency", "date_status"]]
 
     try:
         df.to_excel(OUT_FILE, index=False)

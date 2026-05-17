@@ -1,24 +1,3 @@
-from pathlib import Path
-
-BASE_DIR = Path(__file__).resolve().parent
-DATA_DIR = BASE_DIR / "data"
-OUT_DIR = BASE_DIR / "output"
-
-OUT_DIR.mkdir(exist_ok=True)
-
-SITE_FILE = DATA_DIR / "site.xlsx"
-KEYWORD_FILE = DATA_DIR / "keyword.xlsx"
-MAIL_FILE = DATA_DIR / "00.xlsx"
-
-RAW1 = OUT_DIR / "1.site_news_raw.xlsx"
-RAW2 = OUT_DIR / "2-1.naver_news_raw.xlsx"
-RAW3 = OUT_DIR / "2-2.google_news_raw.xlsx"
-RAW4 = OUT_DIR / "2-3.rss_news_raw.xlsx"
-
-MERGED = OUT_DIR / "news_ai_summary.xlsx"
-FINAL = OUT_DIR / "news_raw.xlsx"
-
-
 import os
 import re
 import pandas as pd
@@ -27,9 +6,7 @@ from difflib import SequenceMatcher
 from sklearn.feature_extraction.text import TfidfVectorizer
 from sklearn.metrics.pairwise import cosine_similarity
 
-from pathlib import Path
-
-BASE_DIR = Path(".")
+BASE_DIR = r"C:\temp"
 
 INPUT_FILES = [
     "1.site_news_raw.xlsx",
@@ -44,12 +21,13 @@ KEYWORD_CANDIDATES = [
     "keyword.xlsx"
 ]
 
-RAW_FILE = os.path.join(BASE_DIR, "3.news_master_raw.xlsx")
+RAW_FILE = os.path.join(BASE_DIR, "news_master_raw.xlsx")
 SUMMARY_FILE = os.path.join(BASE_DIR, "3.news_ai_summary.xlsx")
-CUMULATIVE_FILE = os.path.join(BASE_DIR, "3.news_ai_cumulative.xlsx")
+CUMULATIVE_FILE = os.path.join(BASE_DIR, "news_ai_cumulative.xlsx")
 
 MAX_OUTPUT = 200
 RECENT_HOURS = 24
+
 TITLE_SIM_THRESHOLD = 0.86
 COSINE_SIM_THRESHOLD = 0.78
 CUMULATIVE_SIM_THRESHOLD = 0.92
@@ -57,8 +35,10 @@ CUMULATIVE_SIM_THRESHOLD = 0.92
 
 def load_data():
     dfs = []
+
     for file_name in INPUT_FILES:
         path = os.path.join(BASE_DIR, file_name)
+
         if os.path.exists(path):
             df = pd.read_excel(path)
             df["source_file"] = file_name
@@ -76,6 +56,7 @@ def load_keywords():
 
     for file_name in KEYWORD_CANDIDATES:
         path = os.path.join(BASE_DIR, file_name)
+
         if not os.path.exists(path):
             continue
 
@@ -84,7 +65,14 @@ def load_keywords():
 
         for col in df.columns:
             if "keyword" in col:
-                keywords = df[col].dropna().astype(str).str.strip().str.lower().tolist()
+                keywords = (
+                    df[col]
+                    .dropna()
+                    .astype(str)
+                    .str.strip()
+                    .str.lower()
+                    .tolist()
+                )
                 print(f"keyword file loaded: {file_name} / keywords={len(keywords)}")
                 break
 
@@ -92,16 +80,12 @@ def load_keywords():
             break
 
     base_keywords = [
-        "tariff", "customs", "duty", "trade", "export", "import",
-        "fta", "anti-dumping", "countervailing", "sanction",
-        "restriction", "regulation", "supply chain", "export control",
-        "import restriction", "hs code", "de minimis", "wto",
-
-        "관세", "통상", "무역", "수출", "수입", "수출입",
-        "fta", "반덤핑", "상계관세", "수입규제", "통관",
-        "규제", "공급망", "수출통제", "무역협정", "관세율",
-        "보복관세", "비관세", "원산지", "세관", "hs코드",
-        "품목분류", "품목번호", "기업무역활동", "수출입 현황",
+        "tariff", "customs", "duty", "anti-dumping", "countervailing",
+        "sanction", "restriction", "export control", "import restriction",
+        "fta", "wto", "hs code", "de minimis", "origin", "rules of origin",
+        "관세", "통관", "반덤핑", "상계관세", "수입규제", "수출통제",
+        "무역협정", "관세율", "보복관세", "비관세", "원산지", "세관",
+        "hs코드", "품목분류", "품목번호", "기업무역활동", "수출입 현황",
         "관세청", "국제관세협력", "심사", "조사", "분류원"
     ]
 
@@ -134,6 +118,28 @@ def filter_recent(df):
     return df[df["date"] >= cutoff].reset_index(drop=True)
 
 
+def normalize_title(title):
+    t = str(title).lower()
+
+    t = re.sub(r"&quot;|&#39;|&amp;", " ", t)
+
+    for sep in [" - ", " | ", " : ", " — ", " – "]:
+        if sep in t:
+            t = t.split(sep)[0]
+
+    t = re.sub(r"[^a-z0-9가-힣一-龥ぁ-ゔァ-ヴー\s]", " ", t)
+    t = re.sub(r"\s+", " ", t).strip()
+
+    remove_words = [
+        "the", "a", "an", "new", "latest", "update", "updates",
+        "said", "says", "may", "could", "would", "will",
+        "breaking", "exclusive", "report"
+    ]
+
+    tokens = [w for w in t.split() if w not in remove_words]
+    return " ".join(tokens).strip()
+
+
 def is_must_keep(title, source=""):
     t = str(title).lower()
     s = str(source).lower()
@@ -145,7 +151,8 @@ def is_must_keep(title, source=""):
         "품목분류", "품목번호", "관세율", "수출입 현황",
         "기업무역활동", "통계 공표", "수출입기업",
         "대미 수출", "철강제품", "품목관세",
-        "지식재산권", "위해물품", "국제관세협력"
+        "지식재산권", "위해물품", "국제관세협력",
+        "수입 운임 특례", "관세행정", "한-미 품목번호"
     ]
 
     return any(k.lower() in t or k.lower() in s for k in must_keep_keywords)
@@ -178,7 +185,10 @@ def remove_real_noise(df):
         "노동", "선거", "정치", "칼럼", "사설",
 
         "peace pole", "donate", "donation", "festival",
-        "행사", "축제", "기부"
+        "행사", "축제", "기부",
+
+        "히트곡", "가수", "배우", "드라마", "예능", "별별tv",
+        "day and night", "데이앤나잇"
     ]
 
     keep_rows = []
@@ -217,28 +227,6 @@ def policy_filter(df, keywords):
             keep_rows.append(idx)
 
     return df.loc[keep_rows].reset_index(drop=True)
-
-
-def normalize_title(title):
-    t = str(title).lower()
-
-    t = re.sub(r"&quot;|&#39;|&amp;", " ", t)
-
-    for sep in [" - ", " | ", " : ", " — ", " – "]:
-        if sep in t:
-            t = t.split(sep)[0]
-
-    t = re.sub(r"[^a-z0-9가-힣一-龥ぁ-ゔァ-ヴー\s]", " ", t)
-    t = re.sub(r"\s+", " ", t).strip()
-
-    remove_words = [
-        "the", "a", "an", "new", "latest", "update", "updates",
-        "said", "says", "may", "could", "would", "will",
-        "breaking", "exclusive", "report"
-    ]
-
-    tokens = [w for w in t.split() if w not in remove_words]
-    return " ".join(tokens).strip()
 
 
 def dedup_exact(df):
@@ -288,6 +276,7 @@ def dedup_sentence_similarity(df):
             keep_rows.append(idx)
 
     print("Sentence similar dedup 제거:", len(df) - len(keep_rows))
+
     return df.loc[keep_rows].reset_index(drop=True)
 
 
@@ -322,6 +311,7 @@ def dedup_cosine(df):
                 removed.add(j)
 
     print("Cosine dedup 제거:", len(df) - len(keep))
+
     return df.iloc[keep].reset_index(drop=True)
 
 
@@ -365,6 +355,7 @@ def remove_cumulative(df):
     df = df.loc[keep_rows].reset_index(drop=True)
 
     print("cumulative 제거:", before - len(df))
+
     return df
 
 
@@ -387,27 +378,51 @@ def samsung_policy_score(title):
     t = str(title).lower()
     score = 0
 
-    policy_high = [
-        "tariff", "customs", "duty", "anti-dumping", "countervailing",
-        "sanction", "restriction", "export control", "import restriction",
-        "관세", "통관", "반덤핑", "상계관세", "수입규제", "수출통제",
-        "품목분류", "품목번호", "관세율", "심사"
+    policy_pairs = [
+        ("수입", "관세"), ("수입", "통관"), ("수입", "규제"),
+        ("수입", "fta"), ("수입", "세관"), ("수입", "품목"),
+        ("수출", "관세"), ("수출", "통관"), ("수출", "규제"),
+        ("수출", "fta"), ("수출", "세관"), ("수출", "품목"),
+        ("무역", "관세"), ("무역", "규제"), ("무역", "협정"),
+        ("통상", "관세"), ("통상", "협상"), ("통상", "규제"),
+        ("tariff", "auto"), ("tariff", "customs"),
+        ("tariff", "court"), ("tariff", "eu"), ("tariff", "china"),
+        ("customs", "import"), ("customs", "export"),
+        ("trade", "restriction"), ("trade", "agreement"),
+        ("anti-dumping", "china"), ("fta", "export")
     ]
 
-    policy_mid = [
-        "trade", "export", "import", "fta", "regulation", "supply chain",
-        "무역", "수출", "수입", "수출입", "통상", "규제", "공급망",
-        "원산지", "기업무역활동", "수출입 현황"
+    for a, b in policy_pairs:
+        if a in t and b in t:
+            score += 5
+
+    strong_policy = [
+        "반덤핑", "상계관세", "수입규제", "수출통제",
+        "export control", "customs duty", "tariff hike",
+        "관세율", "품목분류", "품목번호", "원산지",
+        "de minimis", "section 232", "section 301",
+        "무역법", "관세청", "관세행정", "통관",
+        "international customs", "korea customs"
     ]
 
-    products = [
+    for k in strong_policy:
+        if k.lower() in t:
+            score += 5
+
+    samsung_products = [
         "mobile", "smartphone", "phone",
         "consumer electronics", "tv", "appliance",
         "network", "telecom",
         "medical", "healthcare",
         "semiconductor", "chip", "memory",
-        "반도체", "스마트폰", "모바일", "가전", "네트워크", "의료기기"
+        "battery", "display",
+        "반도체", "스마트폰", "모바일", "가전", "네트워크",
+        "의료기기", "배터리", "디스플레이"
     ]
+
+    for k in samsung_products:
+        if k.lower() in t:
+            score += 3
 
     production_sites = [
         "korea", "china", "vietnam", "india", "indonesia",
@@ -416,16 +431,9 @@ def samsung_policy_score(title):
         "튀르키예", "터키", "슬로바키아", "폴란드", "멕시코", "브라질"
     ]
 
-    if any(k in t for k in policy_high):
-        score += 5
-    elif any(k in t for k in policy_mid):
-        score += 3
-
-    if any(k in t for k in products):
-        score += 4
-
-    if any(k in t for k in production_sites):
-        score += 3
+    for k in production_sites:
+        if k.lower() in t:
+            score += 2
 
     if is_must_keep(t):
         score += 5
@@ -467,7 +475,7 @@ def fallback_if_zero_or_too_low(original_df, current_df, keywords, min_rows=50):
 
 
 def main():
-    print("STEP3 FINAL - POLICY CANDIDATE ENGINE v2")
+    print("STEP3 FINAL - POLICY CANDIDATE ENGINE v3")
 
     df = load_data()
     print("Loaded:", len(df))

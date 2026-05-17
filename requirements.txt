@@ -1,6 +1,8 @@
-pandas>=2.2.0
-openpyxl>=3.1.2
-requests>=2.31.0
-feedparser>=6.0.11
-beautifulsoup4>=4.12.3
-lxml>=5.2.0
+pandas
+openpyxl
+xlsxwriter
+requests
+beautifulsoup4
+lxml
+feedparser
+python-dateutil
