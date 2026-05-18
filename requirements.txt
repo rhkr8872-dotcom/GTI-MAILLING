@@ -6,3 +6,4 @@ beautifulsoup4
 lxml
 feedparser
 python-dateutil
+scikit-learn
