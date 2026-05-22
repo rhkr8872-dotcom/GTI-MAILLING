@@ -755,3 +755,12 @@ if __name__ == "__main__":
         log(f"[ERROR] {e}")
         log(traceback.format_exc())
         raise
+
+try:
+    send_mail()
+    print("MAIL SENT SUCCESS")
+except Exception as e:
+    print("MAIL ERROR")
+    print(type(e).__name__)
+    print(str(e))
+    raise
