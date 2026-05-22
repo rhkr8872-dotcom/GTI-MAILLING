@@ -23,7 +23,7 @@ STEPS = [
     ("STEP2_RSS", "2-3._rss_news_raw.py", False),
     ("STEP3_MERGE", "3.merge_news.py", True),
     ("STEP4_ANALYZE", "4.policy_ai_analyzer.py", True),
-    ("STEP5_MAIL", "5.GTI Mail Engine.py", True),
+    ("STEP5_MAIL", "5.GTI_Mail_Engine.py", True),
 ]
 
 ARCHIVE_TARGETS = [
@@ -32,9 +32,9 @@ ARCHIVE_TARGETS = [
     "2-2.google_news_raw.xlsx",
     "2-3.rss_news_raw.xlsx",
     "3.news_ai_summary.xlsx",
-    "4.news_ai_analysis.xlsx",
-    "GTI_Radar.xlsx",
-    "mail_cumulative.xlsx",
+    "news_raw.xlsx",
+    "GTI_Radar_2026-05-23_Top25.xlsx",
+    "GTI_Radar_2026-05-23_Top25_Email.html",
 ]
 
 
