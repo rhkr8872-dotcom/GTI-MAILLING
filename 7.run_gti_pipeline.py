@@ -109,13 +109,22 @@ def run_script(step_name, script_file, required, python_exe):
     start = time.time()
 
     try:
-        result = subprocess.run(
-            [python_exe, script_path],
-            cwd=BASE_DIR,
-            text=True,
-            encoding="utf-8",
-            errors="replace",
-        )
+result = subprocess.run(
+    [python_exe, script_path],
+    cwd=BASE_DIR,
+    capture_output=True,
+    text=True,
+    encoding="utf-8",
+    errors="replace"
+)
+
+if result.stdout:
+    log("[STDOUT]")
+    log(result.stdout)
+
+if result.stderr:
+    log("[STDERR]")
+    log(result.stderr)
 
         elapsed = round(time.time() - start, 2)
 
