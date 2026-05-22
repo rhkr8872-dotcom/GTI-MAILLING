@@ -28,13 +28,14 @@ STEPS = [
 
 ARCHIVE_TARGETS = [
     "1.site_news_raw.xlsx",
+    "1.site_news_reject_debug.xlsx",
     "2-1.naver_news_raw.xlsx",
     "2-2.google_news_raw.xlsx",
     "2-3.rss_news_raw.xlsx",
     "3.news_ai_summary.xlsx",
     "news_raw.xlsx",
-    "GTI_Radar_2026-05-23_Top25.xlsx",
-    "GTI_Radar_2026-05-23_Top25_Email.html",
+    "news_cumulative.xlsx",
+    "mail_cumulative.xlsx",
 ]
 
 
@@ -47,9 +48,17 @@ def ensure_dirs():
     os.makedirs(ARCHIVE_DIR, exist_ok=True)
 
 
+def reset_log():
+    try:
+        if os.path.exists(LOG_FILE):
+            os.remove(LOG_FILE)
+    except Exception:
+        pass
+
+
 def log(msg=""):
     line = f"[{now()}] {msg}"
-    print(line)
+    print(line, flush=True)
     with open(LOG_FILE, "a", encoding="utf-8") as f:
         f.write(line + "\n")
 
@@ -71,6 +80,17 @@ def archive_outputs():
             except Exception as e:
                 log(f"ARCHIVE FAIL : {filename} / {e}")
 
+    # GTI_Radar 산출물은 날짜가 매일 바뀌므로 패턴으로 보관
+    try:
+        for filename in os.listdir(BASE_DIR):
+            if filename.startswith("GTI_Radar_") and filename.endswith((".xlsx", ".html")):
+                src = os.path.join(BASE_DIR, filename)
+                shutil.copy2(src, os.path.join(target_dir, filename))
+                copied += 1
+                log(f"ARCHIVE OK : {filename}")
+    except Exception as e:
+        log(f"ARCHIVE RADAR FAIL : {e}")
+
     log(f"ARCHIVE COMPLETE : {copied} files")
 
 
@@ -89,6 +109,14 @@ def get_python_exe():
     return sys.executable
 
 
+def write_child_output(label, text):
+    if not text:
+        return
+    log(label)
+    for line in str(text).splitlines():
+        log(line)
+
+
 def run_script(step_name, script_file, required, python_exe):
     script_path = os.path.join(BASE_DIR, script_file)
 
@@ -97,46 +125,41 @@ def run_script(step_name, script_file, required, python_exe):
     log("=" * 80)
 
     if not os.path.exists(script_path):
-        log(f"⚠️ FILE NOT FOUND : {script_file}")
+        log(f"FILE NOT FOUND : {script_file}")
 
         if required:
-            log(f"❌ REQUIRED STEP FAILED : {script_file}")
+            log(f"REQUIRED STEP FAILED : {script_file}")
             return "FAILED"
         else:
-            log(f"⏭ OPTIONAL STEP SKIPPED : {script_file}")
+            log(f"OPTIONAL STEP SKIPPED : {script_file}")
             return "SKIPPED"
 
     start = time.time()
 
     try:
-result = subprocess.run(
-    [python_exe, script_path],
-    cwd=BASE_DIR,
-    capture_output=True,
-    text=True,
-    encoding="utf-8",
-    errors="replace"
-)
+        result = subprocess.run(
+            [python_exe, script_path],
+            cwd=BASE_DIR,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+        )
 
-if result.stdout:
-    log("[STDOUT]")
-    log(result.stdout)
-
-if result.stderr:
-    log("[STDERR]")
-    log(result.stderr)
+        write_child_output("[STDOUT]", result.stdout)
+        write_child_output("[STDERR]", result.stderr)
 
         elapsed = round(time.time() - start, 2)
 
         if result.returncode == 0:
-            log(f"✅ COMPLETE : {script_file} / {elapsed} sec")
+            log(f"COMPLETE : {script_file} / {elapsed} sec")
             return "OK"
         else:
-            log(f"❌ FAILED : {script_file} / RETURN CODE {result.returncode}")
+            log(f"FAILED : {script_file} / RETURN CODE {result.returncode}")
             return "FAILED"
 
     except Exception as e:
-        log(f"❌ EXCEPTION : {script_file} / {e}")
+        log(f"EXCEPTION : {script_file} / {type(e).__name__}: {e}")
         return "FAILED"
 
 
@@ -161,6 +184,7 @@ def print_result(results):
 
 def main():
     ensure_dirs()
+    reset_log()
 
     log("#" * 80)
     log("GTI PIPELINE FINAL START")
@@ -179,15 +203,16 @@ def main():
         results.append((script_file, status))
 
         if required and status == "FAILED":
-            log(f"🛑 PIPELINE STOPPED AT : {script_file}")
+            log(f"PIPELINE STOPPED AT : {script_file}")
             break
 
     print_result(results)
 
     if any(status == "FAILED" for _, status in results):
-        log("❌ GTI PIPELINE FINISHED WITH ERROR")
+        log("GTI PIPELINE FINISHED WITH ERROR")
+        sys.exit(1)
     else:
-        log("✅ GTI PIPELINE FINISHED")
+        log("GTI PIPELINE FINISHED SUCCESS")
 
 
 if __name__ == "__main__":
