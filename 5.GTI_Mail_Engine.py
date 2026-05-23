@@ -1,1254 +1,1614 @@
 # -*- coding: utf-8 -*-
-"""
-GTI C_TYPE - Samsung HQ Customs Daily Sensing Mail Engine
+r"""
+5.GTI Mail Engine_FINAL_URL_AI.py
+GTI Radar STEP5 Mail Engine - FINAL STABLE VERSION
 
-Purpose
--------
-Single-file final version that combines:
-1. Step4-style news selection and clustering.
-2. B_type executive mail layout.
-3. A_type-style fallback writing quality for Summary / AI Analysis / Action.
+목적
+- C:\temp\3.news_ai_summary.xlsx 의 URL/제목을 기준으로 뉴스 본문을 직접 확인
+- Google News / Google redirect URL 최대한 원문 URL로 복원
+- Gemini API로 기사별 Summary / AI Analysis / Action Plan 생성
+- Gemini 실패 시에도 제목/본문 기반 rule-based 분석으로 복붙 문구 방지
+- Top30 GTI 메일 Excel + HTML 생성
+- SMTP 메일 발송(5.GTI_Mail_Engine_F.py 방식 참고: GTI_SEND_EMAIL=Y 시 발송)
 
-Default input
--------------
-    C:/Temp/3.news_ai_summary.xlsx
+필수 입력
+- C:\temp\3.news_ai_summary.xlsx
 
-Default outputs
----------------
-    C:/Temp/12345/c_type_outputs/4.news_ai_analysis.xlsx
-    C:/Temp/12345/c_type_outputs/[GTI Radar] Global Trade Intelligence(YYYY-MM-DD).xlsx
-    C:/Temp/12345/c_type_outputs/[GTI Radar] Global Trade Intelligence(YYYY-MM-DD).html
+출력
+- C:\temp\GTI_Radar_YYYY-MM-DD_Top30.xlsx
+- C:\temp\GTI_Radar_YYYY-MM-DD_Top30_Email.html
+- C:\temp\mail_cumulative.xlsx
 
-Environment variables
----------------------
-    GTI_INPUT_FILE       default C:/Temp/3.news_ai_summary.xlsx
-    GTI_OUTPUT_DIR       default C:/Temp/12345/c_type_outputs
-    GTI_RUN_DATE         default today
-    GTI_LOOKBACK_HOURS   default 24
-    GTI_TOP_N            default 30
-    GTI_USE_GEMINI       default Y
-    GEMINI_API_KEY       optional
-    GEMINI_MODEL         default gemini-1.5-flash
+환경변수 예시
+PowerShell 현재 창 테스트:
+  $env:GEMINI_API_KEY="본인 Gemini Key"
+  $env:GEMINI_MODEL="gemini-1.5-flash"
+  $env:GTI_SEND_EMAIL="Y"
+  $env:GTI_SMTP_USER="kch8872@naver.com"
+  $env:GTI_SMTP_PASS="네이버앱비밀번호"
+  $env:GTI_MAIL_TO="수신자메일"
+
+주의
+- API Key / SMTP Password는 코드에 직접 넣지 마십시오.
 """
 
 from __future__ import annotations
 
-import argparse
-import html
-import json
 import os
 import re
-import smtplib
 import ssl
-from datetime import datetime, timedelta
-from difflib import SequenceMatcher
+import json
+import html
+import time
+import smtplib
+import traceback
+from pathlib import Path
+from datetime import datetime
 from email.message import EmailMessage
 from email.utils import formataddr
-from pathlib import Path
-from urllib.parse import parse_qs, unquote, urlparse
+from urllib.parse import urlparse, parse_qs, unquote
 
 import pandas as pd
-from openpyxl import Workbook, load_workbook
-from openpyxl.styles import Alignment, Border, Font, PatternFill, Side
-from openpyxl.utils import get_column_letter
+import requests
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
+from openpyxl import Workbook
+from openpyxl.styles import Font, PatternFill, Border, Side, Alignment
+
+try:
+    from bs4 import BeautifulSoup
+except Exception:
+    BeautifulSoup = None
 
 
-# =============================================================================
-# CONFIG
-# =============================================================================
-INPUT_FILE = Path(os.getenv("GTI_INPUT_FILE", r"C:\Temp\3.news_ai_summary.xlsx"))
-OUTPUT_DIR = Path(os.getenv("GTI_OUTPUT_DIR", r"C:\Temp\12345\c_type_outputs"))
-RUN_DATE = os.getenv("GTI_RUN_DATE", datetime.now().strftime("%Y-%m-%d"))
-LOOKBACK_HOURS = int(os.getenv("GTI_LOOKBACK_HOURS", "24"))
-TOP_N = int(os.getenv("GTI_TOP_N", "30"))
+# ============================================================
+# 0. CONFIG
+# ============================================================
+BASE_DIR = Path(os.getenv("GTI_BASE_DIR", r"C:\temp"))
+TODAY = datetime.now().strftime("%Y-%m-%d")
+NOW_STR = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
-USE_GEMINI = os.getenv("GTI_USE_GEMINI", "Y").strip().upper() in {"Y", "YES", "TRUE", "1"}
-GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "").strip()
-GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-1.5-flash").strip()
-GEMINI_TEMPERATURE = float(os.getenv("GTI_GEMINI_TEMPERATURE", "0.2"))
+INPUT_CANDIDATES = [
+    BASE_DIR / "3.news_ai_summary.xlsx",
+    BASE_DIR / "4.news_ai_analysis.xlsx",
+    BASE_DIR / "news_ai_summary.xlsx",
+    BASE_DIR / "news_raw.xlsx",
+]
 
-SEND_EMAIL = os.getenv("GTI_SEND_EMAIL", "Y").strip().upper() in {"Y", "YES", "TRUE", "1"}
+OUTPUT_XLSX = BASE_DIR / f"GTI_Radar_{TODAY}_Top30.xlsx"
+OUTPUT_HTML = BASE_DIR / f"GTI_Radar_{TODAY}_Top30_Email.html"
+MAIL_CUMULATIVE = BASE_DIR / "mail_cumulative.xlsx"
+SUBJECT = f"[GTI Radar] Global Trade Intelligence | {TODAY}"
+
+GEMINI_API_KEY = (os.getenv("GEMINI_API_KEY") or "").strip()
+GEMINI_MODEL = (os.getenv("GEMINI_MODEL") or "gemini-1.5-flash").strip()
+USE_GEMINI = bool(GEMINI_API_KEY)
+
 SMTP_HOST = os.getenv("GTI_SMTP_HOST", "smtp.naver.com")
 SMTP_PORT = int(os.getenv("GTI_SMTP_PORT", "465"))
-SMTP_USER = os.getenv("GTI_SMTP_USER", "kch8872@naver.com").strip()
+SMTP_USER = (os.getenv("GTI_SMTP_USER") or os.getenv("GTI_MAIL_ID") or "kch8872@naver.com").strip()
 SMTP_PASS = (os.getenv("GTI_SMTP_PASS") or os.getenv("GTI_MAIL_PW") or "3GKBVKMZMEKK").strip()
-MAIL_TO = os.getenv("GTI_MAIL_TO", "").strip()
-MAIL_FROM_NAME = os.getenv("GTI_MAIL_FROM_NAME", "GTI Radar").strip()
-RECIPIENT_FILE = Path(os.getenv("GTI_RECIPIENT_FILE", r"C:\Temp\00.xlsx"))
+MAIL_FROM_NAME = os.getenv("GTI_MAIL_FROM_NAME", "GTI Radar")
+SEND_EMAIL = str(os.getenv("GTI_SEND_EMAIL", "Y")).strip().upper() in ["Y", "YES", "TRUE", "1"]
+FALLBACK_TO = os.getenv("GTI_MAIL_TO", "").strip()
 
+TOP_N = int(os.getenv("GTI_TOP_N", "30"))
+FETCH_LIMIT = int(os.getenv("GTI_FETCH_LIMIT", "45"))     # 본문/Gemini 분석 대상 후보 수
+REQUEST_TIMEOUT = int(os.getenv("GTI_TIMEOUT", "10"))
 
-def output_paths() -> dict[str, Path]:
-    return {
-        "analysis": OUTPUT_DIR / "4.news_ai_analysis.xlsx",
-        "mail_xlsx": OUTPUT_DIR / f"[GTI Radar] Global Trade Intelligence({RUN_DATE}).xlsx",
-        "mail_html": OUTPUT_DIR / f"[GTI Radar] Global Trade Intelligence({RUN_DATE}).html",
-        "cumulative": OUTPUT_DIR / "gti_news_cumulative.xlsx",
-    }
+FOCUS_COUNTRIES = ["KR", "CN", "VN", "IN", "US", "MX", "BR", "EU"]
+PRODUCTS = ["Mobile", "Consumer Electronics", "Network Equipment", "Semiconductor", "Display", "Medical"]
 
-
-# =============================================================================
-# KEYWORDS
-# =============================================================================
 RISK_ORDER = {"상": 1, "중": 2, "하": 3}
+SECTION_ORDER = {
+    "1.직접 영향": 1,
+    "2.관세/통상 정책": 2,
+    "3.수입규제/조사": 3,
+    "4.기타 모니터링": 4,
+}
 
-OFFICIAL_TERMS = [
-    "ustr", "cbp", "federal register", "wto", "wco", "european commission", "eu commission",
-    "mofcom", "gacc", "customs", "trade remedies authority", ".gov",
-    "관세청", "관보", "법제처", "입법예고", "행정예고", "고시", "공고", "상무부", "무역대표부",
+TRADE_KEYWORDS = [
+    "tariff", "customs", "duty", "fta", "trade", "origin", "hs code", "valuation",
+    "anti-dumping", "countervailing", "safeguard", "export control", "import regulation",
+    "section 301", "section 232", "cbam", "ustr", "cbp", "wto", "wco",
+    "관세", "통관", "세관", "무역", "통상", "원산지", "품목분류", "과세가격",
+    "반덤핑", "상계관세", "세이프가드", "수출통제", "수입규제", "무역협정", "환급",
 ]
 
-CORE_CUSTOMS_TERMS = [
-    "tariff", "duty", "customs", "section 301", "section 232", "ustr", "cbp",
-    "anti-dumping", "antidumping", "countervailing", "safeguard", "export control",
-    "import restriction", "origin", "country of origin", "hs code", "classification",
-    "customs valuation", "valuation", "fta", "cepa", "usmca", "wto", "cbam", "refund",
-    "관세", "관세율", "추가관세", "상호관세", "301조", "232조", "반덤핑", "상계관세",
-    "세이프가드", "수입규제", "수출통제", "원산지", "품목분류", "HS", "과세가격",
-    "통관", "관세환급", "FTA", "무역협정", "관세소송",
-]
-
-HIGH_VALUE_TERMS = [
-    "section 301", "section 232", "export control", "anti-dumping", "antidumping",
-    "countervailing", "tariff refund", "trade court", "cit", "forced labor", "uflpa",
-    "critical minerals", "rare earth", "semiconductor", "chip", "hbm",
-    "301조", "232조", "수출통제", "반덤핑", "상계관세", "관세환급", "희토류", "핵심광물",
-    "반도체", "칩", "원산지 규정",
-]
-
-SAMSUNG_PRODUCT_TERMS = [
-    "samsung", "semiconductor", "chip", "hbm", "memory", "display", "battery",
-    "smartphone", "mobile", "electronics", "consumer electronics", "appliance",
-    "network equipment", "telecom", "5g", "component", "pcb", "mlcc",
-    "삼성", "삼성전자", "반도체", "메모리", "디스플레이", "배터리", "스마트폰",
-    "모바일", "전자", "가전", "네트워크", "통신장비", "부품",
-]
-
-SAMSUNG_SITE_TERMS = [
-    "vietnam", "india", "mexico", "china", "korea", "poland", "slovakia", "turkey",
-    "brazil", "indonesia", "united states", "eu", "europe", "sev", "sevt", "siel", "samex",
-    "베트남", "인도", "멕시코", "중국", "한국", "폴란드", "슬로바키아", "튀르키예",
-    "브라질", "인도네시아", "미국", "유럽", "EU",
+HIGH_IMPACT_TERMS = [
+    "tariff hike", "raise duty", "increased tariff", "anti-dumping", "countervailing",
+    "section 301", "section 232", "export control", "import ban", "sanction",
+    "관세 인상", "반덤핑", "상계관세", "수입금지", "수출통제", "제재", "조사 착수",
 ]
 
 NOISE_TERMS = [
-    # entertainment / sport / market articles
-    "sports", "football", "baseball", "celebrity", "movie", "drama", "concert",
-    "stock price", "stock market", "shares", "earnings", "bitcoin", "crypto", "benzinga",
-    "yahoo finance", "investing.com", "bitget", "coinness",
-    "스포츠", "축구", "야구", "연예", "배우", "영화", "드라마", "주가", "증시", "급등", "급락", "코인",
-    # food, retail, tourism, small business
-    "coffee", "beef", "cattle", "seafood", "fertilizer", "farmers", "duty free", "retail",
-    "fertiliser", "gold", "silver", "precious metals", "shopper", "shoppers",
-    "chili powder", "online shopping", "market share", "electric vehicle", "tire", "tyre",
-    "startup", "start-up", "mou with", "workforce skills", "logistics centre",
-    "ag exporters", "farm policy", "cocoa", "fruit", "metallurgical coke", "solar panel", "solar panels",
-    "steel", "hot-rolled", "special steel", "prestress", "posco", "animals", "animal", "ebola",
-    "travel restrictions", "flight diverted",
-    "cosmetic", "fashion", "apparel", "footwear", "tourism", "character goods", "popup",
-    "커피", "소고기", "쇠고기", "수산", "비료", "농산물", "금 수요", "은 수입", "귀금속",
-    "고추", "온라인 쇼핑", "시장 점유율", "전기차", "타이어", "스타트업",
-    "철강", "열연강판", "특수강", "강선", "강케이블", "포스코", "현대제철", "보잉",
-    "전문가 배출", "인재 양성",
-    "면세점", "롯데면세점", "화장품",
-    "패션", "의류", "신발", "관광", "캐릭터", "팝업", "농민",
-    # crime / personal customs / procurement noise
-    "fentanyl", "drug", "narcotic", "smuggling", "stolen", "weapon", "firearm", "suppressor",
-    "cannabis", "cannabis resin",
-    "child porn", "former u.s. customs", "sentenced for", "porn",
-    "nissan patrol", "lucky baskhar", "dutquer", "dulquer", "personal baggage",
-    "how much gold can you bring", "duty-free limits", "tender", "procurement", "security equipment",
-    "sanctuary city", "sanctuary cities", "immigration", "airport staffing", "customs staffing",
-    "telcos", "unregistered devices", "russian influence", "nigeria", "moldovan", "cameroon",
-    "boeing", "枇杷",
-    "마약", "밀수", "도난", "무기", "총기", "휴대품", "면세한도", "입찰", "조달", "보안검색 장비",
-    # company/consumer disputes that are not Samsung customs operating signals
-    "amazon faces", "class-action lawsuit", "walmart to use tariff refunds", "lawsuit over alleged retention",
+    "sports", "football", "baseball", "concert", "festival", "celebrity", "movie",
+    "stock price", "crypto", "bitcoin", "gold price only", "weather", "crime",
+    "cigarette", "students", "immigration", "visa", "opt fraud",
+    "연예", "스포츠", "축구", "야구", "콘서트", "주가", "코인", "비트코인",
+    "담배", "밀수", "학생", "이민", "비자", "범죄", "날씨",
 ]
 
-TOP3_STRONG_NOISE = [
-    "amazon faces lawsuit", "class-action lawsuit", "coffee", "fertilizer", "fertiliser", "gold demand",
-    "silver imports", "duty-free limits", "retail", "tourism", "면세점", "커피", "비료", "금 수요",
-    "은 수입", "롯데", "관광",
+SAMSUNG_COUNTRY_MAP = {
+    "KR": ["korea", "south korea", "한국", "대한민국"],
+    "CN": ["china", "중국"],
+    "VN": ["vietnam", "베트남"],
+    "IN": ["india", "인도"],
+    "US": ["united states", "u.s.", "usa", "미국"],
+    "MX": ["mexico", "멕시코"],
+    "BR": ["brazil", "브라질"],
+    "EU": ["european union", "european commission", "eu", "유럽연합"],
+}
+
+AGENCY_MAP = [
+    ("USTR", ["ustr", "u.s. trade representative", "미 무역대표부"]),
+    ("U.S. Customs and Border Protection (CBP)", ["cbp", "u.s. customs", "customs and border protection", "미 세관"]),
+    ("U.S. Department of Commerce", ["department of commerce", "u.s. commerce", "상무부"]),
+    ("European Commission", ["european commission", "eu commission", "유럽연합 집행위원회"]),
+    ("WTO", ["wto", "world trade organization", "세계무역기구"]),
+    ("WCO", ["wco", "world customs organization", "세계관세기구"]),
+    ("MOFCOM", ["mofcom", "중국 상무부"]),
+    ("GACC", ["gacc", "중국 해관", "해관총서"]),
+    ("Vietnam Customs / Trade Remedies Authority", ["vietnam customs", "trade remedies authority", "vietnam.vn", "베트남"]),
+    ("Ministry of Commerce & Industry, India", ["india", "인도", "piyush goyal"]),
+    ("관세청", ["관세청"]),
+    ("산업통상자원부", ["산업통상자원부", "산업부"]),
+    ("기획재정부", ["기획재정부"]),
 ]
 
 
-# =============================================================================
-# BASIC HELPERS
-# =============================================================================
+# ============================================================
+# 1. LOG / BASIC UTILS
+# ============================================================
 def log(msg: str) -> None:
-    print(msg, flush=True)
+    print(f"[{datetime.now():%Y-%m-%d %H:%M:%S}] {msg}", flush=True)
 
 
-def clean(value) -> str:
-    if value is None:
+def clean_text(v) -> str:
+    if v is None:
         return ""
     try:
-        if pd.isna(value):
+        if pd.isna(v):
             return ""
     except Exception:
         pass
-    text = html.unescape(str(value)).replace("\u00a0", " ")
-    text = re.sub(r"\s+", " ", text).strip()
-    return "" if text.lower() in {"nan", "none", "nat", "0"} else text
+    s = str(v)
+    s = html.unescape(s)
+    s = s.replace("\u200b", " ")
+    s = re.sub(r"\s+", " ", s)
+    return s.strip()
 
 
-def contains_any(text: str, terms: list[str]) -> bool:
-    low = text.lower()
-    return any(term.lower() in low for term in terms)
+def compact(v) -> str:
+    return clean_text(v)
 
 
-def count_hits(text: str, terms: list[str]) -> int:
-    low = text.lower()
-    return sum(1 for term in terms if term.lower() in low)
+def safe_join_values(values) -> str:
+    out = []
+    for v in values:
+        s = clean_text(v)
+        if s and s.lower() not in ["nan", "none", "nat"]:
+            out.append(s)
+    return " ".join(out)
 
 
-def normalize_title(title: str) -> str:
-    text = clean(title).lower()
-    text = re.sub(r"\s*[-|–]\s*[^-|–]{2,50}$", "", text)
-    text = re.sub(r"[^0-9a-z가-힣一-龥 ]+", " ", text)
-    return re.sub(r"\s+", " ", text).strip()
-
-
-def similar_title(a: str, b: str) -> bool:
-    if not a or not b:
-        return False
-    if a[:34] == b[:34]:
-        return True
-    return SequenceMatcher(None, a, b).ratio() >= 0.84
-
-
-def unwrap_url(url: str) -> str:
-    value = clean(url)
-    if not value:
+def safe_date(v) -> str:
+    s = clean_text(v)
+    if not s:
         return ""
+
+    # pandas Series가 문자열화된 "date 2026-05-13 ... Name: ..." 형태 보정
+    m = re.search(r"(20\d{2}[-/.]\d{1,2}[-/.]\d{1,2})(?:[ T](\d{1,2}:\d{2}(?::\d{2})?))?", s)
+    if m:
+        date_part = m.group(1).replace("/", "-").replace(".", "-")
+        time_part = m.group(2) or "00:00"
+        try:
+            return pd.to_datetime(f"{date_part} {time_part}", errors="coerce").strftime("%Y-%m-%d %H:%M")
+        except Exception:
+            return f"{date_part} {time_part[:5]}"
+
     try:
-        parsed = urlparse(value)
-        query = parse_qs(parsed.query)
-        for key in ("url", "u"):
-            if query.get(key):
-                return unquote(query[key][0])
+        dt = pd.to_datetime(v, errors="coerce")
+        if not pd.isna(dt):
+            return dt.strftime("%Y-%m-%d %H:%M")
     except Exception:
         pass
-    return value
+    return s[:16]
 
 
-def parse_date(value):
-    if isinstance(value, datetime):
-        return value
-    text = clean(value)
-    if not text:
-        return None
+def normalize_title(t: str) -> str:
+    s = clean_text(t).lower()
+    s = re.sub(r"[-|–—].*$", "", s)  # 언론사명 제거
+    s = re.sub(r"[^0-9a-z가-힣一-龥ぁ-んァ-ン]+", " ", s)
+    s = re.sub(r"\s+", " ", s)
+    return s.strip()
+
+
+def domain_of(url: str) -> str:
     try:
-        dt = pd.to_datetime(text, errors="coerce")
-        if not pd.isna(dt):
-            return dt.to_pydatetime()
+        return urlparse(url).netloc.lower().replace("www.", "")
     except Exception:
-        return None
-    return None
+        return ""
 
 
-def is_recent(value) -> bool:
-    dt = parse_date(value)
-    if dt is None:
-        return True
-    return dt >= datetime.now() - timedelta(hours=LOOKBACK_HOURS)
+# ============================================================
+# 2. HTTP SESSION / URL RESOLUTION / BODY EXTRACT
+# ============================================================
+def make_session() -> requests.Session:
+    session = requests.Session()
+    retry = Retry(
+        total=1,
+        connect=1,
+        read=1,
+        backoff_factor=1.0,
+        status_forcelist=[429, 500, 502, 503, 504],
+        allowed_methods=["GET", "HEAD"],
+        raise_on_status=False,
+    )
+    adapter = HTTPAdapter(max_retries=retry, pool_connections=20, pool_maxsize=20)
+    session.mount("http://", adapter)
+    session.mount("https://", adapter)
+    session.headers.update({
+        "User-Agent": (
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) "
+            "Chrome/124.0 Safari/537.36"
+        ),
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        "Accept-Language": "ko-KR,ko;q=0.9,en-US;q=0.8,en;q=0.7",
+        "Connection": "close",
+    })
+    return session
 
 
-def cut_sentence(text: str, limit: int = 120) -> str:
-    text = clean(text)
-    if len(text) <= limit:
-        return text
-    return text[:limit].rstrip() + "..."
+SESSION = make_session()
 
 
-# =============================================================================
-# INPUT NORMALIZATION
-# =============================================================================
-def pick_col(df: pd.DataFrame, candidates: list[str]) -> str | None:
-    lower_map = {str(c).strip().lower(): c for c in df.columns}
-    for key in candidates:
-        if key.lower() in lower_map:
-            return lower_map[key.lower()]
-    for col in df.columns:
-        low = str(col).strip().lower()
-        if any(key.lower() in low for key in candidates):
-            return col
-    return None
+def resolve_redirect_url(url: str) -> str:
+    url = clean_text(url)
+    if not url:
+        return ""
+
+    # Google redirect: https://www.google.com/url?...&url=https://...
+    try:
+        parsed = urlparse(url)
+        qs = parse_qs(parsed.query)
+        if "url" in qs and qs["url"]:
+            return unquote(qs["url"][0])
+        if "q" in qs and qs["q"]:
+            q = qs["q"][0]
+            if q.startswith("http"):
+                return unquote(q)
+    except Exception:
+        pass
+
+    # Google News RSS URL은 requests redirect를 통해 최종 URL 확보 시도
+    if "news.google.com/rss/articles" in url or "news.google.com/articles" in url:
+        try:
+            r = SESSION.get(url, timeout=REQUEST_TIMEOUT, allow_redirects=True)
+            if r.url and "news.google.com" not in r.url:
+                return r.url
+        except Exception:
+            return url
+
+    return url
 
 
-def read_input() -> pd.DataFrame:
-    if not INPUT_FILE.exists():
-        raise FileNotFoundError(f"입력 파일 없음: {INPUT_FILE}")
-    df = pd.read_excel(INPUT_FILE)
-    df.columns = [str(c).strip() for c in df.columns]
-
-    col_date = pick_col(df, ["date", "publish date", "published"])
-    col_title = pick_col(df, ["title", "headline"])
-    col_url = pick_col(df, ["url", "link"])
-    col_source = pick_col(df, ["source_file", "source", "publisher"])
-    col_keyword = pick_col(df, ["keyword", "category"])
-    col_score = pick_col(df, ["score", "importance"])
-    col_agency = pick_col(df, ["agency"])
-
-    out = pd.DataFrame()
-    out["DateRaw"] = df[col_date] if col_date else ""
-    out["Date"] = [format_date(v) for v in out["DateRaw"]]
-    out["Headline"] = df[col_title].apply(clean) if col_title else ""
-    out["URL"] = df[col_url].apply(unwrap_url) if col_url else ""
-    out["Source"] = df[col_source].apply(clean) if col_source else ""
-    out["Keyword"] = df[col_keyword].apply(clean) if col_keyword else ""
-    out["AgencyRaw"] = df[col_agency].apply(clean) if col_agency else ""
-    out["Step3Score"] = df[col_score] if col_score else 0
-    out = out[(out["Headline"] != "") & (out["URL"] != "")]
-    out = out[out["DateRaw"].apply(is_recent)]
-    return out.reset_index(drop=True)
+def fetch_html(url: str) -> tuple[str, str]:
+    """return (final_url, html_text). 실패 시 ("", "") 대신 final_url만 반환 가능."""
+    url = resolve_redirect_url(url)
+    if not url:
+        return "", ""
+    try:
+        r = SESSION.get(url, timeout=REQUEST_TIMEOUT, allow_redirects=True)
+        final_url = r.url or url
+        if r.status_code >= 400:
+            log(f"[FETCH SKIP] HTTP {r.status_code}: {url[:120]}")
+            return final_url, ""
+        enc = r.encoding or r.apparent_encoding or "utf-8"
+        r.encoding = enc
+        return final_url, r.text or ""
+    except Exception as e:
+        log(f"[FETCH SKIP] {type(e).__name__}: {url[:120]}")
+        return url, ""
 
 
-def format_date(value) -> str:
-    dt = parse_date(value)
-    if dt is None:
-        return clean(value)[:16]
-    return dt.strftime("%Y-%m-%d %H:%M")
+def extract_article_text(html_text: str) -> str:
+    if not html_text:
+        return ""
+
+    if BeautifulSoup is None:
+        txt = re.sub(r"(?is)<(script|style|noscript).*?>.*?</\1>", " ", html_text)
+        txt = re.sub(r"(?s)<[^>]+>", " ", txt)
+        txt = html.unescape(txt)
+        txt = re.sub(r"\s+", " ", txt)
+        return txt[:4000].strip()
+
+    soup = BeautifulSoup(html_text, "html.parser")
+
+    for tag in soup(["script", "style", "noscript", "iframe", "svg", "footer", "header", "nav"]):
+        tag.decompose()
+
+    candidates = []
+
+    for selector in ["article", "main", "[role=main]", ".article", ".article-body", ".news_body", "#articleBody"]:
+        try:
+            for node in soup.select(selector):
+                text = " ".join([p.get_text(" ", strip=True) for p in node.find_all(["p", "div", "li"])])
+                text = re.sub(r"\s+", " ", text).strip()
+                if len(text) > 300:
+                    candidates.append(text)
+        except Exception:
+            pass
+
+    if not candidates:
+        ps = [p.get_text(" ", strip=True) for p in soup.find_all("p")]
+        ps = [p for p in ps if len(p) >= 30]
+        text = " ".join(ps)
+        text = re.sub(r"\s+", " ", text).strip()
+        if text:
+            candidates.append(text)
+
+    if not candidates:
+        text = soup.get_text(" ", strip=True)
+        text = re.sub(r"\s+", " ", text).strip()
+        candidates.append(text)
+
+    text = max(candidates, key=len) if candidates else ""
+    text = re.sub(r"(구독|광고|저작권|Copyright|All rights reserved).{0,120}", " ", text, flags=re.I)
+    text = re.sub(r"\s+", " ", text).strip()
+    return text[:6000]
 
 
-# =============================================================================
-# STEP4-STYLE DECISION AND SCORING
-# =============================================================================
-def row_text(row: pd.Series) -> str:
-    return " ".join(clean(row.get(c, "")) for c in ["Headline", "Source", "Keyword", "AgencyRaw"])
+# ============================================================
+# 3. COLUMN NORMALIZE
+# ============================================================
+def find_input_file() -> Path:
+    for p in INPUT_CANDIDATES:
+        if p.exists():
+            return p
+    raise FileNotFoundError("입력 파일 없음: " + " / ".join(str(p) for p in INPUT_CANDIDATES))
 
 
-def is_noise(row: pd.Series) -> bool:
-    text = row_text(row)
-    if contains_any(text, NOISE_TERMS):
-        non_overridable = [
-            "gold", "silver", "coffee", "fertilizer", "fertiliser", "amazon", "walmart",
-            "sanctuary city", "immigration", "airport", "telcos", "unregistered devices",
-            "cannabis", "chili powder", "online shopping", "market share", "tire", "tyre",
-            "startup", "start-up", "workforce skills", "logistics centre", "ag exporters",
-            "farm policy", "cocoa", "fruit", "metallurgical coke", "solar panel", "child porn",
-            "former u.s. customs", "boeing", "steel", "prestress", "animals", "ebola",
-            "travel restrictions", "flight diverted", "枇杷",
-            "금 수요", "은 수입", "커피", "비료", "아마존", "월마트",
-            "고추", "온라인 쇼핑", "시장 점유율", "타이어", "스타트업",
-            "철강", "열연강판", "특수강", "강선", "강케이블", "포스코", "현대제철", "보잉",
-            "전문가 배출", "인재 양성",
-        ]
-        if contains_any(text, non_overridable):
-            return True
-        if contains_any(text, ["section 301", "301조", "ustr", "cbp", "federal register", "반덤핑", "상계관세", "수출통제", "semiconductor", "반도체"]):
-            return False
-        return True
-    return False
+def normalize_columns(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    입력 Excel 컬럼을 표준 컬럼으로 정규화합니다.
+
+    중요 수정:
+    - date / collected_at 같이 여러 컬럼이 같은 표준명(Date)으로 매핑되면
+      pandas가 중복 컬럼명을 만들고, 이후 pd.DataFrame(rows)에서
+      InvalidIndexError가 발생합니다.
+    - 따라서 같은 표준명으로 매핑되는 컬럼은 첫 번째 non-empty 값을 합쳐
+      표준 컬럼 1개만 남깁니다.
+    """
+    raw = df.copy().fillna("")
+
+    def canon(col) -> str:
+        lc = str(col).strip().lower()
+        if lc in ["date", "publish date", "publish_date", "published", "news date", "뉴스 원본 게시일시", "원문등록일"]:
+            return "Date"
+        # collected_at은 원본 게시일이 아니라 수집일이므로 Date와 충돌시키지 않음
+        if lc in ["collected_at", "last_checked", "checked_at", "수집일", "수집일시"]:
+            return "last_checked"
+        if lc in ["headline", "title", "news title", "뉴스 제목", "제목", "headlines"]:
+            return "Headline"
+        if lc in ["summary", "뉴스 본문", "뉴스 본문요약", "주요내용", "description", "content", "body", "article"]:
+            return "Summary"
+        if lc in ["ai analysis", "analysis", "impact", "ai_analysis", "전문관세사 분석", "ai분석"]:
+            return "AI Analysis"
+        if lc in ["action plan", "action", "action_plan", "대응방안", "action_plan"]:
+            return "Action Plan"
+        if lc in ["country", "국가", "대상 국가", "countries"]:
+            return "Country"
+        if lc in ["agency", "관련 기관", "정책기관", "관련기관", "organization"]:
+            return "agency"
+        if lc in ["risk", "importance", "중요도", "위험도"]:
+            return "Risk"
+        if lc in ["url", "link", "source url", "출처url", "링크", "출처 url"]:
+            return "URL"
+        if lc in ["source", "출처", "date source", "data source", "수집툴"]:
+            return "source"
+        if lc in ["score", "importance_score", "risk_score"]:
+            return "score"
+        return str(col).strip()
+
+    # 원본 컬럼명별 표준명 생성
+    canon_names = [canon(c) for c in raw.columns]
+
+    # 중복 표준 컬럼 병합: 행 단위로 먼저 값이 있는 컬럼 선택
+    out = pd.DataFrame(index=raw.index)
+    for std in dict.fromkeys(canon_names):
+        idxs = [i for i, name in enumerate(canon_names) if name == std]
+        if len(idxs) == 1:
+            coldata = raw.iloc[:, idxs[0]]
+        else:
+            part = raw.iloc[:, idxs].copy()
+            coldata = part.apply(lambda r: next((clean_text(v) for v in r.values if clean_text(v)), ""), axis=1)
+        out[std] = coldata.map(clean_text)
+
+    # 필수 컬럼 보장
+    for col in ["Date", "Headline", "Summary", "AI Analysis", "Action Plan", "Country", "agency", "Risk", "URL", "source", "score", "last_checked"]:
+        if col not in out.columns:
+            out[col] = ""
+        out[col] = out[col].map(clean_text)
+
+    # URL이 source 또는 Summary에 들어간 케이스 보정
+    mask = (out["URL"].eq("")) & (out["source"].str.startswith("http", na=False))
+    out.loc[mask, "URL"] = out.loc[mask, "source"]
+
+    # 표준 컬럼을 앞쪽에 정렬하고 나머지 컬럼 유지
+    fixed = ["Date", "Headline", "Summary", "AI Analysis", "Action Plan", "Country", "agency", "Risk", "URL", "source", "score", "last_checked"]
+    others = [c for c in out.columns if c not in fixed]
+    out = out[fixed + others].copy()
+
+    # 최종 안전장치: 컬럼명 중복 완전 제거
+    out = out.loc[:, ~out.columns.duplicated()].copy()
+    return out
 
 
-def infer_country(text: str) -> str:
-    rules = [
-        ("United States", ["united states", "u.s.", "usa", "us ", "미국", "美", "ustr", "cbp", "trump"]),
-        ("China", ["china", "중국", "中", "mofcom", "gacc", "beijing", "xi", "시진핑"]),
-        ("EU", ["eu", "europe", "european", "유럽", "eu commission"]),
-        ("Vietnam", ["vietnam", "베트남", "sev", "sevt"]),
-        ("India", ["india", "인도", "siel"]),
-        ("Mexico", ["mexico", "멕시코", "samex", "usmca"]),
-        ("Korea", ["korea", "한국", "관세청", "산업통상", "무역위"]),
-        ("Japan", ["japan", "일본"]),
-        ("Brazil", ["brazil", "브라질"]),
-        ("Indonesia", ["indonesia", "인도네시아"]),
-    ]
+def headline_fallback(row: pd.Series) -> str:
+    h = clean_text(row.get("Headline", ""))
+    if h and h.lower() not in ["nan", "none"]:
+        return h
+    s = clean_text(row.get("Summary", ""))
+    if s:
+        return s[:100]
+    u = clean_text(row.get("URL", ""))
+    return domain_of(u) or "뉴스 제목 확인 필요"
+
+
+# ============================================================
+# 4. INFERENCE / SCORING
+# ============================================================
+def infer_country(text: str, current: str = "") -> str:
+    raw = f"{current} {text}"
+    low = raw.lower()
     found = []
-    low = text.lower()
-    for country, keys in rules:
-        if any(k.lower() in low for k in keys) and country not in found:
-            found.append(country)
-    return ", ".join(found[:2]) if found else "Global"
+    for code, keys in SAMSUNG_COUNTRY_MAP.items():
+        if any(k.lower() in low for k in keys):
+            found.append(code)
+    return " / ".join(found[:2]) if found else clean_text(current) or "Global"
 
 
-def infer_agency(text: str) -> str:
-    rules = [
-        ("USTR", ["ustr", "u.s. trade representative", "무역대표"]),
-        ("U.S. Customs and Border Protection (CBP)", ["cbp", "customs and border protection"]),
-        ("U.S. Department of Commerce", ["department of commerce", "u.s. commerce"]),
-        ("European Commission", ["european commission", "eu commission"]),
-        ("WTO", ["wto"]),
-        ("MOFCOM", ["mofcom", "중국 상무부"]),
-        ("Korea Customs Service", ["관세청"]),
-        ("Korea Trade Commission", ["무역위", "무역위원회"]),
-        ("Vietnam Customs / Trade Remedies Authority", ["vietnam customs", "vietnam.vn", "trade remedies authority"]),
-    ]
+def infer_agency(text: str, current: str = "") -> str:
     low = text.lower()
-    for agency, keys in rules:
+    cur = clean_text(current)
+    if cur and cur.lower() not in ["nan", "none", "google news", "google", "rss"]:
+        return cur
+    for agency, keys in AGENCY_MAP:
         if any(k.lower() in low for k in keys):
             return agency
-    return "Relevant customs/trade authority"
+    return "관련 정부/국제기관"
 
 
-def classify_issue(text: str) -> str:
+def infer_products(text: str) -> str:
     low = text.lower()
-    if contains_any(low, ["section 301", "301조"]):
-        return "SECTION_301"
-    if contains_any(low, ["section 232", "232조"]):
-        return "SECTION_232"
-    if contains_any(low, ["export control", "수출통제", "sanction", "제재"]):
-        return "EXPORT_CONTROL"
-    if contains_any(low, ["anti-dumping", "antidumping", "반덤핑", "countervailing", "상계관세"]):
-        return "AD_CVD"
-    if contains_any(low, ["origin", "원산지", "usmca", "fta", "cepa"]):
-        return "FTA_ORIGIN"
-    if contains_any(low, ["customs", "통관", "cbp", "관세청", "valuation", "과세가격"]):
-        return "CUSTOMS"
-    if contains_any(low, ["semiconductor", "반도체", "chip", "hbm", "rare earth", "희토류"]):
-        return "SEMICONDUCTOR_SUPPLY"
-    if contains_any(low, ["tariff", "관세", "duty"]):
-        return "TARIFF"
-    return "GENERAL_TRADE"
+    products = []
+    checks = [
+        ("Mobile", ["smartphone", "mobile", "phone", "스마트폰", "모바일"]),
+        ("Consumer Electronics", ["appliance", "tv", "refrigerator", "washing machine", "가전", "냉장고", "세탁기", "tv"]),
+        ("Network Equipment", ["network", "telecom", "5g", "base station", "네트워크", "통신장비"]),
+        ("Semiconductor", ["semiconductor", "chip", "hbm", "memory", "반도체", "칩", "메모리"]),
+        ("Display", ["display", "oled", "panel", "디스플레이", "패널"]),
+        ("Medical", ["medical", "healthcare", "의료기기"]),
+    ]
+    for name, keys in checks:
+        if any(k in low for k in keys):
+            products.append(name)
+    return " / ".join(products[:3]) if products else "공통 공급망"
 
 
-def cluster_key(row: pd.Series) -> str:
-    text = row_text(row).lower()
-    if (
-        contains_any(text, ["chip tariff", "chip tariffs", "semiconductor tariff", "semiconductor tariffs", "반도체 관세"])
-        or (contains_any(text, ["ustr", "greer", "무역대표"]) and contains_any(text, ["chip", "chips", "semiconductor", "반도체", "arancel"]))
-    ):
-        return "CHIP_TARIFF"
-    if contains_any(text, ["usmca", "원산지 규정", "rules of origin"]):
-        return "USMCA_ORIGIN"
-    if contains_any(text, ["trade court", "section 122", "tariff refund", "관세환급", "관세소송"]):
-        return "US_TARIFF_LITIGATION_REFUND"
-    issue = classify_issue(text)
-    country = infer_country(text).split(",")[0]
-    if issue in {"SECTION_301", "SECTION_232", "EXPORT_CONTROL", "AD_CVD", "FTA_ORIGIN", "CUSTOMS", "SEMICONDUCTOR_SUPPLY"}:
-        return f"{issue}_{country}"
-    title = normalize_title(row.get("Headline", ""))
-    return f"{issue}_{title[:40]}"
+def normalize_risk(v: str) -> str:
+    s = clean_text(v).lower()
+    if "상" in s or "high" in s or "직접" in s:
+        return "상"
+    if "하" in s or "low" in s or "기타" in s:
+        return "하"
+    if "중" in s or "medium" in s or "간접" in s:
+        return "중"
+    return ""
 
 
-def base_score(row: pd.Series) -> int:
-    text = row_text(row)
-    if is_noise(row):
-        return -999
-
+def calc_score(row: pd.Series) -> int:
+    text = safe_join_values([row.get("Headline", ""), row.get("Summary", ""), row.get("Country", ""), row.get("agency", ""), row.get("source", "")]).lower()
     score = 0
-    official_hits = count_hits(text, OFFICIAL_TERMS)
-    core_hits = count_hits(text, CORE_CUSTOMS_TERMS)
-    high_hits = count_hits(text, HIGH_VALUE_TERMS)
-    product_hits = count_hits(text, SAMSUNG_PRODUCT_TERMS)
-    site_hits = count_hits(text, SAMSUNG_SITE_TERMS)
-    if contains_any(text, ["steel", "철강", "강선", "강케이블", "prestress"]) and not contains_any(text, ["semiconductor", "chip", "hbm", "반도체", "전자", "electronics"]):
-        score -= 700
 
-    score += min(official_hits, 4) * 350
-    score += min(core_hits, 8) * 260
-    score += min(high_hits, 6) * 420
-    score += min(product_hits, 5) * 260
-    score += min(site_hits, 5) * 160
+    if any(k.lower() in text for k in TRADE_KEYWORDS):
+        score += 40
+    if any(k.lower() in text for k in HIGH_IMPACT_TERMS):
+        score += 30
 
-    if core_hits and high_hits:
-        score += 900
-    if product_hits and core_hits:
-        score += 700
-    if site_hits and core_hits:
-        score += 500
-    if product_hits and site_hits:
-        score += 400
+    country = infer_country(text)
+    if any(c in country for c in ["US", "CN", "VN", "IN", "MX", "BR", "EU", "KR"]):
+        score += 20
 
-    issue = classify_issue(text)
-    priority_bonus = {
-        "SECTION_301": 1500,
-        "SECTION_232": 1300,
-        "EXPORT_CONTROL": 1450,
-        "AD_CVD": 1350,
-        "FTA_ORIGIN": 1050,
-        "CUSTOMS": 950,
-        "SEMICONDUCTOR_SUPPLY": 1250,
-        "TARIFF": 800,
-        "GENERAL_TRADE": 200,
-    }
-    score += priority_bonus.get(issue, 0)
+    if any(k in text for k in ["samsung", "semiconductor", "smartphone", "display", "appliance", "electronics", "삼성", "반도체", "스마트폰", "디스플레이", "가전"]):
+        score += 20
+
+    if any(n.lower() in text for n in NOISE_TERMS):
+        score -= 80
+
+    risk = normalize_risk(row.get("Risk", ""))
+    if risk == "상":
+        score += 15
+    elif risk == "중":
+        score += 7
 
     try:
-        score += min(int(float(row.get("Step3Score", 0) or 0)), 50)
+        score += int(float(row.get("score", 0)))
     except Exception:
         pass
 
-    return int(score)
+    return score
 
 
-def infer_risk(score: int, text: str) -> str:
-    if score >= 4200 or contains_any(text, ["section 301", "301조", "section 232", "수출통제", "anti-dumping", "반덤핑", "상계관세"]):
-        return "상"
-    if score >= 2300 or contains_any(text, ["관세", "통관", "원산지", "fta", "customs", "tariff", "origin"]):
-        return "중"
+def infer_risk(headline: str, body: str, country: str, products: str) -> str:
+    text = f"{headline} {body}".lower()
+
+    if any(n.lower() in text for n in NOISE_TERMS):
+        return "하"
+
+    if any(k.lower() in text for k in HIGH_IMPACT_TERMS):
+        if any(c in country for c in ["US", "CN", "VN", "IN", "MX", "BR", "EU", "KR"]):
+            return "상"
+
+    if any(k.lower() in text for k in TRADE_KEYWORDS):
+        if any(c in country for c in ["US", "CN", "VN", "IN", "MX", "BR", "EU", "KR"]):
+            return "중"
+
     return "하"
 
 
-def top3_eligible(row: pd.Series) -> bool:
-    text = row_text(row)
-    if contains_any(text, TOP3_STRONG_NOISE):
-        return False
-    if is_noise(row):
-        return False
-    issue = classify_issue(text)
-    product_or_site = contains_any(text, SAMSUNG_PRODUCT_TERMS) or contains_any(text, ["vietnam", "india", "mexico", "china", "eu", "베트남", "인도", "멕시코", "중국", "미국", "유럽"])
-    if issue == "AD_CVD" and not contains_any(text, SAMSUNG_PRODUCT_TERMS):
-        return False
-    if issue in {"TARIFF", "CUSTOMS", "FTA_ORIGIN"} and not product_or_site and not contains_any(text, ["ustr", "cbp", "federal register", "관세청", "wto"]):
-        return False
-    return issue in {"SECTION_301", "SECTION_232", "EXPORT_CONTROL", "AD_CVD", "FTA_ORIGIN", "CUSTOMS", "SEMICONDUCTOR_SUPPLY", "TARIFF"}
+def infer_section(risk: str, text: str) -> str:
+    low = text.lower()
+    if risk == "상":
+        return "1.직접 영향"
+    if any(k in low for k in ["tariff", "fta", "trade", "관세", "통상", "무역협정", "환급"]):
+        return "2.관세/통상 정책"
+    if any(k in low for k in ["anti-dumping", "countervailing", "investigation", "customs", "반덤핑", "상계관세", "조사", "통관"]):
+        return "3.수입규제/조사"
+    return "4.기타 모니터링"
 
 
-def select_news(raw: pd.DataFrame) -> pd.DataFrame:
-    df = raw.copy()
-    df["_text"] = df.apply(row_text, axis=1)
-    df["_score"] = df.apply(base_score, axis=1)
-    df["_noise"] = df.apply(is_noise, axis=1)
-    df["_cluster"] = df.apply(cluster_key, axis=1)
-    df["_title_norm"] = df["Headline"].apply(normalize_title)
-    df["_url_norm"] = df["URL"].str.lower().str.strip()
+def is_relevant(row: pd.Series) -> bool:
+    text = safe_join_values(row.values).lower()
+    has_trade = any(k.lower() in text for k in TRADE_KEYWORDS)
+    has_country = any(k.lower() in text for keys in SAMSUNG_COUNTRY_MAP.values() for k in keys)
+    is_noise = any(k.lower() in text for k in NOISE_TERMS)
+    return (has_trade and has_country) or (has_trade and not is_noise)
 
-    before = len(df)
-    df = df[(df["_score"] > 0) & (~df["_noise"])].copy()
-    log(f"[FILTER] input={before}, selected_candidates={len(df)}, removed={before - len(df)}")
-    if df.empty:
-        raise RuntimeError("선정 후보가 없습니다. 입력 파일 또는 필터 조건을 확인해 주세요.")
 
-    df = df.sort_values(["_score", "Date"], ascending=[False, False])
-    df = df.drop_duplicates(subset=["_url_norm"], keep="first")
-
-    unique_rows = []
-    seen_titles = []
-    for _, row in df.iterrows():
-        title_norm = row["_title_norm"]
-        if any(similar_title(title_norm, old) for old in seen_titles):
-            continue
-        seen_titles.append(title_norm)
-        unique_rows.append(row)
-    df = pd.DataFrame(unique_rows)
-
-    # Top3 first: high impact with topic diversity.
-    top3 = []
-    used_clusters = set()
-    for _, row in df.iterrows():
-        if not top3_eligible(row):
-            continue
-        key = row["_cluster"]
-        if key in used_clusters:
-            continue
-        top3.append(row)
-        used_clusters.add(key)
-        if len(top3) == 3:
-            break
-    for _, row in df.iterrows():
-        if len(top3) == 3:
-            break
-        if any(row["URL"] == picked["URL"] for picked in top3):
-            continue
-        top3.append(row)
-
-    selected = list(top3)
-    selected_urls = {r["URL"] for r in selected}
-    cluster_count = {}
-    for r in selected:
-        cluster_count[r["_cluster"]] = cluster_count.get(r["_cluster"], 0) + 1
-
-    for _, row in df.iterrows():
-        if row["URL"] in selected_urls:
-            continue
-        cluster = row["_cluster"]
-        if cluster_count.get(cluster, 0) >= 1:
-            continue
-        selected.append(row)
-        selected_urls.add(row["URL"])
-        cluster_count[cluster] = cluster_count.get(cluster, 0) + 1
-        if len(selected) >= TOP_N:
-            break
-
-    # If strict cluster cap produces fewer than TOP_N, fill remaining by score.
-    if len(selected) < TOP_N:
-        for _, row in df.iterrows():
-            if row["URL"] in selected_urls:
-                continue
-            selected.append(row)
-            selected_urls.add(row["URL"])
-            if len(selected) >= TOP_N:
-                break
-
-    out = pd.DataFrame(selected).reset_index(drop=True)
+def dedup_similar(df: pd.DataFrame, max_rows: int = 120) -> pd.DataFrame:
     rows = []
-    for i, row in out.iterrows():
-        text = row["_text"]
-        score = int(row["_score"])
-        country = infer_country(text)
-        agency = clean(row.get("AgencyRaw", "")) or infer_agency(text)
-        risk = infer_risk(score, text)
-        products = infer_products(text)
-        summary = fallback_summary(row["Headline"], country, agency)
-        analysis = fallback_analysis(row["Headline"], country, risk, products)
-        action = fallback_action(row["Headline"], country, agency, risk)
+    seen_titles = []
+    seen_urls = set()
 
-        item = {
-            "No": i + 1,
-            "Date": row["Date"],
-            "Headline": row["Headline"],
+    for _, r in df.iterrows():
+        url = clean_text(r.get("URL", "")).lower()
+        title = normalize_title(r.get("Headline", ""))
+
+        if url and url in seen_urls:
+            continue
+        if not title:
+            continue
+
+        duplicate = False
+        for st in seen_titles:
+            # 단순 token overlap 기반 중복 제거
+            a = set(title.split())
+            b = set(st.split())
+            if a and b:
+                overlap = len(a & b) / max(1, min(len(a), len(b)))
+                if overlap >= 0.75:
+                    duplicate = True
+                    break
+
+        if duplicate:
+            continue
+
+        seen_titles.append(title)
+        if url:
+            seen_urls.add(url)
+        # Series 그대로 append하면 중복 컬럼/index가 있을 때 InvalidIndexError 발생 가능
+        rows.append(r.to_dict())
+
+        if len(rows) >= max_rows:
+            break
+
+    if rows:
+        out = pd.DataFrame(rows)
+        out = out.loc[:, ~out.columns.duplicated()].copy()
+        return out
+    return df.head(max_rows).copy().loc[:, ~df.columns.duplicated()]
+
+
+# ============================================================
+# 5. GEMINI ANALYSIS
+# ============================================================
+def call_gemini(headline: str, body: str, url: str, country: str, agency: str) -> dict:
+    if not USE_GEMINI:
+        return {}
+
+    prompt = f"""
+당신은 삼성전자 본사 관세/통상 리스크 분석 담당자입니다.
+아래 뉴스/게시물 내용을 기준으로 GTI 메일용 분석을 작성하세요.
+
+분석 기준:
+- 삼성전자 생산거점: Korea, China, Vietnam, India, Indonesia, Turkey, Slovakia, Poland, Mexico, Brazil
+- 제품군: Mobile, Consumer Electronics, Network Equipment, Semiconductor, Display, Medical
+- 관세율 변동/반덤핑/상계관세/수출통제/수입규제/FTA 원산지 영향은 중요도 상 또는 중
+- 금/은/담배/학생비자/범죄/일반정치 등 삼성전자 관세업무 직접 관련 낮은 뉴스는 중요도 하
+- 과장하지 말고 원문 기반으로 작성
+- 반드시 한국어로 작성
+- 아래 JSON만 출력
+
+출력 JSON 형식:
+{{
+  "Summary": "뉴스 핵심 내용 2~3문장",
+  "AI Analysis": "삼성전자 관세/통상 업무 영향 2~3문장. 관련 없으면 영향 낮음이라고 명확히 작성",
+  "Action Plan": "관세 전문가 대응방안 1~3개 항목",
+  "Country": "대표 국가 2개 이하",
+  "agency": "관련 정부기관/국제기구 2개 이하",
+  "Risk": "상/중/하",
+  "Products": "관련 제품군"
+}}
+
+Headline: {headline}
+Current Country: {country}
+Current Agency: {agency}
+URL: {url}
+
+Body:
+{body[:4500]}
+""".strip()
+
+    endpoint = f"https://generativelanguage.googleapis.com/v1beta/models/{GEMINI_MODEL}:generateContent"
+    params = {"key": GEMINI_API_KEY}
+    payload = {
+        "contents": [{"parts": [{"text": prompt}]}],
+        "generationConfig": {
+            "temperature": 0.2,
+            "topP": 0.8,
+            "maxOutputTokens": 1200,
+        },
+    }
+
+    try:
+        r = requests.post(endpoint, params=params, json=payload, timeout=60)
+        if r.status_code >= 400:
+            log(f"[GEMINI SKIP] HTTP {r.status_code}: {r.text[:120]}")
+            return {}
+
+        data = r.json()
+        text = data["candidates"][0]["content"]["parts"][0]["text"]
+        text = text.strip()
+        text = re.sub(r"^```json\s*", "", text, flags=re.I)
+        text = re.sub(r"^```\s*", "", text)
+        text = re.sub(r"\s*```$", "", text)
+        m = re.search(r"\{.*\}", text, flags=re.S)
+        if m:
+            text = m.group(0)
+        obj = json.loads(text)
+        return obj if isinstance(obj, dict) else {}
+    except Exception as e:
+        log(f"[GEMINI SKIP] {type(e).__name__}: {e}")
+        return {}
+
+
+def fallback_summary(headline: str, body: str) -> str:
+    body = clean_text(body)
+    headline = clean_text(headline)
+
+    if body and len(body) >= 250:
+        sentences = re.split(r"(?<=[.!?。다])\s+", body)
+        sentences = [clean_text(s) for s in sentences if len(clean_text(s)) >= 25]
+        if sentences:
+            out = " ".join(sentences[:3])
+            return out[:420]
+
+    # 제목만 있어도 반복 문구 대신 제목 기반 요약 생성
+    return f"해당 뉴스는 '{headline}' 이슈를 다루고 있습니다. 제목 기준으로 관세·통상 관련성, 대상 국가, 관련 품목 또는 제도 변경 가능성을 확인해야 합니다."
+
+
+def fallback_analysis(headline: str, body: str, country: str, products: str, risk: str) -> str:
+    text = f"{headline} {body}".lower()
+
+    if risk == "하":
+        return "삼성전자 주요 제품·생산거점의 관세비용 또는 통관 프로세스에 대한 직접 영향은 낮아 보입니다. 다만 동일 이슈가 수입규제·관세조치로 확대되는지 모니터링이 필요합니다."
+
+    if "anti-dumping" in text or "반덤핑" in text:
+        return f"{country} 관련 반덤핑 또는 수입규제 이슈로, {products} 공급망 내 유사 HS 품목의 조사 확대 가능성을 점검해야 합니다. 베트남·인도·중국 등 생산법인의 수출입 품목과 규제 대상 품목의 중복 여부 확인이 필요합니다."
+
+    if "fta" in text or "무역협정" in text:
+        return f"{country} FTA/무역협정 변화는 원산지 기준, 협정세율 적용 가능성, 공급망 전환 전략에 영향을 줄 수 있습니다. {products} 관련 거래에서 원산지 판정 및 증빙 체계를 사전 점검해야 합니다."
+
+    if "tariff" in text or "duty" in text or "관세" in text:
+        return f"{country} 관세·수입세율 변동 이슈로, {products} 관련 원재료·완제품의 수입원가와 통관 신고 기준에 영향을 줄 수 있습니다. HS, 과세가격, 원산지 기준 변경 여부를 확인해야 합니다."
+
+    if "customs" in text or "통관" in text or "세관" in text:
+        return f"{country} 통관·세관 집행 동향으로, 신고 정확성·증빙관리·사후심사 리스크가 높아질 수 있습니다. 법인별 신고자료와 관세사 제출자료의 정합성 점검이 필요합니다."
+
+    return f"{country} 통상정책 변화 가능성이 있어 {products} 공급망 관점에서 HS, 원산지, 과세가격, 수입규제 영향 여부를 확인해야 합니다."
+
+
+def fallback_action(headline: str, body: str, country: str, risk: str) -> str:
+    text = f"{headline} {body}".lower()
+
+    if risk == "하":
+        return "① 일일 모니터링 유지 ② 동일 이슈의 관세·수입규제 확대 여부 확인 ③ 삼성 관련 HS/품목과 직접 연결될 경우 재분류"
+
+    if "anti-dumping" in text or "반덤핑" in text:
+        return "① 규제 대상 HS/품목 확인 ② 생산법인 수출입 품목과 매칭 ③ 조사대상국·공급업체 거래 여부 확인 ④ 필요 시 관세사/법무 검토 요청"
+
+    if "fta" in text or "무역협정" in text:
+        return "① 협정문·원산지 기준 변경 여부 확인 ② 적용 가능 HS 및 생산공정 기준 검토 ③ 법인별 원산지 증빙 준비상태 점검"
+
+    if "tariff" in text or "duty" in text or "관세" in text:
+        return "① 세율 변경 대상 HS 확인 ② 수입원가 영향 시뮬레이션 ③ 기존 신고가격·원산지·거래구조 점검 ④ 법인별 대응 가이드 배포"
+
+    return "① 원문 공고/법령 확인 ② 대상 국가·HS·제품군 매핑 ③ 법인별 수입/수출 신고 영향 검토 ④ 필요 시 대응계획 수립"
+
+
+# ============================================================
+# 6. PREPARE TOP NEWS
+# ============================================================
+def prepare_top(raw: pd.DataFrame) -> pd.DataFrame:
+    df = normalize_columns(raw)
+
+    # 핵심 버그 방지: 모든 값을 문자열로 안전 결합
+    df["_pre_text"] = df.apply(lambda r: safe_join_values(r.values), axis=1)
+    df["Headline"] = df.apply(headline_fallback, axis=1)
+    df["Date"] = df["Date"].map(safe_date)
+    df["URL"] = df["URL"].map(clean_text)
+
+    # URL 없는 행 제거
+    df = df[df["Headline"].map(lambda x: len(clean_text(x)) > 0)].copy()
+
+    # relevance/score
+    df["_relevant"] = df.apply(is_relevant, axis=1)
+    df["_score"] = df.apply(calc_score, axis=1)
+    df = df.sort_values(["_relevant", "_score"], ascending=[False, False]).copy()
+
+    # 1차 중복 제거
+    df["_url_key"] = df["URL"].str.lower().str.strip()
+    df["_title_key"] = df["Headline"].map(normalize_title)
+    if "_url_key" in df.columns:
+        df = df.drop_duplicates(subset=["_url_key"], keep="first")
+    df = df.drop_duplicates(subset=["_title_key"], keep="first")
+
+    # 유사 제목 중복 제거
+    candidates = dedup_similar(df, max_rows=FETCH_LIMIT).copy()
+    log(f"[CANDIDATES] {len(candidates)} rows selected for body/AI analysis")
+
+    rows = []
+    for i, (_, r) in enumerate(candidates.iterrows(), start=1):
+        headline = clean_text(r.get("Headline", ""))
+        url = clean_text(r.get("URL", ""))
+        source_summary = clean_text(r.get("Summary", ""))
+        source_ai = clean_text(r.get("AI Analysis", ""))
+        source_action = clean_text(r.get("Action Plan", ""))
+
+        log(f"[{i}/{len(candidates)}] {headline[:70]}")
+
+        final_url = resolve_redirect_url(url)
+        article_body = ""
+
+        # 기존 Summary가 충분하지 않으면 URL 본문 추출
+        if len(source_summary) < 120 or "본문 정보가 제한" in source_summary:
+            fetched_url, html_text = fetch_html(final_url)
+            if fetched_url:
+                final_url = fetched_url
+            article_body = extract_article_text(html_text)
+            time.sleep(0.4)
+
+        base_body = article_body if len(article_body) >= 200 else source_summary
+        if not base_body:
+            base_body = headline
+
+        country = infer_country(safe_join_values([headline, base_body, r.get("Country", "")]), r.get("Country", ""))
+        agency = infer_agency(safe_join_values([headline, base_body, final_url, r.get("agency", "")]), r.get("agency", ""))
+        products = infer_products(safe_join_values([headline, base_body]))
+        pre_risk = normalize_risk(r.get("Risk", "")) or infer_risk(headline, base_body, country, products)
+
+        ai = {}
+        # 기존 분석이 복붙/부실이면 Gemini 재분석
+        bad_existing = (
+            not source_ai
+            or "HS, 원산지, 과세가격" in source_ai
+            or "본문 정보가 제한" in source_summary
+            or len(source_ai) < 40
+        )
+        if bad_existing:
+            ai = call_gemini(headline, base_body, final_url, country, agency)
+
+        summary = clean_text(ai.get("Summary", "")) or fallback_summary(headline, base_body)
+        analysis = clean_text(ai.get("AI Analysis", "")) or (
+            source_ai if source_ai and "HS, 원산지, 과세가격" not in source_ai else fallback_analysis(headline, base_body, country, products, pre_risk)
+        )
+        action = clean_text(ai.get("Action Plan", "")) or (
+            source_action if source_action and "대상 국가·HS·제품군" not in source_action else fallback_action(headline, base_body, country, pre_risk)
+        )
+        country = clean_text(ai.get("Country", "")) or country
+        agency = clean_text(ai.get("agency", "")) or agency
+        products = clean_text(ai.get("Products", "")) or products
+        risk = normalize_risk(ai.get("Risk", "")) or pre_risk
+
+        # Gemini가 관련 없는 뉴스를 과대평가한 경우 하향
+        if any(n.lower() in f"{headline} {base_body}".lower() for n in NOISE_TERMS):
+            risk = "하"
+
+        section = infer_section(risk, safe_join_values([headline, summary, analysis]))
+
+        rows.append({
+            "Date": safe_date(r.get("Date", "")),
+            "Headline": headline,
             "Summary": summary,
             "AI Analysis": analysis,
             "Action Plan": action,
             "Country": country,
-            "Agency": agency,
+            "agency": agency,
             "Risk": risk,
-            "Samsung Impact Score": score,
-            "URL": row["URL"],
-            "Source": row["Source"],
-            "Issue": classify_issue(text),
-            "Cluster": row["_cluster"],
-        }
-        ai = analyze_with_gemini(item)
-        if ai:
-            item["Summary"] = clean(ai.get("Summary")) or item["Summary"]
-            item["AI Analysis"] = clean(ai.get("AI Analysis")) or item["AI Analysis"]
-            item["Action Plan"] = clean(ai.get("Action Plan")) or item["Action Plan"]
-        rows.append(item)
-
-    return pd.DataFrame(rows)
-
-
-def infer_products(text: str) -> str:
-    products = []
-    rules = [
-        ("Semiconductor/Component", ["semiconductor", "chip", "hbm", "memory", "반도체", "칩", "메모리", "부품"]),
-        ("Mobile", ["smartphone", "mobile", "phone", "스마트폰", "모바일"]),
-        ("Consumer Electronics", ["consumer electronics", "appliance", "tv", "가전", "tv"]),
-        ("Display", ["display", "디스플레이"]),
-        ("Network Equipment", ["network", "telecom", "5g", "네트워크", "통신장비"]),
-    ]
-    low = text.lower()
-    for name, keys in rules:
-        if any(k.lower() in low for k in keys):
-            products.append(name)
-    return ", ".join(products[:3]) if products else "Mobile, Consumer Electronics, Semiconductor/Component"
-
-
-# =============================================================================
-# WRITING QUALITY
-# =============================================================================
-def fallback_summary(headline: str, country: str, agency: str) -> str:
-    return (
-        f"{headline} 관련 정책·집행 변화입니다. 본사 관세팀 관점에서는 {country}의 {agency} 발표가 "
-        "관세율, 통관요건, 원산지 또는 수입규제 변화로 연결되는지 확인할 필요가 있습니다."
-    )
-
-
-def fallback_analysis(headline: str, country: str, risk: str, products: str) -> str:
-    low = headline.lower()
-    if contains_any(low, ["section 301", "301조", "tariff", "관세"]):
-        return (
-            f"{country} 관세 변화는 {products}의 대미·대EU 수출입 원가와 가격전가 판단에 영향을 줄 수 있습니다. "
-            "SEV/SEVT, SIEL, SAMEX 등 생산법인별 HS와 원산지 기준을 함께 점검해야 합니다."
-        )
-    if contains_any(low, ["export control", "수출통제", "sanction", "제재"]):
-        return (
-            f"{country} 수출통제 이슈는 {products}의 출하 가능 여부, 최종사용자 확인, 라이선스 필요성에 영향을 줄 수 있습니다. "
-            "반도체·부품 공급망과 해외 생산법인 거래선을 우선 점검해야 합니다."
-        )
-    if contains_any(low, ["anti-dumping", "antidumping", "반덤핑", "countervailing", "상계관세"]):
-        return (
-            f"{country} 반덤핑·상계관세 이슈는 우회수출, 공급국 전환, 과세가격 방어자료 요구로 확대될 수 있습니다. "
-            f"{products} 관련 원재료·부품 조달 구조와 거래가격 증빙을 확인해야 합니다."
-        )
-    if contains_any(low, ["origin", "원산지", "fta", "usmca"]):
-        return (
-            f"{country} 원산지·FTA 이슈는 특혜관세 적용과 비특혜 원산지 판정에 직접 영향을 줄 수 있습니다. "
-            "생산공정, BOM, 원산지증명서 발급 기준을 생산지별로 재점검해야 합니다."
-        )
-    return (
-        f"{country} 통상정책 변화는 {products}의 수입원가, 수출통관, 원산지 입증 부담에 영향을 줄 수 있습니다. "
-        "본사 관세팀 모니터링 항목으로 등록해 시행일과 적용 품목을 확인해야 합니다."
-    )
-
-
-def fallback_action(headline: str, country: str, agency: str, risk: str) -> str:
-    base = (
-        f"{agency} 원문, 시행일, 적용 품목과 HS 범위를 확인하고 관련 법인에 영향 가능 품목 리스트를 요청합니다. "
-        "원산지 증빙, FTA 적용 여부, 과세가격 자료를 함께 점검합니다."
-    )
-    if risk == "상":
-        return base + " 관세율 변경 시나리오별 원가 영향을 즉시 산출해 사업부와 공유합니다."
-    if risk == "중":
-        return base + " 조사·협의·입법 진행 일정을 추적하고 요청 가능 자료를 사전에 준비합니다."
-    return base + " 단기 조치보다 모니터링 리스트에 등록해 후속 공지를 확인합니다."
-
-
-def analyze_with_gemini(row: dict) -> dict | None:
-    if not USE_GEMINI or not GEMINI_API_KEY:
-        return None
-    try:
-        from google import genai
-
-        client = genai.Client(api_key=GEMINI_API_KEY)
-        prompt = f"""
-You are a Samsung Electronics HQ customs and trade compliance manager.
-
-Samsung context:
-- Production sites: Korea, China, Vietnam(SEV/SEVT), India(SIEL), Mexico(SAMEX), Indonesia, Poland, Slovakia, Turkey, Brazil.
-- Products: Mobile smartphones, Consumer Electronics, Network Equipment, Semiconductor/Component, Display, Medical.
-- Job scope: tariff rate, Section 301/232, anti-dumping/countervailing duties, export control, origin, HS classification, FTA, customs valuation, import/export clearance.
-
-News:
-Headline: {row['Headline']}
-Country: {row['Country']}
-Agency: {row['Agency']}
-Risk: {row['Risk']}
-Issue: {row['Issue']}
-
-Return only JSON in Korean:
-{{
-  "Summary": "뉴스 요약 2문장 이내",
-  "AI Analysis": "삼성전자 본사 관세담당자 관점 영향 2문장 이내",
-  "Action Plan": "관세담당자가 실행할 조치 1-2문장"
-}}
-"""
-        res = client.models.generate_content(
-            model=GEMINI_MODEL,
-            contents=prompt,
-            config={"temperature": GEMINI_TEMPERATURE, "max_output_tokens": 900},
-        )
-        text = res.text.strip()
-        return json.loads(text[text.find("{") : text.rfind("}") + 1])
-    except Exception:
-        return None
-
-
-def build_gemini_client():
-    if not USE_GEMINI or not GEMINI_API_KEY:
-        return None
-    try:
-        from google import genai
-
-        return genai.Client(api_key=GEMINI_API_KEY)
-    except Exception:
-        return None
-
-
-def parse_json_object(text: str) -> dict | None:
-    try:
-        text = clean(text)
-        start = text.find("{")
-        end = text.rfind("}")
-        if start < 0 or end < start:
-            return None
-        return json.loads(text[start : end + 1])
-    except Exception:
-        return None
-
-
-def optimize_rows_with_gemini(rows: pd.DataFrame) -> pd.DataFrame:
-    """
-    Gemini is used only after deterministic selection is finished.
-    It must not add/remove/re-rank news. It only improves wording.
-    """
-    client = build_gemini_client()
-    if client is None:
-        log("[GEMINI] skipped: API key/client unavailable")
-        return rows
-
-    improved = rows.copy()
-    for idx, row in improved.iterrows():
-        prompt = f"""
-You are Samsung Electronics HQ customs and trade compliance manager.
-
-Rewrite the selected news analysis in Korean for a daily executive customs/trade intelligence email.
-
-Rules:
-- Do not change the headline, country, agency, risk, score, issue, or URL.
-- Do not exaggerate Samsung impact. If impact is indirect, say it is indirect.
-- Use Samsung customs wording: SEV/SEVT, SIEL, SAMEX, HS, origin, customs valuation, FTA, ECCN, tariff rate, import/export clearance.
-- Summary: max 2 concise sentences.
-- AI Analysis: max 2 concise sentences, Samsung HQ customs perspective.
-- Action Plan: max 2 concrete action sentences.
-- Avoid repeated boilerplate.
-
-News:
-Headline: {row['Headline']}
-Country: {row['Country']}
-Agency: {row['Agency']}
-Risk: {row['Risk']}
-Issue: {row['Issue']}
-Current Summary: {row['Summary']}
-Current AI Analysis: {row['AI Analysis']}
-Current Action Plan: {row['Action Plan']}
-
-Return only JSON:
-{{
-  "Summary": "...",
-  "AI Analysis": "...",
-  "Action Plan": "..."
-}}
-"""
-        try:
-            res = client.models.generate_content(
-                model=GEMINI_MODEL,
-                contents=prompt,
-                config={"temperature": GEMINI_TEMPERATURE, "max_output_tokens": 900},
-            )
-            data = parse_json_object(res.text)
-            if data:
-                for col in ["Summary", "AI Analysis", "Action Plan"]:
-                    value = clean(data.get(col, ""))
-                    if value:
-                        improved.at[idx, col] = value
-        except Exception as exc:
-            log(f"[GEMINI] row {idx + 1} skipped: {type(exc).__name__}")
-    return improved
-
-
-def optimize_review_with_gemini(top3: pd.DataFrame) -> dict | None:
-    client = build_gemini_client()
-    if client is None or top3.empty:
-        return None
-
-    items = []
-    for i, (_, row) in enumerate(top3.iterrows(), start=1):
-        items.append({
-            "rank": i,
-            "headline": clean(row.get("Headline", "")),
-            "country": clean(row.get("Country", "")),
-            "agency": clean(row.get("Agency", "")),
-            "risk": clean(row.get("Risk", "")),
-            "issue": clean(row.get("Issue", "")),
-            "summary": clean(row.get("Summary", "")),
-            "analysis": clean(row.get("AI Analysis", "")),
-            "action": clean(row.get("Action Plan", "")),
+            "URL": final_url or url,
+            "source": clean_text(r.get("source", "")) or domain_of(final_url or url),
+            "Products": products,
+            "Section": section,
+            "score": calc_score(r) + (30 if risk == "상" else 15 if risk == "중" else 0),
+            "body_len": len(article_body),
         })
 
-    prompt = f"""
-You are writing the opening executive review for Samsung Electronics HQ customs team.
+    out = pd.DataFrame(rows)
 
-Input is the already-selected Top3. Do not question or change selection.
+    if out.empty:
+        raise RuntimeError("분석 대상 뉴스가 없습니다. STEP3 결과 파일을 확인하세요.")
 
-Write in Korean:
-1. total_review: one concise paragraph, 1-2 sentences.
-2. bullets: exactly 3 bullets, one for each Top3, each one sentence.
+    out = select_top30_with_samsung_top3(out).reset_index(drop=True)
 
-Rules:
-- Perspective: Samsung Electronics HQ customs/trade compliance manager.
-- Mention SEV/SEVT, SIEL, SAMEX only when relevant; otherwise use "주요 생산법인".
-- Use concrete customs terms: HS, origin, customs valuation, FTA, ECCN, tariff rate, import/export clearance.
-- Do not mention FTA unless the issue is explicitly FTA/origin/trade agreement.
-- Do not say Samsung should consult foreign customs authorities unless the news is an official customs procedure requiring consultation.
-- Do not invent plant-specific impact. If uncertain, say "주요 생산법인" or "대미/대EU 수출 품목".
-- For USTR semiconductor tariff news, focus on HS mapping, tariff-rate scenarios, origin, and US-bound shipment impact.
-- For US-China semiconductor export-control news, focus on ECCN, end-user, re-export, and shipment-control checks.
-- For EU-China semiconductor supply news, focus on alternative sourcing, import restriction changes, origin, and customs clearance monitoring.
-- Do not repeat the same sentence pattern.
-- No vague phrase like "영향 점검 필요" repeated across bullets.
-- Do not mention unrelated industries unless needed to explain indirect risk.
-- Keep each bullet under 85 Korean characters if possible.
-
-Top3 JSON:
-{json.dumps(items, ensure_ascii=False)}
-
-Return only JSON:
-{{
-  "total_review": "...",
-  "bullets": ["...", "...", "..."]
-}}
-"""
-    try:
-        res = client.models.generate_content(
-            model=GEMINI_MODEL,
-            contents=prompt,
-            config={"temperature": GEMINI_TEMPERATURE, "max_output_tokens": 1000},
-        )
-        data = parse_json_object(res.text)
-        if not data:
-            return None
-        bullets = data.get("bullets", [])
-        if not isinstance(bullets, list) or len(bullets) != 3:
-            return None
-        total = clean(data.get("total_review", ""))
-        bullets = [clean(x) for x in bullets if clean(x)]
-        if not total or len(bullets) != 3:
-            return None
-        bullets = [postprocess_review_bullet(top3.iloc[i], bullets[i]) for i in range(3)]
-        total = postprocess_total_review(total)
-        return {"total_review": total, "bullets": bullets}
-    except Exception as exc:
-        log(f"[GEMINI] review skipped: {type(exc).__name__}")
-        return None
+    return out[[
+        "No", "Section", "Date", "Headline", "Summary", "AI Analysis", "Action Plan",
+        "Country", "agency", "Risk", "Products", "URL", "source", "score", "Samsung Impact Score", "body_len"
+    ]]
 
 
-def postprocess_total_review(text: str) -> str:
-    text = clean(text)
-    text = text.replace("지속적인 모니터링 및 대응이 필요합니다", "HS·원산지·수출통제 기준을 우선 재점검해야 합니다")
-    text = text.replace("지속적인 모니터링이 필요합니다", "후속 시행일과 적용 품목을 추적해야 합니다")
-    return text
+# ============================================================
+# 7. EXCEL / HTML
+# ============================================================
+def save_excel(df: pd.DataFrame, path: Path) -> None:
+    wb = Workbook()
+    ws = wb.active
+    ws.title = "GTI Radar Top30"
 
+    headers = ["No", "Section", "Date", "Headline", "Summary", "AI Analysis", "Action Plan",
+               "Country", "agency", "Risk", "Products", "URL", "source", "score", "Samsung Impact Score", "body_len"]
+    ws.append(headers)
 
-def postprocess_review_bullet(row: pd.Series, text: str) -> str:
-    text = clean(text)
-    issue = clean(row.get("Issue", ""))
-    headline = clean(row.get("Headline", "")).lower()
+    for _, r in df.iterrows():
+        ws.append([r.get(h, "") for h in headers])
+        row_idx = ws.max_row
+        url = clean_text(r.get("URL", ""))
+        if url:
+            cell = ws.cell(row=row_idx, column=4)
+            cell.hyperlink = url
+            cell.font = Font(color="0563C1", underline="single", bold=True)
 
-    if issue not in {"FTA_ORIGIN"} and not contains_any(headline, ["fta", "origin", "원산지", "무역협정", "usmca"]):
-        text = text.replace("FTA 활용 전략", "원산지·관세율 영향")
-        text = text.replace("FTA 활용 가능성", "원산지·관세율 영향")
-        text = text.replace("FTA 활용", "원산지 기준")
-
-    text = text.replace("EU 관세 당국과의 협의를 통해", "EU 집행위·관세당국 후속 공지를 확인해")
-    text = text.replace("관세 당국과의 협의를 통해", "관세당국 후속 공지를 확인해")
-    text = text.replace("통관 관련 불확실성을 해소해야 합니다", "통관 리스크를 사전에 정리해야 합니다")
-
-    if issue == "SEMICONDUCTOR_SUPPLY" and contains_any(headline, ["ustr", "chip tariff", "반도체 관세", "tariff"]):
-        return "미국 반도체 관세가 즉시 시행되지 않더라도 HS별 관세율 시나리오와 원산지 영향표를 선제 갱신해야 합니다."
-    if issue == "EXPORT_CONTROL":
-        return "미·중 수출통제 이슈는 반도체 부품의 ECCN, 최종사용자, 우회수출 가능성을 재확인해야 합니다."
-    if issue == "SEMICONDUCTOR_SUPPLY" and contains_any(headline, ["eu", "중국", "china", "반도체"]):
-        return "중국/EU 반도체 공급망 변화는 대체조달, 원산지 판정, 수입규제 리스크로 나누어 봐야 합니다."
-
-    return text
-
-
-# =============================================================================
-# EXECUTIVE HTML
-# =============================================================================
-def html_link(headline: str, url: str) -> str:
-    title = html.escape(clean(headline))
-    href = html.escape(clean(url))
-    if href.startswith("http"):
-        return f'<a href="{href}" style="color:#0563C1;text-decoration:underline;font-weight:bold;">{title}</a>'
-    return f"<b>{title}</b>"
-
-
-def risk_color(risk: str) -> str:
-    return {"상": "#C00000", "중": "#ED7D31", "하": "#5B9BD5"}.get(risk, "#666666")
-
-
-def detect_theme(row: pd.Series) -> str:
-    issue = clean(row.get("Issue", ""))
-    return {
-        "SECTION_301": "미 301조 관세",
-        "SECTION_232": "미 232조 관세",
-        "EXPORT_CONTROL": "수출통제",
-        "AD_CVD": "반덤핑·상계관세",
-        "FTA_ORIGIN": "FTA·원산지",
-        "CUSTOMS": "통관·관세집행",
-        "SEMICONDUCTOR_SUPPLY": "반도체 공급망",
-        "TARIFF": "관세율 변동",
-    }.get(issue, "통상정책")
-
-
-def executive_impact(row: pd.Series) -> str:
-    theme = detect_theme(row)
-    country = clean(row.get("Country", "관련국"))
-    text = " ".join(clean(row.get(c, "")) for c in ["Headline", "Summary", "AI Analysis", "Action Plan", "Country"])
-    products = infer_products(text)
-    low = text.lower()
-    site = "주요 생산법인"
-    if contains_any(low, ["vietnam", "베트남", "sev", "sevt"]):
-        site = "SEV/SEVT"
-    elif contains_any(low, ["india", "인도", "siel"]):
-        site = "SIEL"
-    elif contains_any(low, ["mexico", "멕시코", "samex"]):
-        site = "SAMEX"
-    elif contains_any(low, ["china", "중국"]):
-        site = "중국 생산·조달망"
-
-    if "301조" in theme or "232조" in theme or "관세" in theme:
-        return f"{theme}: {site} 기준 {products}의 HS별 관세율·원산지·가격전가 영향표를 갱신해야 합니다."
-    if "수출통제" in theme:
-        return f"{theme}: {products}의 ECCN, 최종사용자, 우회수출 가능성을 점검하고 출하통제 기준을 재확인해야 합니다."
-    if "반덤핑" in theme:
-        return f"{theme}: 대상 품목이 삼성 부품·설비 조달망과 겹치는지 확인하고 원산지·가격 방어자료를 준비해야 합니다."
-    if "FTA" in theme:
-        return f"{theme}: {site}의 원산지 판정, CO 발급 요건, 특혜세율 적용 가능성을 재검토해야 합니다."
-    if "반도체" in theme:
-        if contains_any(country, ["United States", "미국"]):
-            return f"{theme}: 미국 반도체 관세가 즉시 시행되지 않더라도 품목별 HS·원산지 영향표를 선제 갱신해야 합니다."
-        if contains_any(country, ["China", "EU", "중국", "유럽"]):
-            return f"{theme}: 중국/EU 반도체 공급 의존도 변화가 대체조달·원산지 판정·수입규제 리스크로 이어지는지 봐야 합니다."
-        if contains_any(country, ["Korea", "한국"]):
-            return f"{theme}: 한국 수출 쏠림이 커진 만큼 반도체 주요 품목의 관세율·통관 리스크를 별도 관리해야 합니다."
-        return f"{theme}: 반도체 부품·장비 조달선 변화가 HS·원산지 판정과 수출통관 리스크로 이어지는지 확인해야 합니다."
-    if "통관" in theme:
-        return f"{theme}: 신고자료, HS 분류, 과세가격 증빙을 정비해 법인별 통관심사 대응 수준을 맞춰야 합니다."
-    return f"{theme}: 후속 고시와 시행일을 추적하고 삼성 적용 품목 여부를 관세 리스크 리스트에 반영해야 합니다."
-
-
-def build_total_review(top3: pd.DataFrame) -> str:
-    countries = []
-    themes = []
-    for _, row in top3.iterrows():
-        for country in clean(row.get("Country", "")).split(","):
-            country = country.strip()
-            if country and country not in countries:
-                countries.append(country)
-        theme = detect_theme(row)
-        if theme not in themes:
-            themes.append(theme)
-    country_text = ", ".join(countries[:3]) if countries else "주요국"
-    theme_text = "·".join(themes[:3]) if themes else "관세·통상"
-    has_export_control = any("수출통제" in theme for theme in themes)
-    has_semiconductor = any("반도체" in theme for theme in themes)
-    has_tariff = any(("관세" in theme or "301조" in theme or "232조" in theme) for theme in themes)
-
-    if has_semiconductor and has_export_control:
-        return (
-            f"{country_text}에서 반도체 관세와 수출통제 신호가 동시에 감지됩니다. "
-            "본사 관세팀은 SEV/SEVT·SIEL·SAMEX 기준으로 HS, 원산지, ECCN, 최종사용자 통제를 함께 점검해야 합니다."
-        )
-    if has_tariff:
-        return (
-            f"{country_text} 중심으로 {theme_text} 변화가 이어지고 있습니다. "
-            "본사 관세팀은 적용 품목, 시행일, 관세율 시나리오를 법인별 원가 영향으로 즉시 연결해야 합니다."
-        )
-    return (
-        f"{country_text} 관련 {theme_text} 이슈가 확인됐습니다. "
-        "본사 관세팀은 삼성 적용 품목 여부를 먼저 가르고, 필요한 경우 HS·원산지·과세가격 증빙을 보강해야 합니다."
-    )
-
-
-def build_html(rows: pd.DataFrame, review: dict | None = None) -> str:
-    subject = f"[GTI Radar] Global Trade Intelligence | {RUN_DATE}"
-    top3 = rows.head(3).copy()
-    rest = rows.iloc[3:].copy()
-    if review:
-        total_review = clean(review.get("total_review", "")) or build_total_review(top3)
-        review_bullets = review.get("bullets", [])
-        if not isinstance(review_bullets, list) or len(review_bullets) != 3:
-            review_bullets = [executive_impact(row) for _, row in top3.iterrows()]
-    else:
-        total_review = build_total_review(top3)
-        review_bullets = [executive_impact(row) for _, row in top3.iterrows()]
-    bullets = "".join(f"· {html.escape(clean(line))}<br>" for line in review_bullets)
-
-    top_blocks = []
-    for idx, row in top3.iterrows():
-        top_blocks.append(f"""
-        <div style="margin:16px 0 18px 0;padding:14px;border-left:5px solid #C00000;background:#FFF7F7;">
-          <div style="font-size:15px;font-weight:bold;margin-bottom:6px;">Top {idx + 1}. {html_link(row['Headline'], row['URL'])}</div>
-          <div style="font-size:12px;color:#555;margin-bottom:10px;">Publish Date: {html.escape(clean(row['Date']))} | Country: {html.escape(clean(row['Country']))} | Agency: {html.escape(clean(row['Agency']))} | Risk: <span style="color:{risk_color(row['Risk'])};font-weight:bold;">{html.escape(clean(row['Risk']))}</span> | Samsung Impact Score: {row['Samsung Impact Score']}</div>
-          <div style="margin-top:8px;"><b>Executive Impact</b><br>{html.escape(executive_impact(row))}</div>
-          <div style="margin-top:8px;"><b>Summary</b><br>{html.escape(clean(row['Summary']))}</div>
-          <div style="margin-top:8px;"><b>Impact</b><br>{html.escape(clean(row['AI Analysis']))}</div>
-          <div style="margin-top:8px;"><b>Action</b><br>{html.escape(clean(row['Action Plan']))}</div>
-        </div>
-        """)
-
-    event_rows = []
-    for _, row in rest.iterrows():
-        event_rows.append(f"""
-        <tr>
-          <td style="padding:7px;border:1px solid #d9d9d9;text-align:center;">{row['No']}</td>
-          <td style="padding:7px;border:1px solid #d9d9d9;">{html_link(row['Headline'], row['URL'])}</td>
-          <td style="padding:7px;border:1px solid #d9d9d9;">{html.escape(clean(row['Summary']))}</td>
-          <td style="padding:7px;border:1px solid #d9d9d9;">{html.escape(clean(row['AI Analysis']))}</td>
-          <td style="padding:7px;border:1px solid #d9d9d9;">{html.escape(clean(row['Action Plan']))}</td>
-          <td style="padding:7px;border:1px solid #d9d9d9;text-align:center;">{html.escape(clean(row['Country']))}</td>
-          <td style="padding:7px;border:1px solid #d9d9d9;">{html.escape(clean(row['Agency']))}</td>
-          <td style="padding:7px;border:1px solid #d9d9d9;text-align:center;color:{risk_color(row['Risk'])};font-weight:bold;">{html.escape(clean(row['Risk']))}</td>
-          <td style="padding:7px;border:1px solid #d9d9d9;text-align:center;">{html.escape(clean(row['Date']))}</td>
-        </tr>
-        """)
-
-    return f"""<!DOCTYPE html>
-<html lang="ko">
-<head><meta charset="utf-8"><title>{html.escape(subject)}</title></head>
-<body style="font-family:Arial,'Malgun Gothic',sans-serif;font-size:13px;color:#222;line-height:1.5;">
-  <div style="max-width:1200px;margin:0 auto;">
-    <h2 style="margin-bottom:4px;color:#1F4E78;">[GTI Radar] Global Trade Intelligence</h2>
-    <div style="font-size:14px;margin-bottom:4px;"><b>Date:</b> {RUN_DATE}</div>
-    <div style="font-size:12px;color:#555;margin-bottom:16px;">Coverage: Last {LOOKBACK_HOURS} Hours | Focus: Samsung Electronics Customs & Trade Intelligence</div>
-
-    <h3 style="margin-top:18px;margin-bottom:6px;">총평</h3>
-    <div style="margin-top:10px;margin-bottom:20px;padding:16px;background:#F4F6F8;border-left:6px solid #1F4E78;color:#222;">
-      <div style="font-size:12pt;font-weight:bold;line-height:1.7;margin-bottom:10px;">{html.escape(total_review)}</div>
-      <div style="margin-top:10px;font-size:11pt;font-weight:normal;line-height:1.8;">{bullets}</div>
-    </div>
-
-    <h3 style="color:#C00000;margin-top:22px;">TOP POLICY EVENTS (Top 3)</h3>
-    {''.join(top_blocks)}
-
-    <h3 style="color:#1F4E78;margin-top:24px;">EVENT LIST</h3>
-    <table style="border-collapse:collapse;width:100%;font-size:12px;">
-      <tr style="background:#1F4E78;color:white;">
-        <th style="padding:7px;border:1px solid #d9d9d9;">No</th>
-        <th style="padding:7px;border:1px solid #d9d9d9;">Headline</th>
-        <th style="padding:7px;border:1px solid #d9d9d9;">Summary</th>
-        <th style="padding:7px;border:1px solid #d9d9d9;">Impact</th>
-        <th style="padding:7px;border:1px solid #d9d9d9;">Action</th>
-        <th style="padding:7px;border:1px solid #d9d9d9;">Country</th>
-        <th style="padding:7px;border:1px solid #d9d9d9;">Agency</th>
-        <th style="padding:7px;border:1px solid #d9d9d9;">Risk</th>
-        <th style="padding:7px;border:1px solid #d9d9d9;">Publish Date</th>
-      </tr>
-      {''.join(event_rows)}
-    </table>
-    <p style="margin-top:18px;color:#666;font-size:12px;">첨부 Excel 파일에 전체 Top30 분석표가 포함되어 있습니다.</p>
-  </div>
-</body>
-</html>"""
-
-
-# =============================================================================
-# EXCEL / MAIL
-# =============================================================================
-def make_headline_formula(title: str, url: str) -> str:
-    if clean(url).startswith("http"):
-        return f'=HYPERLINK("{url.replace(chr(34), "%22")}","{title.replace(chr(34), "'")}")'
-    return title
-
-
-def style_sheet(ws) -> None:
     header_fill = PatternFill("solid", fgColor="1F4E78")
     header_font = Font(color="FFFFFF", bold=True)
     thin = Side(style="thin", color="D9D9D9")
     border = Border(left=thin, right=thin, top=thin, bottom=thin)
+
     for cell in ws[1]:
         cell.fill = header_fill
         cell.font = header_font
         cell.alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
         cell.border = border
-    for row in ws.iter_rows(min_row=2):
-        for cell in row:
-            cell.alignment = Alignment(vertical="top", wrap_text=True)
-            cell.border = border
-        ws.row_dimensions[row[0].row].height = 84
-    ws.freeze_panes = "A2"
-    ws.auto_filter.ref = ws.dimensions
 
-
-def save_excel(rows: pd.DataFrame, paths: dict[str, Path]) -> None:
-    headers = ["No", "Date", "Headline", "Summary", "AI Analysis", "Action Plan", "Country", "Agency", "Risk", "Samsung Impact Score", "URL", "Source", "Issue", "Cluster"]
-    wb = Workbook()
-    ws = wb.active
-    ws.title = "GTI Radar Top30"
-    ws.append(headers)
-    for _, row in rows.iterrows():
-        ws.append([row.get(h, "") if h != "Headline" else make_headline_formula(row["Headline"], row["URL"]) for h in headers])
-        cell = ws.cell(row=ws.max_row, column=3)
-        if clean(row["URL"]).startswith("http"):
-            cell.hyperlink = row["URL"]
-            cell.font = Font(color="0563C1", underline="single", bold=True)
     widths = {
-        "A": 6, "B": 18, "C": 58, "D": 58, "E": 62, "F": 58, "G": 20,
-        "H": 34, "I": 9, "J": 18, "K": 42, "L": 24, "M": 20, "N": 28,
+        "A": 6, "B": 16, "C": 18, "D": 46, "E": 55, "F": 58, "G": 52,
+        "H": 14, "I": 28, "J": 10, "K": 22, "L": 36, "M": 18, "N": 10, "O": 18, "P": 10
     }
     for col, width in widths.items():
         ws.column_dimensions[col].width = width
-    style_sheet(ws)
 
-    ws2 = wb.create_sheet("Top3")
-    ws2.append(headers)
-    for _, row in rows.head(3).iterrows():
-        ws2.append([row.get(h, "") if h != "Headline" else make_headline_formula(row["Headline"], row["URL"]) for h in headers])
-    for idx, width in enumerate([6, 18, 58, 58, 62, 58, 20, 34, 9, 18, 42, 24, 20, 28], start=1):
-        ws2.column_dimensions[get_column_letter(idx)].width = width
-    style_sheet(ws2)
+    for row in ws.iter_rows(min_row=2, max_row=ws.max_row):
+        for cell in row:
+            cell.alignment = Alignment(vertical="top", wrap_text=True)
+            cell.border = border
+        ws.row_dimensions[row[0].row].height = 95
 
-    ws3 = wb.create_sheet("Run Log")
-    ws3.append(["item", "value"])
-    ws3.append(["input", str(INPUT_FILE)])
-    ws3.append(["run_date", RUN_DATE])
-    ws3.append(["lookback_hours", LOOKBACK_HOURS])
-    ws3.append(["selected_rows", len(rows)])
-    ws3.append(["gemini", "ON" if USE_GEMINI and GEMINI_API_KEY else "OFF"])
-    style_sheet(ws3)
+    for row in range(2, ws.max_row + 1):
+        risk = ws.cell(row=row, column=10).value
+        if risk == "상":
+            ws.cell(row=row, column=10).fill = PatternFill("solid", fgColor="F4B183")
+        elif risk == "중":
+            ws.cell(row=row, column=10).fill = PatternFill("solid", fgColor="FFE699")
+        else:
+            ws.cell(row=row, column=10).fill = PatternFill("solid", fgColor="C6E0B4")
 
-    wb.save(paths["mail_xlsx"])
-    wb.save(paths["analysis"])
+    ws.freeze_panes = "A2"
+    ws.auto_filter.ref = ws.dimensions
 
-    cumul = paths["cumulative"]
-    if cumul.exists():
-        old = pd.read_excel(cumul)
-        combined = pd.concat([old, rows], ignore_index=True)
-        combined = combined.drop_duplicates(subset=["URL"], keep="last")
-    else:
-        combined = rows.copy()
-    combined.to_excel(cumul, index=False)
-
-
-def load_recipients() -> list[str]:
-    recipients = [
-        x.strip()
-        for x in re.split(r"[;,]", MAIL_TO)
-        if re.fullmatch(r"[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,}", x.strip())
+    ws2 = wb.create_sheet("Run Summary")
+    summary_rows = [
+        ["Generated At", NOW_STR],
+        ["Subject", SUBJECT],
+        ["Input", str(INPUT_FILE)],
+        ["Output HTML", str(OUTPUT_HTML)],
+        ["Rows", len(df)],
+        ["Gemini", "ON" if USE_GEMINI else "OFF"],
+        ["Model", GEMINI_MODEL],
     ]
-    if recipients:
-        return list(dict.fromkeys(recipients))
+    for row in summary_rows:
+        ws2.append(row)
+    ws2.column_dimensions["A"].width = 24
+    ws2.column_dimensions["B"].width = 90
 
-    for fp in [RECIPIENT_FILE, Path(r"C:\Temp\00.xlsx"), Path(r"C:\Temp\mail.xlsx")]:
-        if not fp.exists():
+    wb.save(path)
+
+
+def esc(v) -> str:
+    return html.escape(clean_text(v)).replace("\n", "<br>")
+
+
+def link_html(title: str, url: str) -> str:
+    title = esc(title)
+    url = clean_text(url)
+    if url:
+        return f"<a href='{html.escape(url)}' style='color:#0563c1;text-decoration:underline;font-weight:bold;'>{title}</a>"
+    return title
+
+
+
+# ============================================================
+# 7-1. SAMSUNG IMPACT TOP3 / EXECUTIVE SUMMARY
+# ============================================================
+SAMSUNG_SITE_TERMS = [
+    "samsung", "삼성", "삼성전자", "sev", "sevt", "siel", "samex",
+    "vietnam", "베트남", "india", "인도", "mexico", "멕시코", "china", "중국",
+    "poland", "폴란드", "brazil", "브라질", "korea", "한국",
+]
+SAMSUNG_PRODUCT_TERMS = [
+    "semiconductor", "반도체", "hbm", "memory", "chip", "칩", "메모리",
+    "mobile", "smartphone", "phone", "스마트폰", "휴대폰",
+    "consumer electronics", "가전", "tv", "display", "디스플레이",
+    "component", "부품", "pcb", "ccl", "mlcc", "network", "telecom", "통신장비",
+]
+EXEC_HIGH_ISSUE_TERMS = [
+    "section 301", "301조", "section 232", "232조", "anti-dumping", "antidumping", "반덤핑",
+    "countervailing", "상계관세", "safeguard", "세이프가드", "export control", "수출통제",
+    "ear", "dual-use", "전략물자", "uflpa", "forced labor", "강제노동", "cbam", "ppwr",
+    "fta", "origin", "원산지", "tariff ruling", "trade court", "cit", "refund", "환급",
+    "customs penalty", "administrative violation", "관세 분야", "행정 위반", "처벌", "사후심사",
+]
+EXEC_COST_TERMS = [
+    "tariff", "관세", "duty", "세율", "additional tariff", "추가관세", "cost", "원가",
+    "pricing", "가격", "refund", "환급", "penalty", "벌금", "처벌", "audit", "심사",
+    "customs", "세관", "통관", "hs", "classification", "품목분류", "valuation", "과세가격",
+]
+EXEC_STRONG_NOISE_TERMS = [
+    "ted successfully signed out", "successfully signed out", "you are signed out", "eu login",
+    "call for tenders", "procurement", "prior information notice", "planning - ted",
+    "로그인", "captcha", "cookie", "advertisement", "subscribe", "x.com/search", "twitter", "instagram",
+    "sports", "football", "baseball", "concert", "celebrity", "movie", "weather", "crypto", "bitcoin",
+    "스포츠", "축구", "야구", "연예", "콘서트", "날씨", "코인", "비트코인",
+]
+
+
+def row_all_text(row: pd.Series) -> str:
+    return safe_join_values([row.get(c, "") for c in [
+        "Headline", "Summary", "AI Analysis", "Action Plan", "Country", "agency", "Products", "Section", "source"
+    ]]).lower()
+
+
+def hit_count(text: str, terms: list[str]) -> int:
+    return sum(1 for t in terms if t.lower() in text)
+
+
+def row_core_text(row: pd.Series) -> str:
+    """
+    TOP3 선정을 위한 원문/메타 기반 텍스트.
+    AI Analysis / Action Plan은 모델이 과장할 수 있으므로 Top3 핵심 판정에서는 보조로만 사용합니다.
+    """
+    return safe_join_values([row.get(c, "") for c in [
+        "Headline", "Summary", "Country", "agency", "Products", "Section", "source", "URL"
+    ]]).lower()
+
+
+def is_official_or_enforcement_source(row: pd.Series) -> bool:
+    text = row_core_text(row)
+    official_terms = [
+        "customs", "cbp", "ustr", "commerce", "trade court", "cit", "commission", "ministry",
+        "관세청", "세관", "무역위원회", "산업통상", "상무부", "법원", "eu commission", "european commission",
+        "vietnam customs", "trade remedies", "mofcom", "gacc", "wto", "wco",
+    ]
+    return any(t in text for t in official_terms)
+
+
+def has_core_hard_policy_issue(row: pd.Series) -> bool:
+    """기사 제목/요약/기관 자체에 실제 관세정책·집행 이슈가 있는지 확인합니다."""
+    text = row_core_text(row)
+    hard_terms = [
+        "ieepa", "refund", "환급", "trade court", "cit", "tariff ruling", "lawsuit", "소송",
+        "section 301", "301조", "section 232", "232조", "additional tariff", "추가관세",
+        "anti-dumping", "antidumping", "반덤핑", "countervailing", "상계관세", "safeguard", "세이프가드",
+        "export control", "수출통제", "dual-use", "ear", "전략물자", "sanction", "제재",
+        "customs", "세관", "통관", "centralized customs", "중앙집중통관", "customs penalty",
+        "administrative violation", "행정 위반", "처벌", "penalty", "audit", "사후심사", "조사 착수",
+        "fta", "free trade agreement", "원산지", "origin", "certificate of origin", "co 발급",
+        "tariff hike", "관세 인상", "duty increase", "세율 인상", "import duty", "수입관세",
+    ]
+    return any(t in text for t in hard_terms)
+
+
+def is_general_economic_or_guide_news(row: pd.Series) -> bool:
+    """Top3에서 제외해야 하는 경제동향·칼럼·일반 가이드성 기사."""
+    text = row_core_text(row)
+    general_terms = [
+        "survival guide", "guide for", "how to", "what to know", "opinion", "column", "commentary",
+        "manufacturer’s survival", "manufacturer's survival", "price increases", "dumb price",
+        "profit falls", "net profit", "marketwatch", "stock", "shares", "earnings",
+        "수출 역대 최대", "수출 호황", "무역수지", "경상수지", "경제 성장", "성장 주도",
+        "시장 성장", "전망", "기회 확대", "물류 전략", "일반적인 내용", "타사 사례",
+        "tesla", "costco", "retailer", "소비자", "집단 소송", "일반 제조업",
+    ]
+    return any(t in text for t in general_terms)
+
+
+def is_top3_eligible(row: pd.Series) -> bool:
+    """
+    Top3 자격조건.
+    - 제목/요약/기관 자체에 관세정책·집행·FTA/원산지·통관제도 이슈가 있어야 함
+    - 일반 제조업 가이드/경제동향/타사 사례는 원칙적으로 제외
+    - 단, 공식기관/법원/세관 집행 이슈는 허용
+    """
+    core = row_core_text(row)
+    full = row_all_text(row)
+
+    if any(t in full for t in EXEC_STRONG_NOISE_TERMS):
+        return False
+
+    if not has_core_hard_policy_issue(row):
+        return False
+
+    # 일반 가이드·경제동향은 Top3 제외. 다만 공식 집행/법원/세관 이슈는 예외 허용.
+    if is_general_economic_or_guide_news(row) and not is_official_or_enforcement_source(row):
+        return False
+
+    # 삼성 관련성 또는 고위험 관세 집행성이 최소 하나는 있어야 함
+    has_samsung_context = any(t in full for t in SAMSUNG_SITE_TERMS + SAMSUNG_PRODUCT_TERMS)
+    has_enforcement = any(t in core for t in [
+        "cbp", "customs", "관세청", "세관", "trade court", "cit", "무역위원회", "anti-dumping", "반덤핑",
+        "countervailing", "상계관세", "administrative violation", "행정 위반", "처벌", "중앙집중통관",
+        "fta", "원산지", "refund", "환급", "section 301", "301조", "section 232", "232조",
+    ])
+    return has_samsung_context or has_enforcement
+
+
+def samsung_impact_score_final(row: pd.Series) -> int:
+    """
+    TOP3 전용 점수.
+    목적: '뉴스 중요도'가 아니라 '삼성전자 관세업무 영향도'가 큰 뉴스 3건 선정.
+
+    핵심 보완:
+    - AI Analysis/Action의 과장 표현보다 제목/요약/기관의 실제 정책·집행성을 우선 평가
+    - 일반 제조업 가이드, 경제동향, 타사 사례는 Top3에서 강하게 감점/제외
+    - 관세환급·301/232·반덤핑/상계관세·수출통제·통관제도·FTA/원산지 이슈를 우선
+    """
+    core = row_core_text(row)
+    full = row_all_text(row)
+    score = 0
+
+    if any(t in full for t in EXEC_STRONG_NOISE_TERMS):
+        return -999
+
+    if not has_core_hard_policy_issue(row):
+        score -= 250
+
+    if is_general_economic_or_guide_news(row):
+        score -= 220
+
+    risk = normalize_risk(row.get("Risk", ""))
+    score += {"상": 35, "중": 15, "하": 0}.get(risk, 5)
+
+    site_hits = hit_count(full, SAMSUNG_SITE_TERMS)
+    product_hits = hit_count(full, SAMSUNG_PRODUCT_TERMS)
+    issue_hits = hit_count(core, EXEC_HIGH_ISSUE_TERMS)
+    cost_hits = hit_count(core, EXEC_COST_TERMS)
+
+    # A. 직접 관세금액 영향: 임원 관점 최우선
+    direct_money_terms = [
+        "refund", "환급", "duty refund", "ieepa", "trade court", "cit", "tariff ruling", "lawsuit", "소송",
+        "section 301", "301조", "section 232", "232조", "additional tariff", "추가관세",
+        "anti-dumping", "antidumping", "반덤핑", "countervailing", "상계관세",
+        "tariff hike", "관세 인상", "duty increase", "세율 인상", "penalty", "벌금", "추징",
+    ]
+    direct_hits = hit_count(core, direct_money_terms)
+    if direct_hits:
+        score += 170 + min(direct_hits, 4) * 20
+
+    # B. 통관 내부통제/법규 집행 영향
+    control_terms = [
+        "customs penalty", "administrative violation", "관세 분야", "행정 위반", "처벌",
+        "audit", "post-clearance", "사후심사", "심사", "investigation", "조사",
+        "customs", "세관", "통관", "centralized customs", "중앙집중통관",
+        "hs", "classification", "품목분류", "valuation", "과세가격", "origin", "원산지", "fta",
+    ]
+    control_hits = hit_count(core, control_terms)
+    if control_hits:
+        score += 120 + min(control_hits, 6) * 12
+
+    # C. 공식기관/집행기관 출처 가산
+    if is_official_or_enforcement_source(row):
+        score += 80
+
+    # D. 삼성 거점·제품군 직접성
+    score += min(site_hits, 5) * 28
+    score += min(product_hits, 5) * 26
+    score += min(issue_hits, 7) * 24
+    score += min(cost_hits, 8) * 10
+
+    if site_hits and product_hits:
+        score += 70
+    if site_hits and (issue_hits or control_hits or direct_hits):
+        score += 70
+    if product_hits and (issue_hits or control_hits or direct_hits):
+        score += 55
+
+    # E. 실제 실행 가능한 관세업무 Action이 있는 기사 가산
+    executable_terms = [
+        "hs mapping", "hs code", "원산지 판정", "fta 적용", "특혜세율", "co 발급", "관세사",
+        "환급 가능액", "환급 대상", "세율 변경 대상", "수입원가", "가격전가", "증빙", "내부통제",
+    ]
+    if any(x in full for x in executable_terms):
+        score += 80
+
+    # F. 직접 영향 표현 가산은 AI 과장 방지를 위해 제한적으로 반영
+    if any(x in full for x in ["직접 영향", "직접적인 영향", "direct impact", "생산 거점", "생산법인", "판매법인"]):
+        score += 45
+
+    # G. 일반론/간접성 감점
+    low_value_terms = [
+        "영향은 낮", "직접적인 영향은 낮", "영향 낮", "구체적인 내용이 없어", "현재로서는 영향",
+        "monitoring", "모니터링", "일반적인 내용", "market growth", "시장 성장", "경제 성장",
+        "logistics", "물류 전략", "타사", "tesla", "general trade", "전망", "기회 확대",
+    ]
+    if any(x in full for x in low_value_terms):
+        score -= 120
+
+    # H. 협정 체결 기사라도 HS·원산지·관세율·환급·통관제도 실행 포인트가 있으면 허용, 없으면 감점
+    pact_terms = ["trade deal", "trade pact", "agreement", "협정", "합의", "deal"]
+    hard_action_terms = direct_money_terms + control_terms + executable_terms
+    if any(x in core for x in pact_terms) and not any(x in full for x in hard_action_terms):
+        score -= 120
+
+    # I. Top3 부적합 최종 감점
+    if not (issue_hits or control_hits or direct_hits):
+        score -= 120
+    if not (site_hits or product_hits or is_official_or_enforcement_source(row)):
+        score -= 100
+
+    return int(score)
+
+def select_top30_with_samsung_top3(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Top3와 Event List를 분리 선정.
+    - Top3: Samsung Impact Score 기준 + Theme 중복 제거 + 직접 관세업무 영향 우선
+    - Event List: 기존 GTI 점수 기준으로 Top30까지 보완
+    """
+    data = df.copy()
+    data["Samsung Impact Score"] = data.apply(samsung_impact_score_final, axis=1)
+    data["_section_order"] = data["Section"].map(SECTION_ORDER).fillna(9)
+    data["_risk_order"] = data["Risk"].map(RISK_ORDER).fillna(4)
+
+    # Top3는 자격조건을 먼저 통과한 기사만 대상으로 선정합니다.
+    # 목적: 일반 제조업 가이드/경제동향/타사 사례가 AI Analysis 과장으로 Top3에 올라오는 현상 방지.
+    data["_top3_eligible"] = data.apply(is_top3_eligible, axis=1)
+
+    ranked = data[(data["Samsung Impact Score"] > -300) & (data["_top3_eligible"])].sort_values(
+        ["Samsung Impact Score", "_risk_order", "score"],
+        ascending=[False, True, False]
+    )
+
+    # Top3는 같은 Theme가 반복되지 않도록 1차 선정
+    selected_idx = []
+    selected_themes = set()
+    for idx, row in ranked.iterrows():
+        theme = detect_main_theme(row)
+        if theme in selected_themes:
             continue
-        try:
-            df = pd.read_excel(fp, dtype=str).fillna("")
-            text = "\n".join(df.astype(str).values.ravel().tolist())
-            found = re.findall(r"[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,}", text)
-            recipients.extend(found)
-        except Exception as exc:
-            log(f"[MAIL] recipient file read failed: {fp} / {type(exc).__name__}")
-    return list(dict.fromkeys([x.strip() for x in recipients if x.strip()]))
+        selected_idx.append(idx)
+        selected_themes.add(theme)
+        if len(selected_idx) >= 3:
+            break
+
+    # Theme가 부족하면 자격 통과 기사 중 점수순으로 보완
+    if len(selected_idx) < 3:
+        for idx, row in ranked.iterrows():
+            if idx in selected_idx:
+                continue
+            selected_idx.append(idx)
+            if len(selected_idx) >= 3:
+                break
+
+    # 그래도 부족하면 비자격 기사 중에서도 강한 관세/통관 점수가 있는 건만 제한적으로 보완
+    if len(selected_idx) < 3:
+        fallback = data[(~data.index.isin(selected_idx)) & (data["Samsung Impact Score"] >= 120)].sort_values(
+            ["Samsung Impact Score", "_risk_order", "score"], ascending=[False, True, False]
+        )
+        for idx, _ in fallback.iterrows():
+            selected_idx.append(idx)
+            if len(selected_idx) >= 3:
+                break
+
+    # 최후 보완: Event List 품질 유지를 위해 기존 점수로만 채우되 Top3 로그에서 확인 가능
+    if len(selected_idx) < 3:
+        fallback = data[~data.index.isin(selected_idx)].sort_values(
+            ["_risk_order", "score"], ascending=[True, False]
+        )
+        for idx, _ in fallback.iterrows():
+            selected_idx.append(idx)
+            if len(selected_idx) >= 3:
+                break
+
+    top3 = data.loc[selected_idx].copy()
+
+    # Event List는 Top3 제외 후 기존 GTI 품질순으로 채움. Top30 유지 목적.
+    rest = data[~data.index.isin(top3.index)].sort_values(
+        ["_risk_order", "_section_order", "score", "Samsung Impact Score"],
+        ascending=[True, True, False, False]
+    ).head(max(0, TOP_N - len(top3))).copy()
+
+    final = pd.concat([top3, rest], ignore_index=True)
+    final = final.drop(columns=["_section_order", "_risk_order", "_top3_eligible"], errors="ignore")
+    if "No" in final.columns:
+        final = final.drop(columns=["No"])
+    final.insert(0, "No", range(1, len(final) + 1))
+    return final
+
+def detect_main_theme(row: pd.Series) -> str:
+    text = row_all_text(row)
+    if any(x in text for x in ["ppwr", "packaging", "포장", "포장재"]):
+        return "EU PPWR"
+    if any(x in text for x in ["cbam", "탄소국경"]):
+        return "EU CBAM"
+    if any(x in text for x in ["uflpa", "forced labor", "강제노동"]):
+        return "UFLPA"
+    if any(x in text for x in ["export control", "수출통제", "전략물자", "ear", "dual-use"]):
+        return "수출통제"
+    if any(x in text for x in ["section 301", "301조"]):
+        return "美 301조 관세"
+    if any(x in text for x in ["section 232", "232조"]):
+        return "美 232조 관세"
+    if any(x in text for x in ["cit", "trade court", "tariff ruling", "refund", "환급"]):
+        return "美 관세소송/환급"
+    if any(x in text for x in ["anti-dumping", "antidumping", "반덤핑"]):
+        return "반덤핑"
+    if any(x in text for x in ["countervailing", "상계관세"]):
+        return "상계관세"
+    if any(x in text for x in ["administrative violation", "관세 분야", "행정 위반", "처벌", "penalty"]):
+        return "통관처벌/내부통제"
+    if any(x in text for x in ["fta", "origin", "원산지", "coo"]):
+        return "FTA/원산지"
+    if any(x in text for x in ["customs", "세관", "통관", "audit", "심사"]):
+        return "통관/세관심사"
+    if any(x in text for x in ["tariff", "관세", "duty"]):
+        return "관세율 변동"
+    return "통상 리스크"
 
 
-def send_email(html_body: str, attachment: Path) -> None:
-    if not SEND_EMAIL:
-        log("[MAIL] skipped: GTI_SEND_EMAIL is not Y")
-        return
+def detect_site_product(row: pd.Series) -> str:
+    text = row_all_text(row)
+    sites = []
+    if any(x in text for x in ["vietnam", "베트남", "sev", "sevt"]):
+        sites.append("SEV/SEVT")
+    if any(x in text for x in ["india", "인도", "siel"]):
+        sites.append("SIEL")
+    if any(x in text for x in ["mexico", "멕시코", "samex"]):
+        sites.append("SAMEX")
+    if any(x in text for x in ["poland", "폴란드"]):
+        sites.append("폴란드")
+    if any(x in text for x in ["china", "중국"]):
+        sites.append("중국")
+    if not sites:
+        sites.append("주요 생산거점")
+
+    products = []
+    if any(x in text for x in ["semiconductor", "반도체", "hbm", "memory", "chip"]):
+        products.append("반도체")
+    if any(x in text for x in ["mobile", "smartphone", "phone", "스마트폰"]):
+        products.append("Mobile")
+    if any(x in text for x in ["consumer electronics", "가전", "tv"]):
+        products.append("CE")
+    if any(x in text for x in ["display", "디스플레이"]):
+        products.append("Display")
+    if any(x in text for x in ["component", "부품", "pcb", "ccl", "mlcc"]):
+        products.append("Component")
+    if any(x in text for x in ["network", "telecom", "통신장비"]):
+        products.append("Network")
+    if not products:
+        products.append("주요 제품")
+    return f"{','.join(sites[:3])} {','.join(products[:3])}"
+
+
+def executive_impact_summary(row: pd.Series) -> str:
+    theme = detect_main_theme(row)
+    target = detect_site_product(row)
+    if theme == "EU PPWR":
+        return f"EU PPWR 시행 → {target}의 EU향 포장재 규제·BOM·통관증빙 재점검 필요"
+    if theme == "EU CBAM":
+        return f"EU CBAM 확대 → {target}의 탄소자료·원산지·수입신고 증빙 정합성 확보 필요"
+    if theme == "UFLPA":
+        return f"UFLPA/강제노동 규제 → {target}의 공급망 원산지 증빙 및 미국 수입통관 리스크 점검 필요"
+    if theme == "수출통제":
+        return f"수출통제 강화 → {target}의 HS·ECCN·최종사용자 심사 및 출하통제 기준 재확인 필요"
+    if theme == "美 301조 관세":
+        return f"美 301조 관세 변동 → {target}의 대미 수출 관세부담·원산지·가격전가 영향 재산출 필요"
+    if theme == "美 232조 관세":
+        return f"美 232조 관세 확대 → {target}의 원재료·부품 관세부담 및 북미 판매법인 원가 영향 점검 필요"
+    if theme == "美 관세소송/환급":
+        return f"美 관세소송/환급 이슈 → {target}의 기존 납부관세 환급 가능액 및 북미 손익 영향 검토 필요"
+    if theme == "반덤핑":
+        return f"반덤핑 조사·관세 → {target}의 공급국 전환, HS 분류, 과세가격 및 원산지 방어자료 확보 필요"
+    if theme == "상계관세":
+        return f"상계관세 리스크 → {target}의 보조금 관련 원산지·가격자료 및 미국/EU 수입규제 대응 필요"
+    if theme == "통관처벌/내부통제":
+        return f"통관처벌 강화 → {target}의 HS·과세가격·원산지 신고 오류 방지 및 관세사 업무지침 개정 필요"
+    if theme == "FTA/원산지":
+        return f"FTA/원산지 변화 → {target}의 원산지 판정기준, CO 발급, 특혜세율 적용 가능성 재검토 필요"
+    if theme == "통관/세관심사":
+        return f"통관·세관심사 강화 → {target}의 HS·과세가격·원산지 신고 정확성 및 증빙 보관체계 점검 필요"
+    if theme == "관세율 변동":
+        return f"관세율 변동 → {target}의 수입원가, 판매가격, FTA 활용 및 생산거점별 관세 시나리오 재산출 필요"
+    ai = clean_text(row.get("AI Analysis", ""))
+    return cut_sentence(ai, 95) if ai else f"{theme} → {target}의 관세·원산지·통관 내부통제 영향 점검 필요"
+
+
+def build_executive_total_line(top3: pd.DataFrame) -> str:
+    themes = [detect_main_theme(r) for _, r in top3.iterrows()]
+    theme_txt = "·".join(list(dict.fromkeys(themes))[:3]) or "관세·통상"
+    text = " ".join([row_all_text(r) for _, r in top3.iterrows()])
+    areas = []
+    for label, keys in [
+        ("미국", ["us", "u.s.", "usa", "united states", "미국"]),
+        ("EU", ["eu", "europe", "유럽"]),
+        ("베트남", ["vietnam", "베트남", "sev", "sevt"]),
+        ("멕시코", ["mexico", "멕시코", "samex"]),
+        ("인도", ["india", "인도", "siel"]),
+        ("중국", ["china", "중국"]),
+    ]:
+        if any(k in text for k in keys):
+            areas.append(label)
+    if not areas:
+        areas = ["주요국"]
+    return f"{','.join(areas[:3])} 중심의 {theme_txt} 이슈가 삼성전자 주요 생산거점·판매법인의 관세원가·원산지·FTA·통관 내부통제 재점검 필요성을 높이고 있습니다."
+
+def build_overall_review_html(df: pd.DataFrame) -> str:
+    """임원용 총평 HTML: Top3 전체 1줄 + Top3 각 뉴스별 1줄을 줄바꿈으로 분리."""
+    top3 = df.head(3).copy()
+    total_line = build_executive_total_line(top3)
+
+    bullet_html = []
+    seen = set()
+    for _, r in top3.iterrows():
+        line = executive_impact_summary(r)
+        # 완전히 같은 1줄 요약은 중복 제거. 단, Top3 3건 표시는 유지가 원칙이므로 theme 중복은 선정단계에서 제거.
+        if line in seen:
+            continue
+        seen.add(line)
+        bullet_html.append(
+            "<div style='margin-top:8px;line-height:1.8;'>"
+            f"• {html.escape(line)}"
+            "</div>"
+        )
+
+    return f"""
+    <div style="margin-top:10px;margin-bottom:20px;padding:16px;background:#F4F6F8;border-left:6px solid #1F4E78;color:#222;font-size:14px;line-height:1.8;">
+      <div style="font-weight:bold;margin-bottom:12px;line-height:1.8;">
+        {html.escape(total_line)}
+      </div>
+      {''.join(bullet_html)}
+    </div>
+    """
+
+def build_html(df: pd.DataFrame) -> str:
+    top3 = df.head(3).copy()
+    rest = df.iloc[3:].copy()
+
+    top_blocks = []
+    for _, r in top3.iterrows():
+        top_blocks.append(f"""
+        <div style="margin:16px 0 20px 0;padding:14px;border-left:5px solid #C00000;background:#fff7f7;">
+          <div style="font-size:15px;margin-bottom:6px;">{int(r['No'])}️⃣ {link_html(r['Headline'], r['URL'])}</div>
+          <div style="font-size:12px;color:#555;margin-bottom:8px;">
+            Date: {esc(r['Date'])} | Country: {esc(r['Country'])} | Agency: {esc(r['agency'])} | Risk: <b>{esc(r['Risk'])}</b>
+          </div>
+          <div><b>Executive Impact</b><br>{esc(executive_impact_summary(r))}</div>
+          <div style="margin-top:8px;"><b>Summary</b><br>{esc(r['Summary'])}</div>
+          <div style="margin-top:8px;"><b>Impact</b><br>{esc(r['AI Analysis'])}</div>
+          <div style="margin-top:8px;"><b>Action</b><br>{esc(r['Action Plan'])}</div>
+        </div>
+        """)
+
+    rows = []
+    for _, r in rest.iterrows():
+        risk_bg = "#F4B183" if r["Risk"] == "상" else "#FFE699" if r["Risk"] == "중" else "#C6E0B4"
+        rows.append(f"""
+        <tr>
+          <td style="padding:7px;border:1px solid #d9d9d9;text-align:center;">{int(r['No'])}</td>
+          <td style="padding:7px;border:1px solid #d9d9d9;">{esc(r['Section'])}</td>
+          <td style="padding:7px;border:1px solid #d9d9d9;">{link_html(r['Headline'], r['URL'])}</td>
+          <td style="padding:7px;border:1px solid #d9d9d9;">{esc(r['Summary'])}</td>
+          <td style="padding:7px;border:1px solid #d9d9d9;">{esc(r['AI Analysis'])}</td>
+          <td style="padding:7px;border:1px solid #d9d9d9;">{esc(r['Action Plan'])}</td>
+          <td style="padding:7px;border:1px solid #d9d9d9;text-align:center;">{esc(r['Country'])}</td>
+          <td style="padding:7px;border:1px solid #d9d9d9;">{esc(r['agency'])}</td>
+          <td style="padding:7px;border:1px solid #d9d9d9;text-align:center;background:{risk_bg};font-weight:bold;">{esc(r['Risk'])}</td>
+          <td style="padding:7px;border:1px solid #d9d9d9;text-align:center;">{esc(r['Date'])}</td>
+        </tr>
+        """)
+
+    return f"""<!DOCTYPE html>
+<html lang="ko">
+<head>
+<meta charset="utf-8">
+<title>{html.escape(SUBJECT)}</title>
+</head>
+<body style="font-family:Arial,'Malgun Gothic',sans-serif;font-size:13px;color:#222;line-height:1.5;">
+<div style="max-width:1280px;margin:0 auto;">
+  <h2 style="margin-bottom:4px;">[GTI Radar] Global Trade Intelligence</h2>
+  <div style="font-size:14px;margin-bottom:4px;"><b>Date:</b> {TODAY}</div>
+  <div style="font-size:12px;color:#555;margin-bottom:16px;">
+    Coverage: Last 24 Hours | Focus: Samsung Electronics Customs & Trade Risk
+  </div>
+
+  <h3 style="margin-top:18px;margin-bottom:6px;">총평</h3>
+  {build_overall_review_html(df)}
+
+  <h3 style="color:#C00000;margin-top:22px;">🔴 TOP POLICY EVENTS</h3>
+  {''.join(top_blocks)}
+
+  <h3 style="color:#1F4E78;margin-top:24px;">🟦 EVENT LIST</h3>
+  <table style="border-collapse:collapse;width:100%;font-size:12px;">
+    <tr style="background:#1F4E78;color:white;">
+      <th style="padding:7px;border:1px solid #d9d9d9;">No</th>
+      <th style="padding:7px;border:1px solid #d9d9d9;">Section</th>
+      <th style="padding:7px;border:1px solid #d9d9d9;">Headline</th>
+      <th style="padding:7px;border:1px solid #d9d9d9;">Summary</th>
+      <th style="padding:7px;border:1px solid #d9d9d9;">Impact</th>
+      <th style="padding:7px;border:1px solid #d9d9d9;">Action</th>
+      <th style="padding:7px;border:1px solid #d9d9d9;">Country</th>
+      <th style="padding:7px;border:1px solid #d9d9d9;">Agency</th>
+      <th style="padding:7px;border:1px solid #d9d9d9;">Risk</th>
+      <th style="padding:7px;border:1px solid #d9d9d9;">Date</th>
+    </tr>
+    {''.join(rows)}
+  </table>
+
+  <p style="margin-top:18px;color:#666;font-size:12px;">
+    ※ 본 메일은 GTI 자동 수집/분석 결과이며, Top3 이슈는 원문 공고·법령 확인 후 법인별 영향 검토가 필요합니다.
+  </p>
+</div>
+</body>
+</html>"""
+
+
+# ============================================================
+# 8. MAIL / CUMULATIVE
+# ============================================================
+def load_recipients() -> list[str]:
+    recipients = []
+    for fn in ["00.xlsx", "mail.xlsx"]:
+        fp = BASE_DIR / fn
+        if fp.exists():
+            try:
+                rdf = pd.read_excel(fp)
+                text = "\n".join(rdf.fillna("").astype(str).values.ravel().tolist())
+                recipients.extend(re.findall(r"[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,}", text))
+            except Exception as e:
+                log(f"[RECIPIENT READ SKIP] {fp}: {e}")
+
+    if not recipients and FALLBACK_TO:
+        recipients.extend([x.strip() for x in FALLBACK_TO.split(",") if x.strip()])
+
+    return list(dict.fromkeys(recipients))
+
+
+def send_email(html_body: str, attachments: list[Path]) -> None:
     recipients = load_recipients()
-    if not SMTP_USER or not SMTP_PASS:
-        log("[MAIL] skipped: GTI_SMTP_USER / GTI_SMTP_PASS is missing")
-        return
+
     if not recipients:
-        log(f"[MAIL] skipped: no recipients. Set GTI_MAIL_TO or check {RECIPIENT_FILE}")
+        log("[MAIL SKIP] 수신자 없음: 00.xlsx / mail.xlsx / GTI_MAIL_TO 확인")
         return
-    log(f"[MAIL] sending: {len(recipients)} recipients via {SMTP_HOST}:{SMTP_PORT}")
+
+    if not SMTP_USER or not SMTP_PASS:
+        log("[MAIL SKIP] SMTP_USER/PASS 없음")
+        return
+
     msg = EmailMessage()
-    msg["Subject"] = f"[GTI Radar] Global Trade Intelligence | {RUN_DATE}"
+    msg["Subject"] = SUBJECT
     msg["From"] = formataddr((MAIL_FROM_NAME, SMTP_USER))
     msg["To"] = ", ".join(recipients)
-    msg.set_content("GTI Radar HTML 메일입니다. HTML 지원 메일 클라이언트에서 확인해 주세요.")
+    msg.set_content("GTI Radar 메일입니다. HTML 메일을 지원하는 클라이언트에서 확인해 주세요.")
     msg.add_alternative(html_body, subtype="html")
-    with open(attachment, "rb") as f:
+
+    for fp in attachments:
+        if not fp.exists():
+            continue
+        data = fp.read_bytes()
         msg.add_attachment(
-            f.read(),
+            data,
             maintype="application",
             subtype="vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-            filename=attachment.name,
+            filename=fp.name,
         )
+
     context = ssl.create_default_context()
     with smtplib.SMTP_SSL(SMTP_HOST, SMTP_PORT, context=context) as server:
         server.login(SMTP_USER, SMTP_PASS)
         server.send_message(msg)
+
     log(f"[MAIL SENT] {len(recipients)} recipients")
 
 
+def update_cumulative(df: pd.DataFrame) -> None:
+    data = df.copy()
+    data.insert(0, "mail_date", TODAY)
+    data.insert(1, "subject", SUBJECT)
+
+    if MAIL_CUMULATIVE.exists():
+        try:
+            old = pd.read_excel(MAIL_CUMULATIVE)
+            data = pd.concat([old, data], ignore_index=True)
+            data = data.drop_duplicates(subset=["mail_date", "Headline", "URL"], keep="last")
+        except Exception as e:
+            log(f"[CUMULATIVE READ SKIP] {e}")
+
+    data.to_excel(MAIL_CUMULATIVE, index=False)
+
+
+# ============================================================
+# 9. MAIN
+# ============================================================
 def main() -> None:
-    paths = output_paths()
-    OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
-    raw = read_input()
-    log(f"[LOAD] {INPUT_FILE} rows={len(raw)}")
-    rows = select_news(raw)
-    if rows.empty:
-        raise RuntimeError("메일 대상 뉴스가 없습니다.")
-    rows = optimize_rows_with_gemini(rows)
-    review = optimize_review_with_gemini(rows.head(3))
-    html_body = build_html(rows, review)
-    save_excel(rows, paths)
-    paths["mail_html"].write_text(html_body, encoding="utf-8")
-    send_email(html_body, paths["mail_xlsx"])
-    log(f"[SELECTED] {len(rows)} rows")
-    for path in paths.values():
-        log(f"[SAVE] {path}")
+    global INPUT_FILE
+    BASE_DIR.mkdir(parents=True, exist_ok=True)
+    INPUT_FILE = find_input_file()
+
+    log("[START] GTI Mail Engine FINAL URL BODY + AI")
+    log(f"BASE_DIR={BASE_DIR}")
+    log(f"INPUT={INPUT_FILE}")
+    log(f"GEMINI={'ON' if USE_GEMINI else 'OFF'} / MODEL={GEMINI_MODEL}")
+    log(f"GTI_SEND_EMAIL={os.getenv('GTI_SEND_EMAIL')} / SEND_EMAIL={SEND_EMAIL}")
+
+    raw = pd.read_excel(INPUT_FILE)
+    log(f"[LOAD] rows={len(raw)}")
+
+    top = prepare_top(raw)
+    log(f"[ANALYSIS COMPLETE] rows={len(top)}")
+    log("[TOP3 SELECTED - Samsung Customs Impact]")
+    for _, r in top.head(3).iterrows():
+        log(f"  - score={r.get('Samsung Impact Score', '')} / theme={detect_main_theme(r)} / {str(r.get('Headline',''))[:90]}")
+
+    save_excel(top, OUTPUT_XLSX)
+    log(f"[SAVE] Excel: {OUTPUT_XLSX}")
+
+    html_body = build_html(top)
+    OUTPUT_HTML.write_text(html_body, encoding="utf-8")
+    log(f"[SAVE] HTML: {OUTPUT_HTML}")
+
+    update_cumulative(top)
+    log(f"[SAVE] Cumulative: {MAIL_CUMULATIVE}")
+
+    if SEND_EMAIL:
+        send_email(html_body, [OUTPUT_XLSX])
+    else:
+        log("[MAIL SKIP] GTI_SEND_EMAIL=Y 설정 시 실제 발송")
+
+    log("[DONE] GTI Mail Engine FINAL")
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--date", default=None)
-    parser.add_argument("--input", default=None)
-    parser.add_argument("--output-dir", default=None)
-    args = parser.parse_args()
-    if args.date:
-        RUN_DATE = args.date
-    if args.input:
-        INPUT_FILE = Path(args.input)
-    if args.output_dir:
-        OUTPUT_DIR = Path(args.output_dir)
-    main()
+    try:
+        main()
+    except Exception as e:
+        log(f"[ERROR] {type(e).__name__}: {e}")
+        log(traceback.format_exc())
+        raise
