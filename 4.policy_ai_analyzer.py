@@ -1,16 +1,20 @@
 # =========================================================
-# GTI STEP4 FINAL v10.0 + LEGAL PRIORITY PATCH
-# file name : 4.policy_ai_analyzer.py
+# GTI STEP4 STRUCTURAL FINAL v12.0
+# Samsung Electronics HQ Customs / Trade Policy Daily Sensing
 #
 # INPUT  : C:/temp/3.news_ai_summary.xlsx
 # DAILY  : C:/temp/news_raw.xlsx
-# CUMUL  : C:/temp/news_cumulative.xlsx
 #
-# 기준:
-# - v10.0 기존 구조 유지
-# - 법령/규칙/고시/공고/입법예고/행정규칙 신규 게시물 최우선 선정 로직 추가
-# - GTI Executive Prompt 유지
-# - HS/원산지/FTA/수출통제/SEV·SEVT·SIEL·SAMEX 강제 반영
+# 
+#  CUMUL  : C:/temp/news_cumulative.xlsx
+#
+# v12.0 핵심:
+# 1) 기존 priority/score 단일 정렬 폐기
+# 2) Reject → Category → Issue Cluster → Category Quota → Representative Pick
+# 3) 법령/공식문서/고시/입법예고/USTR/CBP/Federal Register 최우선
+# 4) 면세점/관광/교육/행사/커피/농산물/비료/방산행사/의약품/수주 강제 제외
+# 5) Top30 중복 이슈 최소화
+# 6) AI는 문장화 보조, 판단은 Rule Engine
 # =========================================================
 
 import os
@@ -40,9 +44,33 @@ OUTPUT_DAILY = r"C:/temp/news_raw.xlsx"
 OUTPUT_CUMUL = r"C:/temp/news_cumulative.xlsx"
 
 TOP_N = 30
-MAX_PER_CLUSTER = 1
-MAX_KOREA_NEWS = 8
-MAX_SOURCE_NEWS = 8
+
+CATEGORY_ORDER = [
+    "A_LEGAL_OFFICIAL",
+    "B_SEMICONDUCTOR_TARIFF",
+    "C_ORIGIN_FTA_USMCA",
+    "D_EXPORT_CONTROL_SANCTION",
+    "E_AD_CVD_TRADE_REMEDY",
+    "F_CUSTOMS_AUDIT_VALUATION",
+    "G_CBAM_SUPPLY_CHAIN",
+    "H_SAMSUNG_GEO_POLICY",
+    "I_GENERAL_REFERENCE",
+]
+
+CATEGORY_QUOTA = {
+    "A_LEGAL_OFFICIAL": 8,
+    "B_SEMICONDUCTOR_TARIFF": 5,
+    "C_ORIGIN_FTA_USMCA": 5,
+    "D_EXPORT_CONTROL_SANCTION": 4,
+    "E_AD_CVD_TRADE_REMEDY": 4,
+    "F_CUSTOMS_AUDIT_VALUATION": 3,
+    "G_CBAM_SUPPLY_CHAIN": 3,
+    "H_SAMSUNG_GEO_POLICY": 4,
+    "I_GENERAL_REFERENCE": 2,
+}
+
+MAX_SOURCE = 5
+MAX_KOREA = 6
 
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "").strip()
 GEMINI_MODEL = "gemini-2.0-flash"
@@ -72,32 +100,28 @@ if USE_AI:
 def safe_str(x):
     if x is None:
         return ""
-
     if isinstance(x, (list, tuple, set)):
-        return ", ".join([str(v).strip() for v in x if str(v).strip()])
-
+        return ", ".join(str(v).strip() for v in x if str(v).strip())
     if isinstance(x, dict):
-        return ", ".join([f"{k}:{v}" for k, v in x.items()])
-
+        return ", ".join(f"{k}:{v}" for k, v in x.items())
     try:
         if pd.isna(x):
             return ""
     except Exception:
         pass
-
     return str(x).strip()
 
 
-def normalize_text(x):
+def norm(x):
     x = safe_str(x).lower()
     x = re.sub(r"https?://\S+", " ", x)
-    x = re.sub(r"&quot;|&amp;|&lt;|&gt;", " ", x)
-    x = re.sub(r"[^a-z0-9가-힣\s]", " ", x)
+    x = re.sub(r"&quot;|&amp;|&lt;|&gt;|&#x27;", " ", x)
+    x = re.sub(r"[^a-z0-9가-힣\s./_-]", " ", x)
     x = re.sub(r"\s+", " ", x).strip()
     return x
 
 
-def clean_ai_text(x):
+def clean_text(x):
     x = safe_str(x)
     x = x.replace("**", "").replace("##", "")
     x = re.sub(r"\s+", " ", x).strip()
@@ -105,25 +129,27 @@ def clean_ai_text(x):
 
 
 def trim(x, n=650):
-    return clean_ai_text(x)[:n].strip()
+    return clean_text(x)[:n].strip()
 
 
-def split_sentences(text):
-    text = clean_ai_text(text)
-    if not text:
-        return []
-    parts = re.split(r"(?<=[.!?。！？])\s+|(?<=[다요음함임됨니다])\.\s*", text)
-    parts = [p.strip(" .") for p in parts if p and p.strip(" .")]
-    return parts
+def contains(text, keywords):
+    t = norm(text)
+    return any(k.lower() in t for k in keywords)
+
+
+def count_hits(text, keywords):
+    t = norm(text)
+    return sum(1 for k in keywords if k.lower() in t)
 
 
 def limit_sentences(text, max_sentences=2, max_len=650):
-    text = clean_ai_text(text)
+    text = clean_text(text)
     if not text:
         return ""
-    sentences = split_sentences(text)
-    if len(sentences) >= 2:
-        text = ". ".join(sentences[:max_sentences]).strip()
+    parts = re.split(r"(?<=[.!?。！？])\s+|(?<=다\.)\s+|(?<=니다\.)\s+", text)
+    parts = [p.strip(" .") for p in parts if p and p.strip(" .")]
+    if len(parts) >= max_sentences:
+        text = ". ".join(parts[:max_sentences])
         if not text.endswith("."):
             text += "."
     return trim(text, max_len)
@@ -141,25 +167,21 @@ def parse_excel_hyperlink_formula(x):
 # COLUMN NORMALIZATION
 # =========================
 def normalize_columns(df):
+    df = df.loc[:, ~df.columns.duplicated()].copy()
     df.columns = [str(c).strip().lower() for c in df.columns]
 
     if "headline" not in df.columns and "title" in df.columns:
         df["headline"] = df["title"]
-
     if "title" not in df.columns and "headline" in df.columns:
         df["title"] = df["headline"]
-
     if "url" not in df.columns:
-        if "link" in df.columns:
-            df["url"] = df["link"]
-        else:
-            df["url"] = ""
-
+        df["url"] = df["link"] if "link" in df.columns else ""
     if "source" not in df.columns:
         df["source"] = ""
-
     if "date" not in df.columns:
         df["date"] = ""
+    if "summary" not in df.columns:
+        df["summary"] = ""
 
     return df
 
@@ -184,7 +206,7 @@ def recover_title_url(row):
 
     if not title and url.startswith("http"):
         path = urlparse(url).path.strip("/").split("/")[-1]
-        title = path[:80] if path else url[:80]
+        title = path[:90] if path else url[:90]
 
     return pd.Series({"title": title.strip(), "url": url.strip()})
 
@@ -192,168 +214,397 @@ def recover_title_url(row):
 # =========================
 # KEYWORDS
 # =========================
-NOISE_KEYWORDS = [
-    "연예", "배우", "드라마", "예능", "영화", "스포츠", "축구", "야구",
-    "결혼", "이혼", "맛집", "날씨", "복권", "주가", "증시",
-    "교육", "세미나", "설명회", "컨퍼런스", "워크숍", "모집", "채용",
-    "webinar", "seminar", "training", "workshop", "celebrity", "movie",
-    "부동산", "아파트", "여행", "맛집",
+LEGAL_KW = [
+    "법령", "법률", "시행령", "시행규칙", "행정규칙", "고시", "공고", "훈령",
+    "예규", "지침", "개정", "입법예고", "행정예고", "관보", "시행", "공포",
+    "규칙", "규정", "notice", "regulation", "rule", "law", "decree",
+    "ordinance", "amendment", "federal register", "final rule", "proposed rule",
+    "cbp notice", "ustr notice", "official journal"
 ]
 
-TRADE_KEYWORDS = [
-    "관세", "tariff", "duty", "customs", "세관", "통관",
-    "fta", "cepa", "epa", "원산지", "origin",
-    "수출", "수입", "export", "import",
-    "301", "section 301", "ustr", "wto",
-    "anti-dumping", "antidumping", "반덤핑",
-    "countervailing", "상계관세",
-    "제재", "sanction",
-    "export control", "수출통제",
-    "cbam", "supply chain", "공급망",
-    "trade", "통상", "무역", "수입규제",
+OFFICIAL_KW = [
+    "관세청", "법제처", "국가법령정보센터", "국민참여입법센터", "관보",
+    "ustr", "cbp", "federal register", "eu commission", "european commission",
+    "official journal", "taxud", "wto", "bis", "mofcom", ".gov", "customs",
+    "border protection", "department of commerce", "commerce department"
 ]
 
-# =========================
-# LEGAL PRIORITY PATCH
-# =========================
-LEGAL_PRIORITY_KEYWORDS = [
-    "법령", "법률", "시행령", "시행규칙", "행정규칙",
-    "고시", "공고", "훈령", "예규", "지침", "개정",
-    "입법예고", "행정예고", "관보", "시행", "공포",
-    "규칙", "규정", "notice", "regulation", "rule", "law",
-    "decree", "ordinance", "amendment", "federal register",
-    "final rule", "proposed rule",
+TRADE_KW = [
+    "관세", "tariff", "duty", "customs", "세관", "통관", "fta", "cepa", "epa",
+    "원산지", "origin", "수출", "수입", "export", "import", "301", "232",
+    "section 301", "section 232", "ustr", "wto", "anti-dumping", "antidumping",
+    "반덤핑", "countervailing", "상계관세", "제재", "sanction", "export control",
+    "수출통제", "cbam", "supply chain", "공급망", "trade", "통상", "무역",
+    "수입규제", "valuation", "과세가격", "customs valuation", "usmca", "ear",
+    "forced labor", "uflpa"
 ]
 
-LEGAL_SOURCE_KEYWORDS = [
-    "관세청", "관보", "법제처", "국가법령정보센터",
-    "국민참여입법센터", "입법예고", "행정예고",
-    "ustr", "cbp", "federal register", "eu commission",
-    "wto", ".gov", "government",
+SEMICON_KW = [
+    "semiconductor", "chip", "반도체", "hbm", "dram", "nand", "memory",
+    "wafer", "foundry", "fab", "processor", "ai chip"
 ]
 
-SAMSUNG_KEYWORDS = [
-    "samsung", "삼성",
-    "semiconductor", "chip", "반도체",
-    "smartphone", "mobile", "휴대폰", "스마트폰", "galaxy",
-    "display", "디스플레이",
-    "battery", "배터리",
-    "electronics", "전자", "consumer electronics", "가전",
-    "network", "네트워크",
-    "medical", "의료기기",
-    "server", "서버",
-    "memory", "메모리",
-    "hbm", "dram", "nand",
+PRODUCT_KW = [
+    "samsung", "삼성", "mobile", "smartphone", "휴대폰", "스마트폰", "galaxy",
+    "electronics", "전자", "consumer electronics", "가전", "tv", "television",
+    "display", "디스플레이", "battery", "배터리", "network", "네트워크",
+    "server", "medical", "의료기기"
 ]
 
-PRODUCTION_COUNTRIES = [
-    "vietnam", "베트남",
-    "india", "인도",
-    "mexico", "멕시코",
-    "china", "중국",
-    "korea", "한국",
-    "poland", "폴란드",
-    "slovakia", "슬로바키아",
-    "turkey", "튀르키예", "터키",
-    "brazil", "브라질",
-    "indonesia", "인도네시아",
+GEO_KW = [
+    "vietnam", "베트남", "india", "인도", "mexico", "멕시코", "china", "중국",
+    "korea", "한국", "poland", "폴란드", "slovakia", "슬로바키아",
+    "brazil", "브라질", "indonesia", "인도네시아", "united states", "usa",
+    "u.s.", "미국", "eu", "europe", "유럽"
 ]
 
-GOV_KEYWORDS = [
-    "관세청", "ustr", "cbp", "customs and border protection",
-    "wto", "eu commission", "european commission",
-    "ministry", "commerce department", "상무부",
-    "산업부", "기재부", "government", ".gov",
-    "official", "commission", "국세청", "세관",
+ORIGIN_FTA_KW = [
+    "fta", "cepa", "epa", "원산지", "origin", "rules of origin", "usmca",
+    "rvc", "regional value content", "certificate of origin", "coo", "co "
 ]
 
-LOW_RELEVANCE_KEYWORDS = [
-    "beef", "소고기", "쇠고기", "농산물", "farm", "farmer", "agriculture", "농업",
-    "seafood", "수산물", "fish", "gold", "silver", "귀금속",
-    "fentanyl", "마약", "drug", "narcotic", "cocaine",
-    "firearm", "gun", "weapon", "suppressor", "총기",
-    "관세청장", "차장 발탁", "인사", "임명",
-    "방산", "호위함", "잠수함", "무기",
+EXPORT_CONTROL_KW = [
+    "export control", "수출통제", "sanction", "제재", "ear", "bis",
+    "entity list", "restricted", "dual-use", "재수출", "최종사용자", "end user",
+    "end-use", "첨단반도체"
 ]
 
-EXCLUDE_IF_LOW_ONLY = [
-    "fentanyl", "마약", "drug", "narcotic", "cocaine",
-    "firearm", "gun", "weapon", "suppressor", "총기",
-    "관세청장", "차장 발탁", "인사", "임명",
-    "방산", "호위함", "잠수함", "무기",
+AD_CVD_KW = [
+    "anti-dumping", "antidumping", "반덤핑", "countervailing", "상계관세",
+    "trade remedy", "safeguard", "세이프가드", "mip", "minimum import price"
+]
+
+CUSTOMS_AUDIT_KW = [
+    "customs", "세관", "통관", "cbp", "valuation", "과세가격", "classification",
+    "품목분류", "hs code", "hs classification", "audit", "심사", "enforcement"
+]
+
+CBAM_KW = ["cbam", "carbon", "탄소", "emissions", "steel tariff", "철강 관세"]
+
+STRICT_REJECT_KW = [
+    "롯데면세점", "면세점", "duty free", "관광", "tourism", "공공캐릭터", "팝업존",
+    "교육", "세미나", "설명회", "컨퍼런스", "워크숍", "인재 양성", "전문가 배출",
+    "합격", "training", "webinar", "seminar", "workshop", "conference",
+    "커피", "coffee", "cocoa", "beef", "소고기", "쇠고기", "농산물", "farmer",
+    "agriculture", "농업", "비료", "fertilizer", "seafood", "수산물", "fish",
+    "마약", "fentanyl", "drug", "narcotic", "cocaine", "firearm", "gun", "weapon",
+    "총기", "방산", "방위산업", "호위함", "잠수함", "무기", "dx korea",
+    "의약품", "제약", "약품", "medicine", "pharma", "롯데", "캐릭터",
+    "맛집", "연예", "드라마", "축구", "야구", "증시", "주가", "부동산",
+    "채용", "모집", "수주", "보안검색 장비"
+]
+
+REJECT_OVERRIDE_KW = [
+    "federal register", "final rule", "proposed rule", "입법예고", "행정예고",
+    "관보", "고시", "공고", "section 301", "section 232", "uflpa",
+    "수출통제", "export control", "sanction", "제재", "반덤핑", "상계관세",
+    "anti-dumping", "countervailing"
 ]
 
 FORBIDDEN_PHRASES = [
-    "모니터링 필요",
-    "영향 분석 필요",
-    "대응 필요",
-    "검토 필요",
-    "관련 이슈",
-    "주의 필요",
-    "리스크 존재",
-    "본사 관세담당자는",
-    "직접 영향은 제한적이나 글로벌 통상 환경",
-    "관세 정책 변화 영향 분석 필요",
-    "관세 영향 점검 및 대응 필요",
+    "모니터링 필요", "영향 분석 필요", "대응 필요", "검토 필요", "관련 이슈",
+    "주의 필요", "리스크 존재", "본사 관세담당자는",
+    "직접 영향은 제한적이나 글로벌 통상 환경"
 ]
 
 
-def is_noise(title):
-    t = normalize_text(title)
-    return any(k.lower() in t for k in NOISE_KEYWORDS)
+# =========================
+# CLASSIFICATION ENGINE
+# =========================
+def strict_reject(title, source=""):
+    text = title + " " + source
+    if contains(text, REJECT_OVERRIDE_KW):
+        return False
+    return contains(text, STRICT_REJECT_KW)
 
 
-def is_trade_news(title):
-    t = normalize_text(title)
-    return any(k.lower() in t for k in TRADE_KEYWORDS)
+def is_trade_related(title, source=""):
+    return contains(title + " " + source, TRADE_KW)
 
 
-def is_legal_priority(title, source=""):
-    t = normalize_text(title + " " + source)
-    has_legal = any(k.lower() in t for k in LEGAL_PRIORITY_KEYWORDS)
-    has_trade = any(k.lower() in t for k in TRADE_KEYWORDS)
-    has_legal_source = any(k.lower() in t for k in LEGAL_SOURCE_KEYWORDS)
-    return has_legal and (has_trade or has_legal_source)
+def is_official(title, source=""):
+    return contains(title + " " + source, OFFICIAL_KW)
 
 
-def legal_priority_score(title, source=""):
-    t = normalize_text(title + " " + source)
+def is_legal(title, source=""):
+    text = title + " " + source
+    return contains(text, LEGAL_KW) and (contains(text, TRADE_KW) or contains(text, OFFICIAL_KW))
+
+
+def classify_category(title, source=""):
+    text = title + " " + source
+
+    if strict_reject(title, source):
+        return "REJECT"
+
+    if is_legal(title, source):
+        return "A_LEGAL_OFFICIAL"
+
+    if is_official(title, source) and is_trade_related(title, source):
+        return "A_LEGAL_OFFICIAL"
+
+    if contains(text, SEMICON_KW) and contains(text, ["관세", "tariff", "232", "301", "ustr", "수출통제", "export control", "제재", "sanction"]):
+        return "B_SEMICONDUCTOR_TARIFF"
+
+    if contains(text, ORIGIN_FTA_KW):
+        return "C_ORIGIN_FTA_USMCA"
+
+    if contains(text, EXPORT_CONTROL_KW):
+        return "D_EXPORT_CONTROL_SANCTION"
+
+    if contains(text, AD_CVD_KW):
+        return "E_AD_CVD_TRADE_REMEDY"
+
+    if contains(text, CUSTOMS_AUDIT_KW):
+        return "F_CUSTOMS_AUDIT_VALUATION"
+
+    if contains(text, CBAM_KW) or contains(text, ["supply chain", "공급망", "rare earth", "희토류"]):
+        return "G_CBAM_SUPPLY_CHAIN"
+
+    if contains(text, PRODUCT_KW) and is_trade_related(title, source):
+        return "H_SAMSUNG_GEO_POLICY"
+
+    if contains(text, GEO_KW) and is_trade_related(title, source):
+        return "H_SAMSUNG_GEO_POLICY"
+
+    if is_trade_related(title, source):
+        return "I_GENERAL_REFERENCE"
+
+    return "REJECT"
+
+
+def classify_news_type(title, category):
+    if category == "A_LEGAL_OFFICIAL":
+        return "LEGAL_OFFICIAL"
+    if contains(title, SEMICON_KW):
+        return "SEMICONDUCTOR"
+    if contains(title, ORIGIN_FTA_KW):
+        return "FTA_ORIGIN"
+    if contains(title, EXPORT_CONTROL_KW):
+        return "EXPORT_CONTROL"
+    if contains(title, AD_CVD_KW):
+        return "AD_CVD"
+    if contains(title, CUSTOMS_AUDIT_KW):
+        return "CUSTOMS_AUDIT"
+    if contains(title, CBAM_KW):
+        return "CBAM"
+    t = norm(title)
+    if "301" in t:
+        return "SECTION_301"
+    if "232" in t:
+        return "SECTION_232"
+    return "GENERAL_TRADE"
+
+
+def category_priority(category):
+    return {cat: i + 1 for i, cat in enumerate(CATEGORY_ORDER)}.get(category, 99)
+
+
+def score_article(title, source="", summary=""):
+    text = title + " " + source + " " + summary
     score = 0
 
-    if any(k.lower() in t for k in LEGAL_PRIORITY_KEYWORDS):
-        score += 160
+    score += count_hits(text, OFFICIAL_KW) * 500
+    score += count_hits(text, LEGAL_KW) * 450
+    score += count_hits(text, SEMICON_KW) * 350
+    score += count_hits(text, HIGH_VALUE_TERMS()) * 300
+    score += count_hits(text, ORIGIN_FTA_KW) * 250
+    score += count_hits(text, EXPORT_CONTROL_KW) * 280
+    score += count_hits(text, AD_CVD_KW) * 260
+    score += count_hits(text, CUSTOMS_AUDIT_KW) * 180
+    score += count_hits(text, PRODUCT_KW) * 150
+    score += count_hits(text, GEO_KW) * 100
 
-    if any(k.lower() in t for k in LEGAL_SOURCE_KEYWORDS):
-        score += 100
+    if "news.google.com" in norm(source) or "news.google.com" in norm(title):
+        score -= 50
 
-    if any(k in t for k in ["관세", "customs", "tariff", "origin", "원산지", "fta", "export control", "수출통제", "sanction", "제재"]):
-        score += 60
+    if strict_reject(title, source):
+        score -= 5000
 
     return score
 
 
-def is_low_relevance_only(title):
-    t = normalize_text(title)
+def HIGH_VALUE_TERMS():
+    return [
+        "section 301", "301", "section 232", "232", "additional tariff", "추가관세",
+        "tariff", "관세", "uflpa", "forced labor", "customs valuation", "과세가격",
+        "rules of origin", "원산지", "usmca", "federal register", "final rule",
+        "proposed rule", "입법예고", "행정규칙", "고시", "공고"
+    ]
 
-    has_low = any(k.lower() in t for k in EXCLUDE_IF_LOW_ONLY)
-    has_strong = any(k.lower() in t for k in [
-        "samsung", "삼성", "semiconductor", "반도체", "smartphone", "mobile",
-        "electronics", "전자", "display", "battery", "배터리",
-        "301", "ustr", "수출통제", "export control", "제재", "sanction",
-        "고시", "공고", "법령", "행정규칙", "입법예고", "관보",
-    ])
 
-    return has_low and not has_strong
+def decision_engine(row):
+    title = safe_str(row.get("title", ""))
+    source = safe_str(row.get("source", ""))
+    summary = safe_str(row.get("summary", ""))
+
+    if not title:
+        return {"include": False, "category": "REJECT", "news_type": "REJECT", "priority": 99, "score": 0, "decision": "REJECT_EMPTY"}
+
+    category = classify_category(title, source)
+    if category == "REJECT":
+        return {"include": False, "category": "REJECT", "news_type": "REJECT", "priority": 99, "score": -9999, "decision": "REJECT_RULE"}
+
+    news_type = classify_news_type(title, category)
+    priority = category_priority(category)
+    score = 10000 - priority * 500 + score_article(title, source, summary)
+
+    return {
+        "include": True,
+        "category": category,
+        "news_type": news_type,
+        "priority": priority,
+        "score": score,
+        "decision": f"INCLUDE_{category}",
+    }
+
+
+# =========================
+# ISSUE CLUSTERING
+# =========================
+def issue_cluster_key(title, category="", news_type=""):
+    t = norm(title)
+
+    rules = [
+        ("USTR_CHIP_TARIFF", ["ustr", "chip"]),
+        ("USTR_CHIP_TARIFF", ["반도체", "관세"]),
+        ("SECTION_232_SEMICON", ["232", "semiconductor"]),
+        ("USMCA_ORIGIN", ["usmca"]),
+        ("USMCA_ORIGIN", ["원산지", "멕시코"]),
+        ("US_CHINA_TARIFF", ["미국", "중국", "관세"]),
+        ("US_CHINA_TARIFF", ["china", "us", "tariff"]),
+        ("EXPORT_CONTROL_CHINA", ["수출통제", "중국"]),
+        ("EXPORT_CONTROL_CHINA", ["export", "control", "china"]),
+        ("AD_CVD_STEEL", ["반덤핑", "철강"]),
+        ("AD_CVD_STEEL", ["anti", "dumping", "steel"]),
+        ("EU_STEEL_CBAM", ["eu", "steel"]),
+        ("EU_STEEL_CBAM", ["eu", "철강"]),
+        ("ASEAN_CUSTOMS_TRANSIT", ["asean", "customs", "transit"]),
+        ("ASEAN_CUSTOMS_TRANSIT", ["아세안", "관세", "환승"]),
+        ("MEXICO_EU_FTA", ["mexico", "eu", "tariff"]),
+        ("MEXICO_EU_FTA", ["멕시코", "eu", "관세"]),
+        ("CHINA_SEMICON_EXPORT", ["중국", "반도체", "수출"]),
+        ("CHINA_SEMICON_EXPORT", ["china", "semiconductor", "export"]),
+    ]
+
+    for key, terms in rules:
+        if all(term in t for term in terms):
+            return key
+
+    if category == "A_LEGAL_OFFICIAL":
+        return "LEGAL_" + "_".join(t.split()[:8])
+
+    tokens = [x for x in t.split() if len(x) >= 2]
+    important = [
+        x for x in tokens
+        if x in [
+            "ustr", "cbp", "wto", "관세청", "federal", "register",
+            "tariff", "관세", "origin", "원산지", "fta", "usmca", "반덤핑",
+            "수출통제", "semiconductor", "반도체", "mexico", "멕시코", "eu",
+            "china", "중국", "vietnam", "베트남", "india", "인도"
+        ]
+    ]
+
+    if important:
+        return "_".join(important[:7])
+
+    return f"{category}_{news_type}_" + t[:50]
+
+
+def is_similar(a, b, threshold=0.84):
+    a = norm(a)
+    b = norm(b)
+    if not a or not b:
+        return False
+    if a[:40] == b[:40]:
+        return True
+    return SequenceMatcher(None, a, b).ratio() >= threshold
+
+
+def deduplicate(df):
+    df = df.loc[:, ~df.columns.duplicated()].copy()
+    df["url_norm"] = df["url"].fillna("").astype(str).str.strip()
+    df = df.drop_duplicates(subset=["url_norm"], keep="first")
+
+    selected = []
+    titles = []
+    for _, row in df.sort_values(["priority", "score"], ascending=[True, False]).iterrows():
+        title = safe_str(row["title"])
+        if any(is_similar(title, old) for old in titles):
+            continue
+        selected.append(row)
+        titles.append(title)
+
+    return pd.DataFrame(selected).drop(columns=["url_norm"], errors="ignore") if selected else df.head(0)
+
+
+# =========================
+# SELECTION ENGINE
+# =========================
+def select_representatives(df, top_n=30):
+    df = df.loc[:, ~df.columns.duplicated()].copy()
+    df = df.sort_values(["priority", "score"], ascending=[True, False])
+
+    selected_rows = []
+    selected_issues = set()
+    category_counts = {k: 0 for k in CATEGORY_QUOTA}
+    source_counts = {}
+    korea_count = 0
+
+    for _, row in df.iterrows():
+        category = row["category"]
+        issue = row["issue_key"]
+        source = safe_str(row.get("source", ""))[:50]
+        country = safe_str(row.get("country_rule", ""))
+
+        if category not in CATEGORY_QUOTA:
+            continue
+        if category_counts[category] >= CATEGORY_QUOTA[category]:
+            continue
+        if issue in selected_issues:
+            continue
+        if source and source_counts.get(source, 0) >= MAX_SOURCE:
+            continue
+        if "한국" in country and korea_count >= MAX_KOREA:
+            continue
+
+        selected_rows.append(row)
+        selected_issues.add(issue)
+        category_counts[category] += 1
+        source_counts[source] = source_counts.get(source, 0) + 1
+        if "한국" in country:
+            korea_count += 1
+
+        if len(selected_rows) >= top_n:
+            break
+
+    if len(selected_rows) < top_n:
+        for _, row in df.iterrows():
+            issue = row["issue_key"]
+            source = safe_str(row.get("source", ""))[:50]
+
+            if issue in selected_issues:
+                continue
+            if source and source_counts.get(source, 0) >= MAX_SOURCE:
+                continue
+
+            selected_rows.append(row)
+            selected_issues.add(issue)
+            source_counts[source] = source_counts.get(source, 0) + 1
+
+            if len(selected_rows) >= top_n:
+                break
+
+    return pd.DataFrame(selected_rows).reset_index(drop=True)
 
 
 # =========================
 # COUNTRY / AGENCY
 # =========================
 def extract_country(title):
-    t = normalize_text(title)
-
+    t = norm(title)
     mapping = [
-        ("united states", "미국"), ("u s", "미국"), ("usa", "미국"), ("미국", "미국"),
+        ("united states", "미국"), ("u.s", "미국"), ("usa", "미국"), ("us", "미국"), ("미국", "미국"),
         ("china", "중국"), ("중국", "중국"),
         ("eu", "EU"), ("europe", "EU"), ("유럽", "EU"),
         ("india", "인도"), ("인도", "인도"),
@@ -365,357 +616,69 @@ def extract_country(title):
         ("australia", "호주"), ("호주", "호주"),
         ("canada", "캐나다"), ("캐나다", "캐나다"),
         ("uk", "영국"), ("britain", "영국"), ("영국", "영국"),
-        ("indonesia", "인도네시아"), ("인도네시아", "인도네시아"),
+        ("asean", "아세안"), ("아세안", "아세안"),
+        ("uae", "UAE"), ("dubai", "UAE"),
     ]
 
     found = []
     for k, v in mapping:
         if k in t and v not in found:
             found.append(v)
-
     return ", ".join(found[:2]) if found else "글로벌"
 
 
 def extract_agency(title, source=""):
-    t = normalize_text(title + " " + source)
-
+    t = norm(title + " " + source)
     mapping = [
         ("ustr", "USTR"),
         ("cbp", "CBP"),
         ("customs and border protection", "CBP"),
+        ("federal register", "Federal Register"),
         ("관세청", "관세청"),
         ("wto", "WTO"),
+        ("bis", "BIS"),
+        ("mofcom", "MOFCOM"),
         ("european commission", "EU Commission"),
         ("eu commission", "EU Commission"),
+        ("official journal", "EU Official Journal"),
+        ("taxud", "EU TAXUD"),
         ("commerce department", "U.S. Department of Commerce"),
         ("상무부", "U.S. Department of Commerce"),
         ("customs", "세관"),
         ("세관", "세관"),
         ("ministry", "정부기관"),
-        ("commission", "정부/위원회"),
         ("법제처", "법제처"),
-        ("국가법령정보센터", "국가법령정보센터"),
         ("관보", "관보"),
-        ("federal register", "Federal Register"),
+        ("reuters", "Reuters"),
     ]
-
     for k, v in mapping:
         if k in t:
             return v
-
     return "N/A"
 
 
-# =========================
-# ISSUE CLUSTERING
-# =========================
-CLUSTER_RULES = [
-    ("LEGAL_CUSTOMS_RULE", ["고시"]),
-    ("LEGAL_CUSTOMS_RULE", ["공고"]),
-    ("LEGAL_CUSTOMS_RULE", ["행정규칙"]),
-    ("LEGAL_CUSTOMS_RULE", ["입법예고"]),
-    ("LEGAL_CUSTOMS_RULE", ["관보"]),
-    ("LEGAL_CUSTOMS_RULE", ["federal", "register"]),
-    ("US_CHINA_TARIFF_DEAL", ["중국", "미국", "관세", "인하"]),
-    ("US_CHINA_TARIFF_DEAL", ["중", "미", "관세", "인하"]),
-    ("US_CHINA_TARIFF_DEAL", ["미중", "관세"]),
-    ("US_CHINA_TARIFF_DEAL", ["china", "us", "tariff"]),
-    ("US_CHINA_TARIFF_DEAL", ["china", "u s", "tariff"]),
-    ("US_CHINA_TARIFF_DEAL", ["trump", "china", "tariff"]),
-    ("SECTION_301", ["301"]),
-    ("CBP_CUSTOMS_POLICY", ["cbp"]),
-    ("CBP_CUSTOMS_POLICY", ["customs", "border", "protection"]),
-    ("AD_CVD", ["반덤핑"]),
-    ("AD_CVD", ["anti", "dumping"]),
-    ("FTA_GENERAL", ["fta"]),
-    ("ORIGIN_RULE", ["원산지"]),
-    ("ORIGIN_RULE", ["origin"]),
-    ("EXPORT_CONTROL", ["수출통제"]),
-    ("EXPORT_CONTROL", ["export", "control"]),
-    ("SANCTION", ["sanction"]),
-    ("SANCTION", ["제재"]),
-    ("CBAM", ["cbam"]),
-]
-
-
-def issue_cluster_key(title):
-    t = normalize_text(title)
-
-    for key, terms in CLUSTER_RULES:
-        if all(term in t for term in terms):
-            return key
-
-    tokens = [x for x in t.split() if len(x) >= 2]
-    important = [
-        x for x in tokens
-        if x in [
-            "미국", "중국", "인도", "베트남", "멕시코", "eu",
-            "ustr", "cbp", "관세청", "tariff", "customs",
-            "origin", "fta", "wto", "관세", "원산지", "반덤핑", "수출통제",
-            "고시", "공고", "법령", "행정규칙", "입법예고",
-        ]
-    ]
-
-    if important:
-        return "_".join(important[:5])
-
-    return t[:50]
-
-
-# =========================
-# SCORING
-# =========================
-def policy_score(title, source=""):
-    t = normalize_text(title + " " + source)
-    s = 0
-
-    weights = {
-        "section 301": 50,
-        "301": 50,
-        "ustr": 45,
-        "관세": 38,
-        "tariff": 38,
-        "duty": 25,
-        "customs": 24,
-        "세관": 24,
-        "cbp": 40,
-        "anti dumping": 42,
-        "antidumping": 42,
-        "반덤핑": 42,
-        "countervailing": 35,
-        "상계관세": 35,
-        "export control": 45,
-        "수출통제": 45,
-        "sanction": 38,
-        "제재": 38,
-        "cbam": 38,
-        "wto": 30,
-        "fta": 26,
-        "cepa": 22,
-        "원산지": 35,
-        "origin": 30,
-    }
-
-    for k, v in weights.items():
-        if k in t:
-            s += v
-
-    if any(k.lower() in t for k in GOV_KEYWORDS):
-        s += 30
-
-    return s
-
-
-def samsung_score(title):
-    t = normalize_text(title)
-    s = 0
-
-    for k in SAMSUNG_KEYWORDS:
-        if k.lower() in t:
-            s += 35
-
-    for k in PRODUCTION_COUNTRIES:
-        if k.lower() in t:
-            s += 18
-
-    if any(k.lower() in t for k in ["vietnam", "베트남", "india", "인도", "mexico", "멕시코"]):
-        s += 20
-
-    if any(k.lower() in t for k in LOW_RELEVANCE_KEYWORDS):
-        s -= 45
-
-    return s
-
-
-def region_balance_score(title):
-    t = normalize_text(title)
-    s = 0
-
-    if any(k in t for k in ["미국", "united states", "usa", "u s", "ustr", "cbp"]):
-        s += 25
-    if any(k in t for k in ["중국", "china"]):
-        s += 18
-    if any(k in t for k in ["eu", "europe", "유럽"]):
-        s += 18
-    if any(k in t for k in ["인도", "india", "베트남", "vietnam", "멕시코", "mexico"]):
-        s += 18
-
-    if "한국" in t and not any(k in t for k in ["관세청", "ustr", "301", "관세", "반덤핑", "수출통제", "삼성", "반도체", "고시", "공고", "법령"]):
-        s -= 15
-
-    return s
-
-
-def final_score(row):
-    return (
-        legal_priority_score(row["title"], row.get("source", ""))
-        + policy_score(row["title"], row.get("source", ""))
-        + samsung_score(row["title"])
-        + region_balance_score(row["title"])
-    )
-
-
-def importance_by_score(score, title, source=""):
-    if is_legal_priority(title, source):
+def importance_by_category(category):
+    if category in ["A_LEGAL_OFFICIAL", "B_SEMICONDUCTOR_TARIFF", "C_ORIGIN_FTA_USMCA", "D_EXPORT_CONTROL_SANCTION", "E_AD_CVD_TRADE_REMEDY"]:
         return "상"
-
-    t = normalize_text(title)
-
-    if any(k in t for k in LOW_RELEVANCE_KEYWORDS) and score < 120:
-        return "하"
-
-    if score >= 120:
-        return "상"
-    if score >= 60:
+    if category in ["F_CUSTOMS_AUDIT_VALUATION", "G_CBAM_SUPPLY_CHAIN", "H_SAMSUNG_GEO_POLICY"]:
         return "중"
     return "하"
 
 
-def risk_by_title(title, score, source=""):
-    if is_legal_priority(title, source):
+def risk_by_category(category):
+    if category in ["A_LEGAL_OFFICIAL", "B_SEMICONDUCTOR_TARIFF", "D_EXPORT_CONTROL_SANCTION", "E_AD_CVD_TRADE_REMEDY"]:
         return "상"
-
-    t = normalize_text(title)
-
-    if any(k in t for k in LOW_RELEVANCE_KEYWORDS) and not any(k in t for k in ["삼성", "반도체", "301", "수출통제", "ustr"]):
-        return "하"
-
-    if any(k in t for k in ["301", "추가관세", "반덤핑", "anti dumping", "antidumping", "수출통제", "export control", "제재", "sanction"]):
-        return "상"
-
-    if any(k in t for k in ["관세", "tariff", "customs", "fta", "원산지", "origin"]):
-        return "상" if score >= 120 else "중"
-
+    if category in ["C_ORIGIN_FTA_USMCA", "F_CUSTOMS_AUDIT_VALUATION", "G_CBAM_SUPPLY_CHAIN"]:
+        return "중"
     return "하"
 
 
 # =========================
-# NEWS TYPE
-# =========================
-def classify_news_type(title):
-    t = normalize_text(title)
-
-    if any(k.lower() in t for k in LEGAL_PRIORITY_KEYWORDS):
-        return "LEGAL_RULE"
-    if any(k in t for k in ["301", "section 301", "추가관세", "tariff", "관세"]):
-        return "TARIFF"
-    if any(k in t for k in ["fta", "cepa", "원산지", "origin"]):
-        return "FTA_ORIGIN"
-    if any(k in t for k in ["anti dumping", "antidumping", "반덤핑", "상계관세", "countervailing"]):
-        return "AD_CVD"
-    if any(k in t for k in ["export control", "수출통제", "sanction", "제재"]):
-        return "EXPORT_CONTROL"
-    if any(k in t for k in ["customs", "세관", "통관", "cbp"]):
-        return "CUSTOMS_AUDIT"
-    if any(k in t for k in ["cbam", "carbon", "탄소"]):
-        return "CBAM"
-    return "GENERAL_TRADE"
-
-
-# =========================
-# DEDUP + CLUSTER LIMIT
-# =========================
-def is_similar(a, b, threshold=0.80):
-    a = normalize_text(a)
-    b = normalize_text(b)
-
-    if not a or not b:
-        return False
-
-    if a[:35] == b[:35]:
-        return True
-
-    return SequenceMatcher(None, a, b).ratio() >= threshold
-
-
-def dedup_news(df):
-    df = df.copy()
-
-    df["url_norm"] = df["url"].fillna("").astype(str).str.strip()
-    df = df.drop_duplicates(subset=["url_norm"], keep="first")
-
-    selected_titles = []
-    rows = []
-
-    for _, row in df.sort_values("score", ascending=False).iterrows():
-        title = row["title"]
-        if any(is_similar(title, old) for old in selected_titles):
-            continue
-        selected_titles.append(title)
-        rows.append(row)
-
-    if not rows:
-        return df.head(0)
-
-    return pd.DataFrame(rows).drop(columns=["url_norm"], errors="ignore")
-
-
-def select_balanced_top(df, top_n=30):
-    country_count = {}
-    source_count = {}
-    cluster_count = {}
-    selected = []
-
-    legal_df = df[df.apply(lambda r: is_legal_priority(r["title"], r.get("source", "")), axis=1)]
-    normal_df = df[~df.index.isin(legal_df.index)]
-
-    ordered = pd.concat([
-        legal_df.sort_values("score", ascending=False),
-        normal_df.sort_values("score", ascending=False)
-    ])
-
-    for _, row in ordered.iterrows():
-        country = safe_str(row.get("country_rule", "글로벌"))
-        source = safe_str(row.get("source", ""))
-        cluster = safe_str(row.get("cluster_key", ""))
-
-        c_key = country.split(",")[0].strip() if country else "글로벌"
-        s_key = source[:40]
-
-        if cluster_count.get(cluster, 0) >= MAX_PER_CLUSTER:
-            continue
-
-        if c_key == "한국" and country_count.get(c_key, 0) >= MAX_KOREA_NEWS:
-            continue
-
-        if s_key and source_count.get(s_key, 0) >= MAX_SOURCE_NEWS:
-            continue
-
-        selected.append(row)
-        country_count[c_key] = country_count.get(c_key, 0) + 1
-        source_count[s_key] = source_count.get(s_key, 0) + 1
-        cluster_count[cluster] = cluster_count.get(cluster, 0) + 1
-
-        if len(selected) >= top_n:
-            break
-
-    if len(selected) < top_n:
-        selected_titles = {r["title"] for r in selected}
-
-        for _, row in ordered.iterrows():
-            if row["title"] in selected_titles:
-                continue
-
-            cluster = safe_str(row.get("cluster_key", ""))
-            if cluster_count.get(cluster, 0) >= MAX_PER_CLUSTER:
-                continue
-
-            selected.append(row)
-            cluster_count[cluster] = cluster_count.get(cluster, 0) + 1
-
-            if len(selected) >= top_n:
-                break
-
-    return pd.DataFrame(selected).reset_index(drop=True)
-
-
-# =========================
-# BODY FETCH
+# WEB BODY
 # =========================
 def safe_request(url):
     if not safe_str(url).startswith("http"):
         return ""
-
     for _ in range(2):
         try:
             r = requests.get(url, headers=HEADERS, timeout=8, allow_redirects=True)
@@ -723,8 +686,7 @@ def safe_request(url):
                 return r.text
         except Exception:
             pass
-        time.sleep(random.uniform(0.5, 1.2))
-
+        time.sleep(random.uniform(0.4, 1.0))
     return ""
 
 
@@ -732,28 +694,159 @@ def fetch_body(url):
     html = safe_request(url)
     if not html:
         return ""
-
     soup = BeautifulSoup(html, "html.parser")
-
     for tag in soup(["script", "style", "noscript", "header", "footer", "nav"]):
         tag.decompose()
-
     text = soup.get_text(" ")
     text = re.sub(r"\s+", " ", text).strip()
     return text[:3000]
 
 
 # =========================
-# AI ANALYSIS
+# ANALYSIS ENGINE
 # =========================
+def detect_product_area(title):
+    areas = []
+    if contains(title, SEMICON_KW):
+        areas.append("Semiconductor/Component")
+    if contains(title, ["mobile", "smartphone", "스마트폰", "휴대폰", "galaxy"]):
+        areas.append("Mobile")
+    if contains(title, ["전자", "electronics", "가전", "consumer electronics", "tv"]):
+        areas.append("Consumer Electronics")
+    if contains(title, ["network", "네트워크"]):
+        areas.append("Network Equipment")
+    if contains(title, ["display", "디스플레이"]):
+        areas.append("Display")
+    return ", ".join(areas[:2]) if areas else "Mobile/CE/Component 공통"
+
+
+def detect_geo_focus(title):
+    geos = []
+    checks = [
+        ("SEV/SEVT", ["vietnam", "베트남"]),
+        ("SIEL", ["india", "인도"]),
+        ("SAMEX", ["mexico", "멕시코"]),
+        ("중국법인", ["china", "중국"]),
+        ("북미 판매법인", ["united states", "usa", "u.s", "미국", "us"]),
+        ("EU 판매법인", ["eu", "europe", "유럽"]),
+        ("한국 본사/생산", ["korea", "한국"]),
+    ]
+    for label, keys in checks:
+        if contains(title, keys):
+            geos.append(label)
+    return ", ".join(geos[:3]) if geos else "SEV/SEVT, SIEL, SAMEX"
+
+
+def fallback_summary(title, body="", original_summary=""):
+    if original_summary and len(original_summary) > 20:
+        return limit_sentences(original_summary, 2, 420)
+    if body and len(body) > 120:
+        return limit_sentences(trim(body, 350), 2, 420)
+    return f"{title} 관련 관세·통상 정책 이슈입니다."
+
+
+def fallback_analysis(title, news_type, category):
+    product = detect_product_area(title)
+    geo = detect_geo_focus(title)
+
+    if category == "A_LEGAL_OFFICIAL":
+        return (
+            f"해당 공식 정책·법령 이슈는 {geo} 생산품의 HS·원산지·FTA·수출통제 내부통제 기준 변경 여부를 즉시 판정해야 하는 사안입니다. "
+            f"{product} 적용 품목과 시행일을 기준으로 통관 신고 기준, 증빙 보관, 법인·관세사 업무지침 변경 여부를 확정해야 합니다."
+        )
+
+    if category == "B_SEMICONDUCTOR_TARIFF":
+        return (
+            f"반도체 관세·규제 변화는 {geo}의 Semiconductor/Component 품목 HS별 관세원가와 북미/EU 판매법인 가격전가에 직접 반영됩니다. "
+            "Section 232/301 및 수출통제 병행 적용 가능성을 전제로 원산지·FTA·EAR 판정을 동시에 재점검해야 합니다."
+        )
+
+    if category == "C_ORIGIN_FTA_USMCA":
+        return (
+            f"FTA·원산지 기준 변화는 {geo} 생산품의 협정세율 적용과 사후검증 리스크를 직접 좌우합니다. "
+            f"{product} BOM상 역외산 핵심부품 비중이 높으면 원산지 충족률과 FTA 적용 가능성이 즉시 변동됩니다."
+        )
+
+    if category == "D_EXPORT_CONTROL_SANCTION":
+        return (
+            "수출통제·제재 변화는 Semiconductor/Component와 Network Equipment 거래의 최종사용자·최종용도 심사를 강화합니다. "
+            "SEV/SEVT·SIEL·SAMEX 출하품은 EAR·제재리스트·재수출 규정 적용 여부를 거래 전 단계에서 차단해야 합니다."
+        )
+
+    if category == "E_AD_CVD_TRADE_REMEDY":
+        return (
+            f"반덤핑·상계관세 조치는 {product} 관련 원재료·부품의 조달비용과 우회수출 판정 리스크를 높입니다. "
+            "SEV/SEVT·SIEL·SAMEX 생산품에 투입되는 대상 품목의 HS·원산지·거래가격 연결성을 즉시 확인해야 합니다."
+        )
+
+    if category == "F_CUSTOMS_AUDIT_VALUATION":
+        return (
+            f"세관 집행 강화는 {product} 제품의 HS 분류, 과세가격, 원산지 증빙, FTA 적용 신고의 정합성을 직접 겨냥합니다. "
+            "SEV/SEVT·SIEL·SAMEX 신고자료와 ERP Invoice·계약가격 간 불일치가 추징 포인트가 될 수 있습니다."
+        )
+
+    if category == "G_CBAM_SUPPLY_CHAIN":
+        return (
+            "CBAM·공급망 정책은 EU향 제품의 원재료 출처, 탄소자료, 원산지 증빙을 결합해 요구할 가능성이 높습니다. "
+            "SEV/SEVT·SIEL·SAMEX 생산품의 HS별 원재료 출처와 증빙 확보 수준을 EU 판매법인 기준으로 정렬해야 합니다."
+        )
+
+    return (
+        f"{geo} 관련 통상정책 변화가 {product} 제품의 HS·원산지·FTA·수출통제 적용 여부와 연결되는지 1차 판정해야 합니다. "
+        "직접 관련 품목이 확인되면 생산거점별 관세율·과세가격·증빙자료를 즉시 재산출합니다."
+    )
+
+
+def fallback_action(title, news_type, category):
+    product = detect_product_area(title)
+    geo = detect_geo_focus(title)
+
+    if category == "A_LEGAL_OFFICIAL":
+        return (
+            f"① 시행일·적용대상 HS를 확정하고 ② {geo} 생산거점별 원산지·FTA·수출통제 영향표를 업데이트하며 ③ 법인·관세사 신고지침과 증빙 보관 체크리스트를 개정합니다."
+        )
+
+    if category == "B_SEMICONDUCTOR_TARIFF":
+        return (
+            f"① 미국/EU향 Semiconductor HS Mapping을 재점검하고 ② {geo} 생산거점별 관세율·원산지·FTA 적용세율을 재산출하며 ③ EAR/수출통제 대상 여부와 가격전가 영향을 사업부에 공유합니다."
+        )
+
+    if category == "C_ORIGIN_FTA_USMCA":
+        return (
+            f"① {geo} 생산품의 BOM 기준 원산지 충족률을 재산출하고 ② FTA 적용 가능 HS를 분리하며 ③ 공급업체 원산지확인서·제조공정 증빙을 사후검증 패키지로 정리합니다."
+        )
+
+    if category == "D_EXPORT_CONTROL_SANCTION":
+        return (
+            "① 거래상대방·최종사용자·목적지 국가를 수출통제 리스트와 대조하고 ② EAR·재수출 규정 적용 여부를 판정하며 ③ 반도체·네트워크 출하 승인 기준을 법무·영업과 업데이트합니다."
+        )
+
+    if category == "E_AD_CVD_TRADE_REMEDY":
+        return (
+            "① 대상 품목 HS와 공급처 원산지를 매핑하고 ② SEV/SEVT·SIEL·SAMEX 투입 부품과 연결성을 비교하며 ③ 반덤핑 관세율 반영 시 대체 공급처·가격조건을 구매부서와 재산출합니다."
+        )
+
+    if category == "F_CUSTOMS_AUDIT_VALUATION":
+        return (
+            f"① {geo} 최근 신고 건의 HS·과세가격·원산지·FTA 적용 내역을 샘플링하고 ② ERP Invoice와 신고금액·수량 불일치를 정리하며 ③ 관세사별 소명자료 패키지를 준비합니다."
+        )
+
+    if category == "G_CBAM_SUPPLY_CHAIN":
+        return (
+            "① EU향 대상 HS를 식별하고 ② 원재료 원산지·탄소자료 확보 수준을 점검하며 ③ SEV/SEVT·SIEL·SAMEX 공급망별 증빙 공백을 EU 판매법인에 공유합니다."
+        )
+
+    return (
+        f"① {geo} 관련 품목의 HS·원산지·FTA 적용 여부를 1차 분류하고 ② 수출통제 대상 여부를 확인하며 ③ 직접 영향 품목만 GTI 후속 과제로 등록합니다."
+    )
+
+
 def parse_json_from_text(txt):
     txt = safe_str(txt)
     start = txt.find("{")
     end = txt.rfind("}") + 1
-
     if start < 0 or end <= start:
         return {}
-
     try:
         return json.loads(txt[start:end])
     except Exception:
@@ -761,22 +854,17 @@ def parse_json_from_text(txt):
 
 
 def bad_ai_text(text, min_len=80):
-    t = clean_ai_text(text)
-    if not t:
+    t = clean_text(text)
+    if not t or len(t) < min_len:
         return True
-    if len(t) < min_len:
-        return True
-
     if any(p in t for p in FORBIDDEN_PHRASES):
         return True
-
     if t.count("삼성전자") > 3:
         return True
-
     return False
 
 
-def analyze_with_ai(title, body, news_type):
+def analyze_with_ai(title, body, news_type, category, decision):
     if not USE_AI or client is None:
         return {}
 
@@ -784,8 +872,14 @@ def analyze_with_ai(title, body, news_type):
 너는 삼성전자 본사 관세전략 담당 임원이다.
 아래 뉴스 제목과 본문을 기준으로 삼성전자 관세·통상 업무 관점의 GTI 보고서용 분석을 작성한다.
 
+[선정 카테고리]
+{category}
+
 [뉴스 유형]
 {news_type}
+
+[선정 사유]
+{decision}
 
 [제목]
 {title}
@@ -793,44 +887,18 @@ def analyze_with_ai(title, body, news_type):
 [본문 일부]
 {body[:2200]}
 
-[반드시 아래 기준으로 작성]
+[작성 기준]
 - 2문장 이내
 - 실행지시형
 - HS/원산지/FTA/수출통제 포함
 - 삼성 생산거점(SEV/SEVT/SIEL/SAMEX) 언급
 - 관세전문가 어조
 - 일반론 금지
-- "모니터링 필요" 금지
-- 실제 실무지시 작성
-- 법령/규칙/고시/공고/입법예고/행정규칙이면 시행일, 적용대상, 내부통제 변경 필요성을 우선 판단
-
-[삼성전자 분석 기준]
-- 생산거점: SEV/SEVT(베트남), SIEL(인도), SAMEX(멕시코), 중국, 한국, 폴란드, 브라질
-- 제품군: Mobile, Consumer Electronics, Network Equipment, Semiconductor/Component, Display
-- 관세 포인트: HS Code, 관세율, 301조, 반덤핑/상계관세, 원산지, FTA, 수출통제, 제재, 통관심사, 과세가격
-- 직접 영향: 관세율/수입규제/수출통제/원산지 규정이 삼성 제품·생산국·판매국과 연결될 때
-- 간접 영향: 통상협상, 시장접근, 공급망, 물류, 세관 집행 강화 등
-
-[Action Plan 작성 규칙]
-- 반드시 실행 동사 사용: 확인, 매핑, 산출, 비교, 업데이트, 공유, 준비, 재산출
-- 아래 항목 중 최소 3개를 포함: HS Mapping, 생산거점별 원산지 영향, FTA 적용 가능 여부, 수출통제/EAR 대상 여부, 북미/EU 판매법인 영향
-- "검토 필요", "대응 필요", "모니터링 필요" 금지
-
-[금지 표현]
-- 모니터링 필요
-- 영향 분석 필요
-- 대응 필요
-- 검토 필요
-- 관련 이슈
-- 주의 필요
-- 리스크 존재
-
-[좋은 예시]
-AI Analysis:
-미국 추가관세 적용 시 SEV/SEVT 생산 Mobile 제품의 CIF 기준 과세가격 상승이 북미 판매법인의 가격 경쟁력에 직접 반영될 수 있으며, SIEL 생산품은 FTA 적용 여부에 따라 관세율 차이가 발생한다.
-
-Action Plan:
-① 미국향 Mobile 모델 HS Mapping을 재점검하고 ② SEV/SEVT·SIEL 원산지 판정 구조와 FTA 적용세율을 재산출하며 ③ EAR/수출통제 대상 여부와 북미 판매법인 가격전가 영향을 사업부에 공유한다.
+- "모니터링 필요", "검토 필요", "대응 필요" 금지
+- 법령/공식문서는 시행일, 적용대상, 내부통제 변경 여부 우선
+- 반도체/301/232는 HS·관세율 시나리오·EAR·북미 판매법인 영향 우선
+- FTA/원산지는 BOM·원산지 충족률·사후검증 증빙 우선
+- 수출통제는 최종사용자·최종용도·재수출 규정 우선
 
 [출력 JSON만 작성]
 {{
@@ -842,7 +910,6 @@ Action Plan:
   "risk": "상/중/하"
 }}
 """
-
     try:
         res = client.models.generate_content(model=GEMINI_MODEL, contents=prompt)
         return parse_json_from_text(res.text)
@@ -850,176 +917,20 @@ Action Plan:
         return {}
 
 
-# =========================
-# EXPERT FALLBACK ANALYSIS
-# =========================
-def fallback_summary(title, body=""):
-    if body and len(body) > 120:
-        return limit_sentences(trim(body, 300), 2, 300)
-    return f"{title} 관련 관세·통상 조치입니다."
-
-
-def detect_product_area(title):
-    t = normalize_text(title)
-    areas = []
-
-    if any(k in t for k in ["반도체", "semiconductor", "chip", "hbm", "dram", "nand"]):
-        areas.append("Semiconductor/Component")
-    if any(k in t for k in ["smartphone", "mobile", "스마트폰", "휴대폰", "galaxy"]):
-        areas.append("Mobile")
-    if any(k in t for k in ["전자", "electronics", "가전", "consumer electronics"]):
-        areas.append("Consumer Electronics")
-    if any(k in t for k in ["network", "네트워크"]):
-        areas.append("Network Equipment")
-    if any(k in t for k in ["display", "디스플레이"]):
-        areas.append("Display")
-
-    return ", ".join(areas[:2]) if areas else "Mobile/CE/Component 공통"
-
-
-def detect_geo_focus(title):
-    t = normalize_text(title)
-    geos = []
-
-    for label, keys in [
-        ("SEV/SEVT", ["vietnam", "베트남"]),
-        ("SIEL", ["india", "인도"]),
-        ("SAMEX", ["mexico", "멕시코"]),
-        ("중국법인", ["china", "중국"]),
-        ("북미 판매법인", ["united states", "usa", "u s", "미국"]),
-        ("EU 판매법인", ["eu", "europe", "유럽"]),
-        ("한국 본사/생산", ["korea", "한국"]),
-    ]:
-        if any(k in t for k in keys):
-            geos.append(label)
-
-    if not geos:
-        geos = ["SEV/SEVT", "SIEL", "SAMEX"]
-
-    return ", ".join(geos[:3])
-
-
-def fallback_analysis(title, news_type="GENERAL_TRADE"):
-    product = detect_product_area(title)
-    geo = detect_geo_focus(title)
-
-    if news_type == "LEGAL_RULE":
-        return (
-            f"해당 법령·규칙 신규 게시물은 {geo} 생산품의 HS·원산지·FTA·수출통제 내부통제 기준 변경 여부를 즉시 판단해야 하는 사안입니다. "
-            f"{product} 적용 품목과 시행일을 기준으로 통관 신고 기준, 증빙 보관, 법인·관세사 업무지침 변경 여부를 확정해야 합니다."
-        )
-
-    if news_type == "TARIFF":
-        return (
-            f"{geo} 관련 관세율·추가관세 변경은 {product} 제품의 HS별 수입원가와 북미/EU 판매법인 가격전가에 직접 반영됩니다. "
-            "원산지 판정과 FTA 적용 가능성에 따라 동일 모델도 생산거점별 관세 부담이 달라집니다."
-        )
-
-    if news_type == "FTA_ORIGIN":
-        return (
-            f"{geo} 관련 FTA·원산지 기준 변화는 {product} 제품의 협정세율 적용과 사후검증 리스크를 직접 좌우합니다. "
-            "BOM상 역외산 핵심부품 비중이 높으면 SEV/SEVT·SIEL·SAMEX 생산품의 원산지 충족률이 흔들릴 수 있습니다."
-        )
-
-    if news_type == "AD_CVD":
-        return (
-            f"반덤핑·상계관세 조치는 {product} 관련 원재료·부품의 조달비용과 우회수출 판정 리스크를 높입니다. "
-            "SEV/SEVT·SIEL·SAMEX 생산품에 투입되는 대상 품목의 HS·원산지·거래가격 연결성을 즉시 확인해야 합니다."
-        )
-
-    if news_type == "EXPORT_CONTROL":
-        return (
-            "수출통제·제재 변화는 Semiconductor/Component와 Network Equipment 거래의 최종사용자·최종용도 심사를 강화합니다. "
-            "SEV/SEVT·SIEL·SAMEX 출하품은 EAR·제재리스트·재수출 규정 적용 여부를 거래 전 단계에서 차단해야 합니다."
-        )
-
-    if news_type == "CUSTOMS_AUDIT":
-        return (
-            f"세관 집행 강화는 {product} 제품의 HS 분류, 과세가격, 원산지 증빙, FTA 적용 신고의 정합성을 직접 겨냥합니다. "
-            "SEV/SEVT·SIEL·SAMEX 신고자료와 ERP Invoice·계약가격 간 불일치가 추징 포인트가 될 수 있습니다."
-        )
-
-    if news_type == "CBAM":
-        return (
-            "CBAM·탄소통상 조치는 EU향 제품의 원재료 탄소정보와 원산지·공급망 증빙을 결합해 요구할 가능성이 높습니다. "
-            "SEV/SEVT·SIEL·SAMEX 생산품의 HS별 원재료 출처와 탄소자료 확보 수준을 EU 판매법인 기준으로 정렬해야 합니다."
-        )
-
-    return (
-        f"{geo} 관련 통상정책 변화가 {product} 제품의 HS·원산지·FTA·수출통제 적용 여부와 연결되는지 1차 판정해야 합니다. "
-        "직접 관련 품목이 확인되면 생산거점별 관세율·과세가격·증빙자료를 즉시 재산출합니다."
-    )
-
-
-def fallback_action(title, news_type="GENERAL_TRADE"):
-    product = detect_product_area(title)
-    geo = detect_geo_focus(title)
-
-    if news_type == "LEGAL_RULE":
-        return (
-            f"① 신규 법령·규칙의 시행일·적용대상 HS를 확정하고 ② {geo} 생산거점별 원산지·FTA·수출통제 영향표를 업데이트하며 ③ 법인·관세사 신고지침과 증빙 보관 체크리스트를 개정합니다."
-        )
-
-    if news_type == "TARIFF":
-        return (
-            f"① {product} 미국/EU향 모델의 HS Mapping을 재점검하고 ② {geo} 생산거점별 원산지 판정과 FTA 적용세율을 재산출하며 ③ 관세율 시나리오별 원가·가격전가 영향을 사업부에 공유합니다."
-        )
-
-    if news_type == "FTA_ORIGIN":
-        return (
-            f"① {geo} 생산품의 BOM 기준 원산지 충족률을 재산출하고 ② FTA 적용 가능 HS를 분리하며 ③ 공급업체 원산지확인서·제조공정 증빙을 사후검증 패키지로 정리합니다."
-        )
-
-    if news_type == "AD_CVD":
-        return (
-            "① 대상 품목 HS와 공급처 원산지를 매핑하고 ② SEV/SEVT·SIEL·SAMEX 투입 부품과 연결성을 비교하며 ③ 반덤핑 관세율 반영 시 대체 공급처·가격조건을 구매부서와 재산출합니다."
-        )
-
-    if news_type == "EXPORT_CONTROL":
-        return (
-            "① 거래상대방·최종사용자·목적지 국가를 수출통제 리스트와 대조하고 ② EAR·재수출 규정 적용 여부를 판정하며 ③ 반도체·네트워크 출하 승인 기준을 법무·영업과 업데이트합니다."
-        )
-
-    if news_type == "CUSTOMS_AUDIT":
-        return (
-            f"① {geo} 최근 신고 건의 HS·과세가격·원산지·FTA 적용 내역을 샘플링하고 ② ERP Invoice와 신고금액·수량 불일치를 정리하며 ③ 관세사별 소명자료 패키지를 준비합니다."
-        )
-
-    if news_type == "CBAM":
-        return (
-            "① EU향 대상 HS를 식별하고 ② 원재료 원산지·탄소자료 확보 수준을 점검하며 ③ SEV/SEVT·SIEL·SAMEX 공급망별 CBAM 증빙 공백을 EU 판매법인에 공유합니다."
-        )
-
-    return (
-        f"① {geo} 관련 품목의 HS·원산지·FTA 적용 여부를 1차 분류하고 ② 수출통제 대상 여부를 확인하며 ③ 직접 영향 품목만 GTI 후속 과제로 등록합니다."
-    )
-
-
-def enforce_gti_quality(text, kind="analysis", title="", news_type="GENERAL_TRADE"):
+def enforce_quality(text):
     text = limit_sentences(text, 2, 650)
-
     if any(p in text for p in FORBIDDEN_PHRASES):
         return ""
-
-    if kind == "action":
-        required_any = ["HS", "원산지", "FTA", "수출통제", "EAR", "SEV", "SEVT", "SIEL", "SAMEX"]
-        if not any(k in text for k in required_any):
-            return ""
-        if len(text) < 80:
-            return ""
-
-    elif kind == "analysis":
-        required_any = ["HS", "원산지", "FTA", "수출통제", "SEV", "SEVT", "SIEL", "SAMEX", "관세", "과세가격"]
-        if not any(k in text for k in required_any):
-            return ""
-        if len(text) < 80:
-            return ""
-
+    required = ["HS", "원산지", "FTA", "수출통제", "EAR", "SEV", "SEVT", "SIEL", "SAMEX", "관세", "과세가격"]
+    if not any(k in text for k in required):
+        return ""
+    if len(text) < 70:
+        return ""
     return text
 
 
 # =========================
-# EXCEL OUTPUT
+# EXCEL
 # =========================
 def write_excel(df_out, path):
     os.makedirs(os.path.dirname(path), exist_ok=True)
@@ -1052,21 +963,11 @@ def write_excel(df_out, path):
                 h.font = link_font
 
     widths = {
-        "Date": 18,
-        "Headline": 50,
-        "importance": 10,
-        "URL": 30,
-        "source": 22,
-        "last_checked": 18,
-        "Summary": 58,
-        "AI Analysis": 78,
-        "Action Plan": 78,
-        "Country": 18,
-        "agency": 24,
-        "risk": 8,
-        "score": 8,
-        "news_type": 18,
-        "cluster_key": 22,
+        "Date": 18, "Headline": 55, "importance": 10, "URL": 30,
+        "source": 22, "last_checked": 18, "Summary": 58,
+        "AI Analysis": 78, "Action Plan": 78, "Country": 18,
+        "agency": 24, "risk": 8, "score": 10, "priority": 8,
+        "category": 26, "decision": 28, "news_type": 18, "issue_key": 28,
     }
 
     for col_name, width in widths.items():
@@ -1086,7 +987,7 @@ def write_excel(df_out, path):
 # MAIN
 # =========================
 def main():
-    print("🚀 GTI STEP4 FINAL v10.0 + LEGAL PATCH START")
+    print("🚀 GTI STEP4 STRUCTURAL FINAL v12.0 START")
     print(f"[AI] {'ON' if USE_AI else 'OFF - rule fallback only'}")
 
     if not os.path.exists(INPUT_FILE):
@@ -1104,35 +1005,40 @@ def main():
     df["url"] = df["url"].apply(safe_str)
     df["source"] = df["source"].apply(safe_str)
     df["date"] = df["date"].apply(safe_str)
+    df["summary"] = df["summary"].apply(safe_str)
 
-    df = df[(df["title"] != "") & (df["title"] != "0")]
+    df = df[(df["title"] != "") & (df["title"] != "0")].copy()
     print(f"[TITLE OK] {len(df)} rows")
 
-    df = df[~df["title"].apply(is_noise)]
-    print(f"[NOISE REMOVED] {len(df)} rows")
+    for col in ["include", "category", "news_type", "priority", "score", "decision", "issue_key"]:
+        if col in df.columns:
+            df = df.drop(columns=[col])
 
-    df = df[
-        df["title"].apply(is_trade_news)
-        | df.apply(lambda r: is_legal_priority(r["title"], r.get("source", "")), axis=1)
-    ]
-    print(f"[TRADE/LEGAL FILTER] {len(df)} rows")
+    decisions = df.apply(decision_engine, axis=1, result_type="expand")
+    df = pd.concat([df.reset_index(drop=True), decisions.reset_index(drop=True)], axis=1)
+    df = df.loc[:, ~df.columns.duplicated()].copy()
 
-    df = df[~df["title"].apply(is_low_relevance_only)]
-    print(f"[LOW-ONLY REMOVED] {len(df)} rows")
+    print(f"[INCLUDE] {int(df['include'].sum())} rows")
+    print(f"[REJECT] {int((~df['include']).sum())} rows")
+
+    df = df[df["include"] == True].copy()
 
     df["country_rule"] = df["title"].apply(extract_country)
     df["agency_rule"] = df.apply(lambda r: extract_agency(r["title"], r.get("source", "")), axis=1)
-    df["cluster_key"] = df["title"].apply(issue_cluster_key)
-    df["score"] = df.apply(final_score, axis=1)
-    df["importance"] = df.apply(lambda r: importance_by_score(r["score"], r["title"], r.get("source", "")), axis=1)
-    df["risk_rule"] = df.apply(lambda r: risk_by_title(r["title"], r["score"], r.get("source", "")), axis=1)
-    df["news_type"] = df["title"].apply(classify_news_type)
+    df["issue_key"] = df.apply(lambda r: issue_cluster_key(r["title"], r["category"], r["news_type"]), axis=1)
+    df["importance"] = df["category"].apply(importance_by_category)
+    df["risk_rule"] = df["category"].apply(risk_by_category)
 
-    df = dedup_news(df)
+    df = deduplicate(df)
     print(f"[DEDUP] {len(df)} rows")
 
-    top = select_balanced_top(df, TOP_N)
+    top = select_representatives(df, TOP_N)
     print(f"[TOP] {len(top)} rows")
+
+    if len(top) > 0:
+        print("[CATEGORY MIX]")
+        for k, v in top["category"].value_counts().items():
+            print(f" - {k}: {v}")
 
     records = []
     last_checked = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
@@ -1141,30 +1047,32 @@ def main():
         title = safe_str(row["title"])
         url = safe_str(row["url"])
         news_type = safe_str(row.get("news_type", "GENERAL_TRADE"))
+        category = safe_str(row.get("category", ""))
+        decision = safe_str(row.get("decision", ""))
 
-        print(f"[AI {idx + 1}/{len(top)}] {title[:80]}")
+        print(f"[AI {idx + 1}/{len(top)}] {category} | {title[:70]}")
 
         body = fetch_body(url)
-        ai = analyze_with_ai(title, body, news_type)
+        ai = analyze_with_ai(title, body, news_type, category, decision)
 
-        summary = clean_ai_text(ai.get("summary", ""))
-        analysis = clean_ai_text(ai.get("ai_analysis", ""))
-        action = clean_ai_text(ai.get("action_plan", ""))
-        country = clean_ai_text(ai.get("country", ""))
-        agency = clean_ai_text(ai.get("agency", ""))
-        risk = clean_ai_text(ai.get("risk", ""))
+        summary = clean_text(ai.get("summary", ""))
+        analysis = clean_text(ai.get("ai_analysis", ""))
+        action = clean_text(ai.get("action_plan", ""))
+        country = clean_text(ai.get("country", ""))
+        agency = clean_text(ai.get("agency", ""))
+        risk = clean_text(ai.get("risk", ""))
 
-        if bad_ai_text(summary, min_len=40):
-            summary = fallback_summary(title, body)
+        if bad_ai_text(summary, min_len=35):
+            summary = fallback_summary(title, body, row.get("summary", ""))
 
-        analysis = enforce_gti_quality(analysis, "analysis", title, news_type)
-        action = enforce_gti_quality(action, "action", title, news_type)
+        analysis = enforce_quality(analysis)
+        action = enforce_quality(action)
 
         if not analysis:
-            analysis = fallback_analysis(title, news_type)
+            analysis = fallback_analysis(title, news_type, category)
 
         if not action:
-            action = fallback_action(title, news_type)
+            action = fallback_action(title, news_type, category)
 
         analysis = limit_sentences(analysis, 2, 650)
         action = limit_sentences(action, 2, 650)
@@ -1192,8 +1100,11 @@ def main():
             "agency": agency,
             "risk": risk,
             "score": int(row.get("score", 0)),
+            "priority": int(row.get("priority", 99)),
+            "category": category,
+            "decision": decision,
             "news_type": news_type,
-            "cluster_key": safe_str(row.get("cluster_key", "")),
+            "issue_key": safe_str(row.get("issue_key", "")),
         })
 
     out = pd.DataFrame(records)
@@ -1201,15 +1112,16 @@ def main():
     final_cols = [
         "Date", "Headline", "importance", "URL", "source", "last_checked",
         "Summary", "AI Analysis", "Action Plan",
-        "Country", "agency", "risk", "score", "news_type", "cluster_key"
+        "Country", "agency", "risk",
+        "score", "priority", "category", "decision", "news_type", "issue_key"
     ]
 
     out = out[final_cols]
-
     write_excel(out, OUTPUT_DAILY)
 
     if os.path.exists(OUTPUT_CUMUL):
         old = pd.read_excel(OUTPUT_CUMUL)
+        old = old.loc[:, ~old.columns.duplicated()].copy()
         total = pd.concat([old, out], ignore_index=True)
         if "URL" in total.columns:
             total = total.drop_duplicates(subset=["URL"], keep="last")
@@ -1221,7 +1133,7 @@ def main():
     write_excel(total, OUTPUT_CUMUL)
 
     print("===================================")
-    print("✅ GTI STEP4 FINAL v10.0 + LEGAL PATCH COMPLETE")
+    print("✅ GTI STEP4 STRUCTURAL FINAL v12.0 COMPLETE")
     print(f"📁 DAILY : {OUTPUT_DAILY}")
     print(f"📁 CUMUL : {OUTPUT_CUMUL}")
     print("===================================")
