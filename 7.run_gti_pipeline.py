@@ -1,219 +1,481 @@
 # 7.run_gti_pipeline.py
 # -*- coding: utf-8 -*-
+"""
+GTI law/news split pipeline.
 
+Flow:
+1. Site crawler creates regulation/news site raw files.
+2. Naver, Google, RSS collectors create external news raw files.
+3. Separate merge jobs build regulation and news summaries.
+4. Separate AI analysis jobs build regulation and news analysis files.
+5. A combined mail input is generated and passed to the mail engine.
+"""
+
+from __future__ import annotations
+
+import argparse
 import os
-import sys
-import time
 import shutil
 import subprocess
+import sys
+import time
+from dataclasses import dataclass, field
 from datetime import datetime
+from pathlib import Path
 
-BASE_DIR = r"C:\temp"
+import pandas as pd
 
-PYTHON_EXE = r"C:\Users\KCH\AppData\Local\Programs\Python\Python312\python.exe"
 
-LOG_DIR = os.path.join(BASE_DIR, "logs")
-ARCHIVE_DIR = os.path.join(BASE_DIR, "archive")
-LOG_FILE = os.path.join(LOG_DIR, "gti_pipeline_run.log")
+BASE_DIR = Path(os.getenv("GTI_BASE_DIR", r"C:\Temp"))
+PYTHON_EXE = Path(os.getenv("GTI_PYTHON_EXE", r"C:\Users\KCH\AppData\Local\Programs\Python\Python312\python.exe"))
 
-STEPS = [
-    ("STEP1_SITE_CRAWLER", "1.site_crawler.py", False),
-    ("STEP2_NAVER", "2-1.naver_news_collector.py", False),
-    ("STEP2_GOOGLE", "2-2.google_news_collector.py", False),
-    ("STEP2_RSS", "2-3._rss_news_raw.py", False),
-    ("STEP3_MERGE", "3.merge_news.py", True),
-    ("STEP4_ANALYZE", "4.policy_ai_analyzer.py", True),
-    ("STEP5_MAIL", "5.GTI_Mail_Engine.py", True),
+LOG_DIR = BASE_DIR / "logs"
+ARCHIVE_DIR = BASE_DIR / "archive"
+LOG_FILE = LOG_DIR / "gti_pipeline_run.log"
+
+MAIL_INPUT_FILE = BASE_DIR / "4.gti_mail_input.xlsx"
+MAIL_OUTPUT_DIR = BASE_DIR / "12345" / "c_type_outputs"
+
+
+@dataclass(frozen=True)
+class Step:
+    name: str
+    script: str
+    required: bool = True
+    expected_outputs: tuple[str, ...] = field(default_factory=tuple)
+    args: tuple[str, ...] = field(default_factory=tuple)
+
+
+STAGE_1 = [
+    Step(
+        "STEP1_SITE_CRAWLER",
+        "1.site_crawler.py",
+        required=True,
+        expected_outputs=("1-1.regulation_raw.xlsx", "1-2.site_news_raw.xlsx"),
+    ),
+]
+
+STAGE_2 = [
+    Step("STEP2_NAVER", "2-1.naver_news_collector.py", required=False, expected_outputs=("2-1.naver_news_raw.xlsx",)),
+    Step("STEP2_GOOGLE", "2-2.google_news_collector.py", required=False, expected_outputs=("2-2.google_news_raw.xlsx",)),
+    Step("STEP2_RSS", "2-3._rss_news_raw.py", required=False, expected_outputs=("2-3.rss_news_raw.xlsx",)),
+]
+
+STAGE_3 = [
+    Step(
+        "STEP3_1_REGULATION_MERGE",
+        "3-1.regulation_merge.py",
+        required=True,
+        expected_outputs=("3-1.regulation_summary.xlsx", "3-1.regulation_cumulative.xlsx"),
+    ),
+    Step(
+        "STEP3_2_NEWS_MERGE",
+        "3-2.news_merge.py",
+        required=True,
+        expected_outputs=("3-2.news_summary.xlsx", "3-2.news_cumulative.xlsx"),
+    ),
+]
+
+STAGE_3_1_ARTICLE = [
+    Step(
+        "STEP3_1_ARTICLE_EXTRACTOR",
+        "3-1.article_extractor.py",
+        required=True,
+        expected_outputs=("3-1.regulation_article_summary.xlsx", "3-2.news_article_summary.xlsx"),
+    ),
+]
+
+STAGE_4 = [
+    Step(
+        "STEP4_1_REGULATION_AI",
+        "4-1.regulation_ai_analysis.py",
+        required=True,
+        expected_outputs=("4-1.regulation_ai_summary.xlsx", "4-1.regulation_ai_cumulative.xlsx"),
+    ),
+    Step(
+        "STEP4_2_NEWS_AI",
+        "4-2.news_ai_analysis.py",
+        required=True,
+        expected_outputs=("4-2.news_ai_summary.xlsx", "4-2.news_ai_cumulative.xlsx"),
+    ),
+]
+
+STAGE_5 = [
+    Step(
+        "STEP5_MAIL_ENGINE",
+        "5.GTI_Mail Engine.py",
+        required=True,
+        expected_outputs=(),
+        args=("--input", str(MAIL_INPUT_FILE), "--output-dir", str(MAIL_OUTPUT_DIR)),
+    ),
 ]
 
 ARCHIVE_TARGETS = [
     "1.site_news_raw.xlsx",
-    "1.site_news_reject_debug.xlsx",
+    "1.site_news_audit.xlsx",
+    "1-1.regulation_raw.xlsx",
+    "1-2.site_news_raw.xlsx",
     "2-1.naver_news_raw.xlsx",
     "2-2.google_news_raw.xlsx",
     "2-3.rss_news_raw.xlsx",
-    "3.news_ai_summary.xlsx",
-    "news_raw.xlsx",
-    "news_cumulative.xlsx",
+    "3-1.regulation_summary.xlsx",
+    "3-1.regulation_cumulative.xlsx",
+    "3-2.news_summary.xlsx",
+    "3-2.news_cumulative.xlsx",
+    "3-1.regulation_article_summary.xlsx",
+    "3-2.news_article_summary.xlsx",
+    "4-1.regulation_ai_summary.xlsx",
+    "4-1.regulation_ai_cumulative.xlsx",
+    "4-2.news_ai_summary.xlsx",
+    "4-2.news_ai_cumulative.xlsx",
+    "4-2.news_ai_audit_candidates.xlsx",
+    "4.gti_mail_input.xlsx",
+    "GTI_Radar.xlsx",
     "mail_cumulative.xlsx",
 ]
 
 
-def now():
+def now() -> str:
     return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
 
-def ensure_dirs():
-    os.makedirs(LOG_DIR, exist_ok=True)
-    os.makedirs(ARCHIVE_DIR, exist_ok=True)
+def ensure_dirs() -> None:
+    LOG_DIR.mkdir(parents=True, exist_ok=True)
+    ARCHIVE_DIR.mkdir(parents=True, exist_ok=True)
+    MAIL_OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 
 
-def reset_log():
+def log(message: str = "") -> None:
+    line = f"[{now()}] {message}"
+    print(line)
     try:
-        if os.path.exists(LOG_FILE):
-            os.remove(LOG_FILE)
-    except Exception:
+        with LOG_FILE.open("a", encoding="utf-8") as f:
+            f.write(line + "\n")
+    except PermissionError:
         pass
 
 
-def log(msg=""):
-    line = f"[{now()}] {msg}"
-    print(line, flush=True)
-    with open(LOG_FILE, "a", encoding="utf-8") as f:
-        f.write(line + "\n")
-
-
-def archive_outputs():
-    stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    target_dir = os.path.join(ARCHIVE_DIR, stamp)
-    os.makedirs(target_dir, exist_ok=True)
-
-    copied = 0
-
-    for filename in ARCHIVE_TARGETS:
-        src = os.path.join(BASE_DIR, filename)
-        if os.path.exists(src):
-            try:
-                shutil.copy2(src, os.path.join(target_dir, filename))
-                copied += 1
-                log(f"ARCHIVE OK : {filename}")
-            except Exception as e:
-                log(f"ARCHIVE FAIL : {filename} / {e}")
-
-    # GTI_Radar 산출물은 날짜가 매일 바뀌므로 패턴으로 보관
-    try:
-        for filename in os.listdir(BASE_DIR):
-            if filename.startswith("GTI_Radar_") and filename.endswith((".xlsx", ".html")):
-                src = os.path.join(BASE_DIR, filename)
-                shutil.copy2(src, os.path.join(target_dir, filename))
-                copied += 1
-                log(f"ARCHIVE OK : {filename}")
-    except Exception as e:
-        log(f"ARCHIVE RADAR FAIL : {e}")
-
-    log(f"ARCHIVE COMPLETE : {copied} files")
-
-
-def get_python_exe():
+def get_python_exe() -> str:
     candidates = [
-        PYTHON_EXE,
+        str(PYTHON_EXE),
         sys.executable,
         shutil.which("python"),
         shutil.which("py"),
     ]
-
     for exe in candidates:
-        if exe and os.path.exists(exe):
+        if exe and Path(exe).exists():
             return exe
-
     return sys.executable
 
 
-def write_child_output(label, text):
-    if not text:
-        return
-    log(label)
-    for line in str(text).splitlines():
-        log(line)
+def file_has_rows(path: Path) -> bool:
+    if not path.exists() or path.stat().st_size == 0:
+        return False
+    if path.suffix.lower() not in {".xlsx", ".xls"}:
+        return True
+    try:
+        df = pd.read_excel(path, nrows=2)
+        return len(df) > 0 or len(df.columns) > 0
+    except Exception:
+        return False
 
 
-def run_script(step_name, script_file, required, python_exe):
-    script_path = os.path.join(BASE_DIR, script_file)
+def validate_outputs(step: Step) -> tuple[bool, list[str]]:
+    missing_or_empty: list[str] = []
+    for filename in step.expected_outputs:
+        path = BASE_DIR / filename
+        if not file_has_rows(path):
+            missing_or_empty.append(filename)
+    return not missing_or_empty, missing_or_empty
 
+
+def run_script(step: Step, python_exe: str, dry_run: bool = False) -> str:
+    script_path = BASE_DIR / step.script
     log("=" * 80)
-    log(f"RUN START : {script_file}")
+    log(f"{step.name} START : {step.script}")
     log("=" * 80)
 
-    if not os.path.exists(script_path):
-        log(f"FILE NOT FOUND : {script_file}")
+    if not script_path.exists():
+        log(f"FILE NOT FOUND : {step.script}")
+        return "FAILED" if step.required else "SKIPPED"
 
-        if required:
-            log(f"REQUIRED STEP FAILED : {script_file}")
-            return "FAILED"
-        else:
-            log(f"OPTIONAL STEP SKIPPED : {script_file}")
-            return "SKIPPED"
+    command = [python_exe, str(script_path), *step.args]
+    log("COMMAND : " + " ".join(f'"{x}"' if " " in x else x for x in command))
+
+    if dry_run:
+        log(f"DRY RUN SKIPPED : {step.script}")
+        return "DRY_RUN"
 
     start = time.time()
+    result = subprocess.run(
+        command,
+        cwd=str(BASE_DIR),
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        capture_output=True,
+    )
+    elapsed = round(time.time() - start, 2)
 
-    try:
-        result = subprocess.run(
-            [python_exe, script_path],
-            cwd=BASE_DIR,
-            capture_output=True,
-            text=True,
-            encoding="utf-8",
-            errors="replace",
-        )
+    if result.stdout:
+        log(f"{step.name} STDOUT BEGIN")
+        for line in result.stdout.splitlines():
+            log(f"  {line}")
+        log(f"{step.name} STDOUT END")
+    if result.stderr:
+        log(f"{step.name} STDERR BEGIN")
+        for line in result.stderr.splitlines():
+            log(f"  {line}")
+        log(f"{step.name} STDERR END")
 
-        write_child_output("[STDOUT]", result.stdout)
-        write_child_output("[STDERR]", result.stderr)
-
-        elapsed = round(time.time() - start, 2)
-
-        if result.returncode == 0:
-            log(f"COMPLETE : {script_file} / {elapsed} sec")
-            return "OK"
-        else:
-            log(f"FAILED : {script_file} / RETURN CODE {result.returncode}")
-            return "FAILED"
-
-    except Exception as e:
-        log(f"EXCEPTION : {script_file} / {type(e).__name__}: {e}")
+    if result.returncode != 0:
+        log(f"{step.name} FAILED : return_code={result.returncode} / {elapsed} sec")
         return "FAILED"
 
+    ok, bad_outputs = validate_outputs(step)
+    if not ok:
+        log(f"{step.name} OUTPUT CHECK FAILED : {', '.join(bad_outputs)}")
+        return "FAILED" if step.required else "WARNING"
 
-def print_result(results):
+    log(f"{step.name} COMPLETE : {elapsed} sec")
+    return "OK"
+
+
+def archive_outputs() -> None:
+    stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    target_dir = ARCHIVE_DIR / stamp
+    target_dir.mkdir(parents=True, exist_ok=True)
+
+    copied = 0
+    for filename in ARCHIVE_TARGETS:
+        src = BASE_DIR / filename
+        if src.exists():
+            try:
+                shutil.copy2(src, target_dir / filename)
+                copied += 1
+                log(f"ARCHIVE OK : {filename}")
+            except Exception as exc:
+                log(f"ARCHIVE FAIL : {filename} / {exc}")
+
+    log(f"ARCHIVE COMPLETE : {copied} files -> {target_dir}")
+
+
+def collapse_duplicate_columns(df: pd.DataFrame) -> pd.DataFrame:
+    """Merge duplicate column names created by normalization aliases."""
+    if df.columns.is_unique:
+        return df
+
+    merged: list[pd.Series] = []
+    names = list(dict.fromkeys(df.columns))
+    for name in names:
+        same_name = df.loc[:, df.columns == name]
+        if same_name.shape[1] == 1:
+            series = same_name.iloc[:, 0]
+        else:
+            series = same_name.replace("", pd.NA).bfill(axis=1).iloc[:, 0].fillna("")
+        series.name = name
+        merged.append(series)
+
+    return pd.concat(merged, axis=1)
+
+
+def normalize_mail_columns(df: pd.DataFrame, category: str) -> pd.DataFrame:
+    df = df.copy()
+    df.columns = [str(c).strip() for c in df.columns]
+
+    rename_map = {
+        "Title": "Headline",
+        "title": "Headline",
+        "headline": "Headline",
+        "Link": "URL",
+        "link": "URL",
+        "url": "URL",
+        "Publisher": "Source",
+        "publisher": "Source",
+        "Agency": "agency",
+        "Risk": "risk",
+        "NewsType": "news_type",
+        "AI_Analysis": "AI Analysis",
+        "Action": "Action Plan",
+    }
+    df = df.rename(columns={k: v for k, v in rename_map.items() if k in df.columns})
+    df = collapse_duplicate_columns(df)
+
+    required_cols = ["Date", "CollectedAt", "Headline", "URL", "Source", "agency", "risk", "score", "news_type"]
+    for col in required_cols:
+        if col not in df.columns:
+            df[col] = ""
+
+    if "KeywordMatches" in df.columns and "Keyword" not in df.columns:
+        df["Keyword"] = df["KeywordMatches"]
+    elif "Keyword" not in df.columns:
+        df["Keyword"] = category
+
+    if "Summary" not in df.columns:
+        df["Summary"] = ""
+    if "AI Analysis" not in df.columns:
+        df["AI Analysis"] = ""
+    if "Action Plan" not in df.columns:
+        df["Action Plan"] = ""
+
+    df["pipeline_category"] = category
+    df["Keyword"] = df["Keyword"].fillna("").astype(str)
+    df.loc[df["Keyword"].str.strip() == "", "Keyword"] = category
+
+    return df
+
+
+def build_mail_input() -> bool:
+    inputs = [
+        ("REGULATION", BASE_DIR / "4-1.regulation_ai_summary.xlsx"),
+        ("NEWS", BASE_DIR / "4-2.news_ai_summary.xlsx"),
+    ]
+
+    frames: list[pd.DataFrame] = []
+    for category, path in inputs:
+        if not path.exists():
+            log(f"MAIL INPUT SOURCE MISSING : {path.name}")
+            continue
+        try:
+            df = pd.read_excel(path)
+            df = normalize_mail_columns(df, category)
+            frames.append(df)
+            log(f"MAIL INPUT SOURCE OK : {path.name} / rows={len(df)}")
+        except Exception as exc:
+            log(f"MAIL INPUT SOURCE FAIL : {path.name} / {exc}")
+
+    if not frames:
+        log("MAIL INPUT BUILD FAILED : no source rows")
+        return False
+
+    combined = pd.concat(frames, ignore_index=True)
+    combined = combined.dropna(how="all")
+    combined = combined[
+        (combined["Headline"].fillna("").astype(str).str.strip() != "")
+        & (combined["URL"].fillna("").astype(str).str.strip() != "")
+    ]
+
+    if combined.empty:
+        log("MAIL INPUT BUILD FAILED : combined file has no valid rows")
+        return False
+
+    sort_cols = [c for c in ["pipeline_category", "score", "Date", "CollectedAt"] if c in combined.columns]
+    if sort_cols:
+        ascending = [True if c == "pipeline_category" else False for c in sort_cols]
+        combined = combined.sort_values(sort_cols, ascending=ascending, kind="stable")
+
+    combined.to_excel(MAIL_INPUT_FILE, index=False)
+    log(f"MAIL INPUT CREATED : {MAIL_INPUT_FILE} / rows={len(combined)}")
+    return True
+
+
+def run_stage(
+    stage_name: str,
+    steps: list[Step],
+    python_exe: str,
+    dry_run: bool,
+    keep_going: bool,
+    results: list[tuple[str, str, str]],
+) -> bool:
+    log("")
+    log("#" * 80)
+    log(f"{stage_name} START")
+    log("#" * 80)
+
+    stage_ok = True
+    for step in steps:
+        status = run_script(step, python_exe, dry_run=dry_run)
+        results.append((step.name, step.script, status))
+
+        if step.required and status == "FAILED":
+            stage_ok = False
+            log(f"PIPELINE REQUIRED STEP FAILED : {step.name}")
+            if not keep_going:
+                return False
+
+    return stage_ok
+
+
+def print_result(results: list[tuple[str, str, str]]) -> None:
     log("#" * 80)
     log("GTI PIPELINE RESULT")
     log("#" * 80)
 
-    for script_file, status in results:
-        log(f"{script_file} : {status}")
+    for step_name, script_file, status in results:
+        log(f"{step_name} / {script_file} : {status}")
 
-    ok_count = sum(1 for _, status in results if status == "OK")
-    skip_count = sum(1 for _, status in results if status == "SKIPPED")
-    fail_count = sum(1 for _, status in results if status == "FAILED")
+    counts = {}
+    for _, _, status in results:
+        counts[status] = counts.get(status, 0) + 1
 
     log("-" * 80)
-    log(f"OK      : {ok_count}")
-    log(f"SKIPPED : {skip_count}")
-    log(f"FAILED  : {fail_count}")
+    for key in ["OK", "WARNING", "SKIPPED", "DRY_RUN", "FAILED"]:
+        log(f"{key:<8}: {counts.get(key, 0)}")
     log("#" * 80)
 
 
-def main():
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description="Run GTI law/news split pipeline")
+    parser.add_argument("--no-archive", action="store_true", help="Do not archive previous outputs before running")
+    parser.add_argument("--skip-mail", action="store_true", help="Run steps 1-4 only")
+    parser.add_argument("--keep-going", action="store_true", help="Continue after required step failures")
+    parser.add_argument("--dry-run", action="store_true", help="Print commands without running scripts")
+    return parser.parse_args()
+
+
+def main() -> int:
+    args = parse_args()
     ensure_dirs()
-    reset_log()
 
     log("#" * 80)
-    log("GTI PIPELINE FINAL START")
+    log("GTI LAW/NEWS SPLIT PIPELINE START")
     log("#" * 80)
+    log(f"BASE_DIR : {BASE_DIR}")
 
     python_exe = get_python_exe()
     log(f"PYTHON : {python_exe}")
-    log(f"BASE_DIR : {BASE_DIR}")
 
-    archive_outputs()
+    if not args.no_archive:
+        archive_outputs()
 
-    results = []
+    results: list[tuple[str, str, str]] = []
 
-    for step_name, script_file, required in STEPS:
-        status = run_script(step_name, script_file, required, python_exe)
-        results.append((script_file, status))
+    stages = [
+        ("STAGE 1 - SITE LAW/NEWS CRAWL", STAGE_1),
+        ("STAGE 2 - NEWS COLLECTORS", STAGE_2),
+        ("STAGE 3 - LAW/NEWS MERGE", STAGE_3),
+        ("STAGE 3-1 - ARTICLE EXTRACTION", STAGE_3_1_ARTICLE),
+        ("STAGE 4 - LAW/NEWS AI ANALYSIS", STAGE_4),
+    ]
 
-        if required and status == "FAILED":
-            log(f"PIPELINE STOPPED AT : {script_file}")
+    pipeline_ok = True
+    for stage_name, steps in stages:
+        stage_ok = run_stage(stage_name, steps, python_exe, args.dry_run, args.keep_going, results)
+        pipeline_ok = pipeline_ok and stage_ok
+        if not stage_ok and not args.keep_going:
             break
+
+    if pipeline_ok and not args.skip_mail and not args.dry_run:
+        if build_mail_input():
+            stage_ok = run_stage("STAGE 5 - MAIL", STAGE_5, python_exe, args.dry_run, args.keep_going, results)
+            pipeline_ok = pipeline_ok and stage_ok
+        else:
+            results.append(("BUILD_MAIL_INPUT", str(MAIL_INPUT_FILE), "FAILED"))
+            pipeline_ok = False
+    elif args.skip_mail:
+        log("STAGE 5 SKIPPED BY OPTION")
+    elif args.dry_run:
+        log("MAIL INPUT BUILD SKIPPED BY DRY RUN")
 
     print_result(results)
 
-    if any(status == "FAILED" for _, status in results):
-        log("GTI PIPELINE FINISHED WITH ERROR")
-        sys.exit(1)
-    else:
-        log("GTI PIPELINE FINISHED SUCCESS")
+    if pipeline_ok and not any(status == "FAILED" for _, _, status in results):
+        log("GTI PIPELINE FINISHED")
+        return 0
+
+    log("GTI PIPELINE FINISHED WITH ERROR")
+    return 1
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())
