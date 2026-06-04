@@ -1,527 +1,1037 @@
+# -*- coding: utf-8 -*-
+"""
+GTI STEP3 - Regulation / News Article Body Extract + Representative Clustering
+----------------------------------------------------------------------------
+목적
+1) STEP3에서 법규/뉴스 본문을 확보한다.
+2) 뉴스는 유사·중복 기사 Reuters/Bloomberg/Yahoo/MSN/Google RSS 재배포 등을 Cluster로 묶는다.
+3) Cluster별 대표기사 1건만 3-2.news_article_summary.xlsx에 저장한다.
+4) 전체 클러스터 멤버는 3-2.news_article_cluster_audit.xlsx에 별도 저장한다.
+
+권장 위치: C:/Temp/3-1.regulation_merge.py
+실행: python C:/Temp/3-1.regulation_merge.py
+
+입력 후보
+- Regulation: C:/Temp/3-1.regulation_summary.xlsx 또는 C:/Temp/1-1.regulation_raw.xlsx
+- News:       C:/Temp/3-2.news_summary.xlsx 또는 C:/Temp/3-2.news_merge.xlsx
+              없으면 1-2.site_news_raw.xlsx, 2-1.naver_news_raw.xlsx, 2-2.google_news_raw.xlsx, 2-3.rss_news_raw.xlsx 자동 병합
+
+출력
+- C:/Temp/3-1.regulation_article_summary.xlsx
+- C:/Temp/3-2.news_article_summary.xlsx              # 대표기사만 저장
+- C:/Temp/3-2.news_article_cluster_audit.xlsx        # 클러스터 전체 멤버 감사용
+- C:/Temp/3-2.news_article_before_cluster.xlsx       # 클러스터 전 300건 원본 보존
+"""
+
 import os
 import re
-import pandas as pd
+import json
+import time
+import hashlib
+import warnings
+import traceback
+from openpyxl.cell.cell import ILLEGAL_CHARACTERS_RE
 from datetime import datetime, timedelta
-from difflib import SequenceMatcher
-from sklearn.feature_extraction.text import TfidfVectorizer
-from sklearn.metrics.pairwise import cosine_similarity
+from urllib.parse import urlparse, parse_qs, unquote, urlunparse
 
-BASE_DIR = r"C:\temp"
+import pandas as pd
 
-INPUT_FILES = [
-    "1.site_news_raw.xlsx",
-    "2-1.naver_news_raw.xlsx",
-    "2-2.google_news_raw.xlsx",
-    "2-3.rss_news_raw.xlsx"
+warnings.filterwarnings("ignore")
+
+# -----------------------------------------------------------------------------
+# CONFIG
+# -----------------------------------------------------------------------------
+BASE_DIR = r"C:/Temp"
+
+REG_INPUT_CANDIDATES = [
+    os.path.join(BASE_DIR, "3-1.regulation_summary.xlsx"),
+    os.path.join(BASE_DIR, "1-1.regulation_raw.xlsx"),
+]
+NEWS_INPUT_CANDIDATES = [
+    os.path.join(BASE_DIR, "3-2.news_summary.xlsx"),
+    os.path.join(BASE_DIR, "3-2.news_merge.xlsx"),
+    os.path.join(BASE_DIR, "3-2.news_merged.xlsx"),
+]
+NEWS_RAW_FALLBACKS = [
+    os.path.join(BASE_DIR, "1-2.site_news_raw.xlsx"),
+    os.path.join(BASE_DIR, "2-1.naver_news_raw.xlsx"),
+    os.path.join(BASE_DIR, "2-2.google_news_raw.xlsx"),
+    os.path.join(BASE_DIR, "2-3.rss_news_raw.xlsx"),
 ]
 
-KEYWORD_CANDIDATES = [
-    "keyword_master_trade_policy_150.xlsx",
-    "KEYWORD.xlsx",
-    "keyword.xlsx"
+REG_OUT = os.path.join(BASE_DIR, "3-1.regulation_article_summary.xlsx")
+NEWS_OUT = os.path.join(BASE_DIR, "3-2.news_article_summary.xlsx")
+NEWS_BEFORE_CLUSTER_OUT = os.path.join(BASE_DIR, "3-2.news_article_before_cluster.xlsx")
+NEWS_CLUSTER_AUDIT_OUT = os.path.join(BASE_DIR, "3-2.news_article_cluster_audit.xlsx")
+
+# 뉴스 본문추출/클러스터링 대상 최대치. STEP3 전단에서 이미 300건이면 그대로 사용.
+NEWS_MAX_ROWS = 300
+
+# 대표 클러스터링 후 목표 상한. 원하면 180으로 고정, None이면 전체 대표기사 저장.
+NEWS_REPRESENTATIVE_TARGET_MAX = 180
+
+# 본문 추출 타임아웃
+HTTP_TIMEOUT = 12
+SLEEP_SEC = 0.15
+USER_AGENT = (
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+    "AppleWebKit/537.36 (KHTML, like Gecko) "
+    "Chrome/124.0 Safari/537.36"
+)
+
+# 대표기사 선정 시 우대 매체
+SOURCE_PRIORITY = {
+    "reuters": 100,
+    "bloomberg": 96,
+    "financial times": 94,
+    "ft.com": 94,
+    "associated press": 92,
+    "ap news": 92,
+    "wall street journal": 91,
+    "wsj": 91,
+    "nikkei": 90,
+    "politico": 88,
+    "cnbc": 84,
+    "yahoo": 60,
+    "msn": 58,
+    "google": 45,
+    "naver": 45,
+}
+
+# 클러스터링에서 의미 없는 단어 제거
+STOPWORDS = set("""
+ the a an and or of to in on for from by with at as is are was were be been being into over under after before amid against about this that these those it its their his her you your our will would could should may might can says said report reports update latest news breaking live why how what when where who korea korean china chinese us usa u.s united states eu europe european uk britain japan india vietnam mexico tariff tariffs trade customs duty duties import imports export exports regulation regulations government ministry agency samsung electronics global market markets economy economic business company companies new more first last june july august september october november december monday tuesday wednesday thursday friday saturday sunday
+ 관세 무역 통상 수입 수출 규제 법령 고시 공고 발표 보도자료 뉴스 관련 대상 적용 변경 개정 시행 정부 산업부 기재부 관세청 한국 중국 미국 일본 유럽 인도 베트남 멕시코 삼성전자 글로벌 주요 속보 최신
+""".split())
+
+ISSUE_KEYWORDS = [
+    "entity list", "bis", "export control", "semiconductor", "chip", "tariff", "section 301", "section 232",
+    "anti-dumping", "countervailing", "fta", "rules of origin", "origin", "hs code", "classification",
+    "cbam", "uflpa", "forced labor", "sanction", "customs", "duty", "de minimis", "ev", "battery",
+    "steel", "aluminum", "rare earth", "critical minerals", "china", "morocco", "eu", "us", "korea",
 ]
 
-RAW_FILE = os.path.join(BASE_DIR, "news_master_raw.xlsx")
-SUMMARY_FILE = os.path.join(BASE_DIR, "3.news_ai_summary.xlsx")
-CUMULATIVE_FILE = os.path.join(BASE_DIR, "news_ai_cumulative.xlsx")
+# -----------------------------------------------------------------------------
+# UTIL
+# -----------------------------------------------------------------------------
+def now_str():
+    return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
-MAX_OUTPUT = 200
-RECENT_HOURS = 24
 
-TITLE_SIM_THRESHOLD = 0.86
-COSINE_SIM_THRESHOLD = 0.78
-CUMULATIVE_SIM_THRESHOLD = 0.92
+def log(msg):
+    print(f"[{now_str()}] {msg}", flush=True)
 
 
-def load_data():
-    dfs = []
+def ensure_dir(path):
+    os.makedirs(os.path.dirname(path), exist_ok=True)
 
-    for file_name in INPUT_FILES:
-        path = os.path.join(BASE_DIR, file_name)
 
-        if os.path.exists(path):
-            df = pd.read_excel(path)
-            df["source_file"] = file_name
-            dfs.append(df)
-            print(f"load: {file_name} / rows={len(df)}")
+def first_existing(paths):
+    for p in paths:
+        if os.path.exists(p):
+            return p
+    return None
 
-    if not dfs:
-        raise Exception("No input files found")
 
-    return pd.concat(dfs, ignore_index=True)
-
-
-def load_keywords():
-    keywords = []
-
-    for file_name in KEYWORD_CANDIDATES:
-        path = os.path.join(BASE_DIR, file_name)
-
-        if not os.path.exists(path):
-            continue
-
-        df = pd.read_excel(path)
-        df.columns = [str(c).strip().lower() for c in df.columns]
-
-        for col in df.columns:
-            if "keyword" in col:
-                keywords = (
-                    df[col]
-                    .dropna()
-                    .astype(str)
-                    .str.strip()
-                    .str.lower()
-                    .tolist()
-                )
-                print(f"keyword file loaded: {file_name} / keywords={len(keywords)}")
-                break
-
-        if keywords:
-            break
-
-    base_keywords = [
-        "tariff", "customs", "duty", "anti-dumping", "countervailing",
-        "sanction", "restriction", "export control", "import restriction",
-        "fta", "wto", "hs code", "de minimis", "origin", "rules of origin",
-        "관세", "통관", "반덤핑", "상계관세", "수입규제", "수출통제",
-        "무역협정", "관세율", "보복관세", "비관세", "원산지", "세관",
-        "hs코드", "품목분류", "품목번호", "기업무역활동", "수출입 현황",
-        "관세청", "국제관세협력", "심사", "조사", "분류원"
-    ]
-
-    return list(set(keywords + base_keywords))
-
-
-def standardize(df):
-    df.columns = [str(c).strip().lower() for c in df.columns]
-    df = df.loc[:, ~df.columns.duplicated()]
-
-    for col in ["date", "title", "url", "source", "collected_at", "source_file"]:
-        if col not in df.columns:
-            df[col] = ""
-
-    df["title"] = df["title"].astype(str).str.strip()
-    df["url"] = df["url"].astype(str).str.strip()
-    df["source"] = df["source"].astype(str).str.strip()
-    df["source_file"] = df["source_file"].astype(str).str.strip()
-
-    df["date"] = pd.to_datetime(df["date"], errors="coerce", utc=True)
-    df["date"] = df["date"].dt.tz_convert(None)
-
-    df = df[df["title"].astype(str).str.len() > 5]
-
-    return df.reset_index(drop=True)
-
-
-def filter_recent(df):
-    cutoff = datetime.now() - timedelta(hours=RECENT_HOURS)
-    return df[df["date"] >= cutoff].reset_index(drop=True)
-
-
-def normalize_title(title):
-    t = str(title).lower()
-
-    t = re.sub(r"&quot;|&#39;|&amp;", " ", t)
-
-    for sep in [" - ", " | ", " : ", " — ", " – "]:
-        if sep in t:
-            t = t.split(sep)[0]
-
-    t = re.sub(r"[^a-z0-9가-힣一-龥ぁ-ゔァ-ヴー\s]", " ", t)
-    t = re.sub(r"\s+", " ", t).strip()
-
-    remove_words = [
-        "the", "a", "an", "new", "latest", "update", "updates",
-        "said", "says", "may", "could", "would", "will",
-        "breaking", "exclusive", "report"
-    ]
-
-    tokens = [w for w in t.split() if w not in remove_words]
-    return " ".join(tokens).strip()
-
-
-def is_must_keep(title, source=""):
-    t = str(title).lower()
-    s = str(source).lower()
-
-    must_keep_keywords = [
-        "관세청", "customs", "korea customs",
-        "[국제관세협력]", "[통관]", "[심사]", "[조사]",
-        "[정보데이터]", "[분류원]", "[품목분류]",
-        "품목분류", "품목번호", "관세율", "수출입 현황",
-        "기업무역활동", "통계 공표", "수출입기업",
-        "대미 수출", "철강제품", "품목관세",
-        "지식재산권", "위해물품", "국제관세협력",
-        "수입 운임 특례", "관세행정", "한-미 품목번호"
-    ]
-
-    return any(k.lower() in t or k.lower() in s for k in must_keep_keywords)
-
-
-def remove_real_noise(df):
-    noise_keywords = [
-        "youtube", "facebook", "instagram", "tiktok", "reddit",
-        "threads", "shorts", "reels",
-
-        "stock", "stocks", "share price", "shares", "nasdaq", "nyse",
-        "brokerage", "brokerages", "consensus recommendation",
-        "eps", "dividend", "earnings call", "marketbeat", "simplywall",
-        "zacks", "analyst rating", "price target",
-        "주가", "증권", "투자", "실적", "배당", "목표주가", "매수", "매도",
-
-        "baseball", "softball", "lacrosse", "basketball", "football",
-        "tournament", "playoffs", "roundup", "high school",
-        "hs baseball", "hs softball", "hs roundup",
-        "야구", "축구", "농구", "대회", "토너먼트",
-
-        "celebrity", "movie", "music", "entertainment", "fashion",
-        "shopping", "review", "coupon", "sale", "deal",
-        "연예", "방송", "영화", "음악", "패션", "쇼핑", "광고",
-        "홍보", "이벤트", "맛집",
-
-        "strike", "union", "wage", "inheritance", "restructuring",
-        "hiring", "election", "opinion", "editorial", "column",
-        "파업", "노조", "임금", "상속", "구조조정", "채용",
-        "노동", "선거", "정치", "칼럼", "사설",
-
-        "peace pole", "donate", "donation", "festival",
-        "행사", "축제", "기부",
-
-        "히트곡", "가수", "배우", "드라마", "예능", "별별tv",
-        "day and night", "데이앤나잇"
-    ]
-
-    keep_rows = []
-
-    for idx, row in df.iterrows():
-        title = str(row.get("title", ""))
-        source = str(row.get("source", ""))
-
-        if is_must_keep(title, source):
-            keep_rows.append(idx)
-            continue
-
-        t = title.lower()
-
-        if any(k in t for k in noise_keywords):
-            continue
-
-        keep_rows.append(idx)
-
-    return df.loc[keep_rows].reset_index(drop=True)
-
-
-def policy_filter(df, keywords):
-    keep_rows = []
-
-    for idx, row in df.iterrows():
-        title = str(row.get("title", "")).lower()
-        source = str(row.get("source", "")).lower()
-        text = f"{title} {source}"
-
-        if is_must_keep(title, source):
-            keep_rows.append(idx)
-            continue
-
-        if any(k in text for k in keywords):
-            keep_rows.append(idx)
-
-    return df.loc[keep_rows].reset_index(drop=True)
-
-
-def dedup_exact(df):
-    df["title_norm"] = df["title"].apply(normalize_title)
-
-    before = len(df)
-    df = df.drop_duplicates(subset=["url"], keep="first")
-    print("URL dedup 제거:", before - len(df))
-
-    before = len(df)
-    df = df.drop_duplicates(subset=["title_norm"], keep="first")
-    print("Title exact dedup 제거:", before - len(df))
-
-    return df.reset_index(drop=True)
-
-
-def is_similar(a, b, threshold=TITLE_SIM_THRESHOLD):
-    a = str(a)
-    b = str(b)
-
-    if len(a) < 8 or len(b) < 8:
-        return False
-
-    return SequenceMatcher(None, a, b).ratio() >= threshold
-
-
-def dedup_sentence_similarity(df):
-    seen_titles = []
-    keep_rows = []
-
-    for idx, row in df.iterrows():
-        title_norm = str(row.get("title_norm", ""))
-
-        duplicate = False
-
-        for seen in seen_titles[-500:]:
-            if is_similar(title_norm, seen):
-                duplicate = True
-                break
-
-            if len(title_norm) >= 24 and title_norm[:24] == seen[:24]:
-                duplicate = True
-                break
-
-        if not duplicate:
-            seen_titles.append(title_norm)
-            keep_rows.append(idx)
-
-    print("Sentence similar dedup 제거:", len(df) - len(keep_rows))
-
-    return df.loc[keep_rows].reset_index(drop=True)
-
-
-def dedup_cosine(df):
-    if len(df) < 2:
-        return df
-
-    titles = df["title_norm"].fillna("").astype(str).tolist()
-
+def read_excel_safe(path):
+    if not path or not os.path.exists(path):
+        return pd.DataFrame()
     try:
-        vectorizer = TfidfVectorizer(analyzer="char_wb", ngram_range=(3, 5))
-        tfidf = vectorizer.fit_transform(titles)
-        sim_matrix = cosine_similarity(tfidf)
+        return pd.read_excel(path)
     except Exception as e:
-        print(f"Cosine dedup skip: {e}")
-        return df
-
-    keep = []
-    removed = set()
-
-    for i in range(len(titles)):
-        if i in removed:
-            continue
-
-        keep.append(i)
-
-        for j in range(i + 1, len(titles)):
-            if j in removed:
-                continue
-
-            if sim_matrix[i, j] >= COSINE_SIM_THRESHOLD:
-                removed.add(j)
-
-    print("Cosine dedup 제거:", len(df) - len(keep))
-
-    return df.iloc[keep].reset_index(drop=True)
+        log(f"WARN read failed: {path} / {e}")
+        return pd.DataFrame()
 
 
-def remove_cumulative(df):
-    if not os.path.exists(CUMULATIVE_FILE):
-        print("cumulative 없음 → skip")
-        return df
+def clean_excel_cell(value, max_len=32000):
+    """Excel/openpyxl 저장 불가 제어문자 제거 + 셀 최대 길이 보호."""
+    if value is None:
+        return ""
+    try:
+        if pd.isna(value):
+            return ""
+    except Exception:
+        pass
+    if not isinstance(value, str):
+        return value
 
-    old = pd.read_excel(CUMULATIVE_FILE)
-    old = standardize(old)
+    value = ILLEGAL_CHARACTERS_RE.sub("", value)
+    value = re.sub(r"[\x00-\x08\x0B\x0C\x0E-\x1F]", "", value)
+    value = value.replace("\ufeff", "").replace("\u200b", "")
+    # Excel 셀 최대 32,767자. 여유를 두고 32,000자로 제한.
+    if max_len and len(value) > max_len:
+        value = value[:max_len] + " ...[TRUNCATED_FOR_EXCEL]"
+    return value
 
-    if len(old) == 0:
-        print("cumulative empty → skip")
-        return df
 
-    old["title_norm"] = old["title"].apply(normalize_title)
+def sanitize_dataframe_for_excel(df):
+    """DataFrame 전체를 Excel 안전 문자열로 변환한다."""
+    if df is None:
+        return pd.DataFrame()
+    out = df.copy()
+    for col in out.columns:
+        if out[col].dtype == "object":
+            out[col] = out[col].map(clean_excel_cell)
+    # 컬럼명에도 불법문자 방어
+    out.columns = [str(clean_excel_cell(c, max_len=200)) for c in out.columns]
+    return out
 
-    before = len(df)
 
-    old_urls = set(old["url"].dropna().astype(str))
-    old_titles = old["title_norm"].dropna().astype(str).tolist()
+def save_excel(df, path):
+    ensure_dir(path)
+    safe_df = sanitize_dataframe_for_excel(df)
+    with pd.ExcelWriter(path, engine="openpyxl") as writer:
+        safe_df.to_excel(writer, index=False, sheet_name="data")
+    log(f"[SAVE] {path}")
 
-    keep_rows = []
 
-    for idx, row in df.iterrows():
-        url = str(row.get("url", ""))
-        title_norm = str(row.get("title_norm", ""))
+def s(x):
+    if pd.isna(x):
+        return ""
+    return str(x).strip()
 
-        if url and url in old_urls:
-            continue
 
-        duplicate = False
-        for old_title in old_titles[-3000:]:
-            if is_similar(title_norm, old_title, CUMULATIVE_SIM_THRESHOLD):
-                duplicate = True
-                break
+def pick_col(df, names):
+    low = {str(c).lower(): c for c in df.columns}
+    for n in names:
+        if n in df.columns:
+            return n
+        if n.lower() in low:
+            return low[n.lower()]
+    return None
 
-        if not duplicate:
-            keep_rows.append(idx)
 
-    df = df.loc[keep_rows].reset_index(drop=True)
-
-    print("cumulative 제거:", before - len(df))
-
+def ensure_columns(df, defaults):
+    for c, v in defaults.items():
+        if c not in df.columns:
+            df[c] = v
     return df
 
 
-def update_cumulative(df):
-    save_df = df.copy()
+def normalize_url(url):
+    url = s(url)
+    if not url:
+        return ""
+    url = url.replace("&amp;", "&")
+    # Google alert/rss redirect 처리
+    try:
+        parsed = urlparse(url)
+        qs = parse_qs(parsed.query)
+        for key in ["url", "q", "u"]:
+            if key in qs and qs[key]:
+                cand = unquote(qs[key][0])
+                if cand.startswith("http") and "google." not in urlparse(cand).netloc:
+                    url = cand
+                    parsed = urlparse(url)
+                    break
+        # tracking query 제거
+        drop_keys = {"utm_source", "utm_medium", "utm_campaign", "utm_term", "utm_content", "fbclid", "gclid"}
+        qs2 = parse_qs(parsed.query)
+        kept = []
+        for k, vals in qs2.items():
+            if k.lower() in drop_keys:
+                continue
+            for v in vals:
+                kept.append((k, v))
+        query = "&".join([f"{k}={v}" for k, v in kept])
+        netloc = parsed.netloc.lower().replace("www.", "")
+        path = re.sub(r"/+$", "", parsed.path)
+        return urlunparse((parsed.scheme or "https", netloc, path, "", query, ""))
+    except Exception:
+        return url
 
-    if os.path.exists(CUMULATIVE_FILE):
-        old = pd.read_excel(CUMULATIVE_FILE)
-        save_df = pd.concat([old, save_df], ignore_index=True)
 
-    save_df.columns = [str(c).strip().lower() for c in save_df.columns]
-
-    if "url" in save_df.columns:
-        save_df = save_df.drop_duplicates(subset=["url"], keep="first")
-
-    save_df.to_excel(CUMULATIVE_FILE, index=False)
+def domain_of(url):
+    try:
+        return urlparse(normalize_url(url)).netloc.lower().replace("www.", "")
+    except Exception:
+        return ""
 
 
-def samsung_policy_score(title):
-    t = str(title).lower()
-    score = 0
+def clean_text(text, max_len=None):
+    text = s(text)
+    text = re.sub(r"\s+", " ", text)
+    text = re.sub(r"[\u200b\ufeff]", "", text)
+    if max_len and len(text) > max_len:
+        text = text[:max_len]
+    return text.strip()
 
-    policy_pairs = [
-        ("수입", "관세"), ("수입", "통관"), ("수입", "규제"),
-        ("수입", "fta"), ("수입", "세관"), ("수입", "품목"),
-        ("수출", "관세"), ("수출", "통관"), ("수출", "규제"),
-        ("수출", "fta"), ("수출", "세관"), ("수출", "품목"),
-        ("무역", "관세"), ("무역", "규제"), ("무역", "협정"),
-        ("통상", "관세"), ("통상", "협상"), ("통상", "규제"),
-        ("tariff", "auto"), ("tariff", "customs"),
-        ("tariff", "court"), ("tariff", "eu"), ("tariff", "china"),
-        ("customs", "import"), ("customs", "export"),
-        ("trade", "restriction"), ("trade", "agreement"),
-        ("anti-dumping", "china"), ("fta", "export")
+
+def normalize_title(title):
+    t = s(title).lower()
+    t = re.sub(r"\|.*$", " ", t)
+    t = re.sub(r" - (reuters|bloomberg|yahoo finance|msn|cnbc|ap news|financial times|ft\.com).*$", " ", t)
+    t = re.sub(r"\[(.*?)\]", " ", t)
+    t = re.sub(r"\((reuters|bloomberg|ap|afp|yonhap|연합뉴스).*?\)", " ", t)
+    t = re.sub(r"[^0-9a-z가-힣%]+", " ", t)
+    t = re.sub(r"\s+", " ", t).strip()
+    return t
+
+
+def title_tokens(title):
+    t = normalize_title(title)
+    toks = [x for x in t.split() if len(x) >= 2 and x not in STOPWORDS]
+    return toks
+
+
+def jaccard(a, b):
+    a, b = set(a), set(b)
+    if not a or not b:
+        return 0.0
+    return len(a & b) / max(1, len(a | b))
+
+
+def md5_short(text, n=12):
+    return hashlib.md5(s(text).encode("utf-8", errors="ignore")).hexdigest()[:n]
+
+
+def date_yyyymmdd(x):
+    txt = s(x)
+    if not txt:
+        return "00000000"
+    try:
+        dt = pd.to_datetime(txt, errors="coerce")
+        if pd.notna(dt):
+            return dt.strftime("%Y%m%d")
+    except Exception:
+        pass
+    m = re.search(r"(20\d{2})[-./]?(\d{1,2})[-./]?(\d{1,2})", txt)
+    if m:
+        return f"{m.group(1)}{int(m.group(2)):02d}{int(m.group(3)):02d}"
+    return "00000000"
+
+
+def to_num(x, default=0):
+    try:
+        if pd.isna(x):
+            return default
+        return float(x)
+    except Exception:
+        return default
+
+# -----------------------------------------------------------------------------
+# ARTICLE EXTRACTION
+# -----------------------------------------------------------------------------
+def requests_get_text(url):
+    try:
+        import requests
+        headers = {"User-Agent": USER_AGENT, "Accept-Language": "ko,en-US;q=0.9,en;q=0.8"}
+        r = requests.get(url, headers=headers, timeout=HTTP_TIMEOUT, allow_redirects=True)
+        if r.status_code >= 400:
+            return "", f"HTTP_{r.status_code}", url
+        ct = r.headers.get("content-type", "").lower()
+        if "pdf" in ct or normalize_url(r.url).lower().endswith(".pdf"):
+            return "", "PDF_NOT_PARSED", r.url
+        html = r.text or ""
+        if len(html) < 200:
+            return "", "HTML_TOO_SHORT", r.url
+        return extract_text_from_html(html), "FETCHED_HTML", r.url
+    except Exception as e:
+        return "", f"FETCH_ERROR:{type(e).__name__}", url
+
+
+def extract_text_from_html(html):
+    try:
+        from bs4 import BeautifulSoup
+        soup = BeautifulSoup(html, "html.parser")
+        for tag in soup(["script", "style", "noscript", "header", "footer", "nav", "form", "aside"]):
+            tag.decompose()
+        candidates = []
+        for sel in ["article", "main", "div.article", "div.article-body", "div.story-body", "div.entry-content", "section"]:
+            for node in soup.select(sel):
+                txt = clean_text(node.get_text(" "))
+                if len(txt) > 300:
+                    candidates.append(txt)
+        if candidates:
+            candidates.sort(key=len, reverse=True)
+            return clean_text(candidates[0], 12000)
+        body = clean_text(soup.get_text(" "), 12000)
+        # 반복 메뉴성 문구 제거 후에도 짧으면 실패 처리에서 걸림
+        return body
+    except Exception:
+        text = re.sub(r"<script.*?</script>", " ", html, flags=re.I | re.S)
+        text = re.sub(r"<style.*?</style>", " ", text, flags=re.I | re.S)
+        text = re.sub(r"<[^>]+>", " ", text)
+        return clean_text(text, 12000)
+
+
+def is_bad_body(text):
+    txt = clean_text(text)
+    if len(txt) < 180:
+        return True, "TOO_SHORT"
+    low = txt.lower()
+    bad_markers = [
+        "enable javascript", "access denied", "robot check", "captcha", "cookies are disabled",
+        "페이지를 찾을 수", "서비스 이용에 불편", "검색 결과", "메뉴", "로그인",
     ]
+    if any(m in low for m in bad_markers):
+        return True, "BLOCK_OR_MENU_PAGE"
+    # 단어 다양성이 낮으면 메뉴 페이지 가능성
+    words = re.findall(r"[A-Za-z가-힣0-9]+", low)
+    if len(set(words)) < 40 and len(txt) < 600:
+        return True, "LOW_SIGNAL"
+    return False, "OK"
 
-    for a, b in policy_pairs:
-        if a in t and b in t:
-            score += 5
 
-    strong_policy = [
-        "반덤핑", "상계관세", "수입규제", "수출통제",
-        "export control", "customs duty", "tariff hike",
-        "관세율", "품목분류", "품목번호", "원산지",
-        "de minimis", "section 232", "section 301",
-        "무역법", "관세청", "관세행정", "통관",
-        "international customs", "korea customs"
-    ]
+def extract_article_for_row(row, is_regulation=False):
+    url = normalize_url(row.get("URL", "") or row.get("original_url", ""))
+    original_url = url
+    existing = clean_text(row.get("article_body", ""))
+    if existing:
+        bad, status = is_bad_body(existing)
+        if not bad:
+            return existing, "EXISTING_BODY_OK", "OFFICIAL" if is_regulation else "MEDIA", "Y", "OK", "EXISTING", len(existing), original_url
 
-    for k in strong_policy:
-        if k.lower() in t:
-            score += 5
+    # 입력 요약이 있는 경우 fallback 후보
+    fallback_parts = []
+    for c in ["Summary", "Description", "Snippet", "Content", "Headline", "Title"]:
+        if c in row and s(row.get(c)):
+            fallback_parts.append(s(row.get(c)))
+    fallback = clean_text(" ".join(fallback_parts), 3000)
 
-    samsung_products = [
-        "mobile", "smartphone", "phone",
-        "consumer electronics", "tv", "appliance",
-        "network", "telecom",
-        "medical", "healthcare",
-        "semiconductor", "chip", "memory",
-        "battery", "display",
-        "반도체", "스마트폰", "모바일", "가전", "네트워크",
-        "의료기기", "배터리", "디스플레이"
-    ]
+    body = ""
+    status = "EMPTY_URL"
+    final_url = original_url
+    if url.startswith("http"):
+        body, status, final_url = requests_get_text(url)
+        time.sleep(SLEEP_SEC)
 
-    for k in samsung_products:
-        if k.lower() in t:
-            score += 3
+    body = clean_text(body, 12000)
+    bad, q = is_bad_body(body)
+    if not bad:
+        return body, status, "OFFICIAL" if is_regulation else "MEDIA", "Y", "OK", "FETCHED_HTML", len(body), final_url
 
-    production_sites = [
-        "korea", "china", "vietnam", "india", "indonesia",
-        "turkey", "slovakia", "poland", "mexico", "brazil",
-        "한국", "중국", "베트남", "인도", "인도네시아",
-        "튀르키예", "터키", "슬로바키아", "폴란드", "멕시코", "브라질"
-    ]
+    if len(fallback) >= 40:
+        return fallback, "INPUT_FALLBACK", "OFFICIAL" if is_regulation else "MEDIA", "Y", "FALLBACK_OK", "INPUT_FALLBACK", len(fallback), final_url
 
-    for k in production_sites:
-        if k.lower() in t:
-            score += 2
+    return "", f"{status}:{q}", "OFFICIAL" if is_regulation else "MEDIA", "N", q if q else "EMPTY", "EMPTY", 0, final_url
 
-    if is_must_keep(t):
-        score += 5
 
+def add_hints(df):
+    def hint_effective(text):
+        t = s(text)
+        hits = []
+        patterns = [
+            r"시행\s*20\d{2}[.\-년\s]\s*\d{1,2}[.\-월\s]\s*\d{1,2}",
+            r"20\d{2}[.\-/년\s]\s*\d{1,2}[.\-/월\s]\s*\d{1,2}\s*(?:부터|까지|시행|effective|takes effect)",
+            r"effective\s+(?:on\s+)?[A-Z][a-z]+\s+\d{1,2},\s*20\d{2}",
+        ]
+        for p in patterns:
+            hits += re.findall(p, t, flags=re.I)
+        return "; ".join(dict.fromkeys([clean_text(x) for x in hits[:6]]))
+
+    def hint_hs(text):
+        t = s(text)
+        hits = re.findall(r"\b(?:HS|HTS|HTSUS|품목번호|세번)\s*[:#]?\s*([0-9]{4}(?:\.[0-9]{2,6})?)", t, flags=re.I)
+        hits += re.findall(r"\b([0-9]{4}\.[0-9]{2,6})\b", t)
+        return "; ".join(dict.fromkeys(hits[:10]))
+
+    def hint_rate(text):
+        t = s(text)
+        hits = re.findall(r"(?:관세율|세율|tariff|duty|rate)[^.;\n]{0,40}?\b([0-9]{1,3}(?:\.[0-9]+)?\s*%)", t, flags=re.I)
+        hits += re.findall(r"\b([0-9]{1,3}(?:\.[0-9]+)?\s*%)\s*(?:tariff|duty|관세|세율)", t, flags=re.I)
+        return "; ".join(dict.fromkeys([clean_text(x) for x in hits[:10]]))
+
+    def hint_change(text):
+        t = clean_text(text, 2000)
+        # 본문 초반 및 change 문장 일부만 보존
+        sent = re.split(r"(?<=[.!?。])\s+", t)
+        keys = ["tariff", "duty", "customs", "export control", "FTA", "origin", "HS", "관세", "세율", "수입", "수출", "시행", "개정", "할당관세"]
+        picked = [x for x in sent if any(k.lower() in x.lower() for k in keys)]
+        return clean_text("; ".join(picked[:3]), 1200)
+
+    for c in ["effective_date_hint", "change_detail_hint", "hs_hint", "tariff_rate_hint"]:
+        if c not in df.columns:
+            df[c] = ""
+    bodies = df.get("article_body", pd.Series([""] * len(df)))
+    df["effective_date_hint"] = [hint_effective(x) for x in bodies]
+    df["change_detail_hint"] = [hint_change(x) for x in bodies]
+    df["hs_hint"] = [hint_hs(x) for x in bodies]
+    df["tariff_rate_hint"] = [hint_rate(x) for x in bodies]
+    return df
+
+# -----------------------------------------------------------------------------
+# INPUT LOAD
+# -----------------------------------------------------------------------------
+def load_regulation_input():
+    p = first_existing(REG_INPUT_CANDIDATES)
+    if not p:
+        log("[REGULATION] input not found")
+        return pd.DataFrame()
+    df = read_excel_safe(p)
+    log(f"[REGULATION] input={p} rows={len(df)}")
+    return df
+
+
+def load_news_input():
+    p = first_existing(NEWS_INPUT_CANDIDATES)
+    if p:
+        df = read_excel_safe(p)
+        log(f"[NEWS] input={p} rows={len(df)}")
+    else:
+        frames = []
+        for fp in NEWS_RAW_FALLBACKS:
+            d = read_excel_safe(fp)
+            if len(d):
+                d["SourceFile"] = os.path.basename(fp)
+                frames.append(d)
+                log(f"[NEWS] fallback load {os.path.basename(fp)} rows={len(d)}")
+        df = pd.concat(frames, ignore_index=True) if frames else pd.DataFrame()
+        log(f"[NEWS] fallback total rows={len(df)}")
+
+    if df.empty:
+        return df
+
+    # Headline/URL 표준화
+    hcol = pick_col(df, ["Headline", "Title", "title", "제목"])
+    ucol = pick_col(df, ["URL", "Link", "link", "url", "링크"])
+    if hcol and hcol != "Headline":
+        df["Headline"] = df[hcol]
+    if ucol and ucol != "URL":
+        df["URL"] = df[ucol]
+    df = ensure_columns(df, {"Headline": "", "URL": ""})
+
+    # 점수 컬럼이 없으면 기본값
+    for c in ["FinalScore", "Score", "TopicScore", "RiskScore", "SamsungImpactScore"]:
+        if c not in df.columns:
+            df[c] = 0
+
+    # URL 기준 1차 중복 제거
+    df["_norm_url"] = df["URL"].map(normalize_url)
+    df["_title_norm"] = df["Headline"].map(normalize_title)
+    df = df.sort_values(by=["FinalScore", "Score"], ascending=False, na_position="last")
+    df = df.drop_duplicates(subset=["_norm_url"], keep="first")
+    df = df.drop_duplicates(subset=["_title_norm"], keep="first")
+
+    # 상위 NEWS_MAX_ROWS만 본문 추출. 이미 STEP3 전단에서 300건 선별된 구조 유지.
+    if len(df) > NEWS_MAX_ROWS:
+        df = df.head(NEWS_MAX_ROWS).copy()
+    else:
+        df = df.copy()
+    df.drop(columns=[c for c in ["_norm_url", "_title_norm"] if c in df.columns], inplace=True, errors="ignore")
+    log(f"[NEWS] target rows={len(df)}")
+    return df
+
+# -----------------------------------------------------------------------------
+# BODY EXTRACTION PIPELINE
+# -----------------------------------------------------------------------------
+def process_articles(df, is_regulation=False):
+    if df.empty:
+        return df
+    defaults = {
+        "original_url": "",
+        "article_body": "",
+        "article_extract_status": "",
+        "article_source_type": "OFFICIAL" if is_regulation else "MEDIA",
+        "article_body_ok": "N",
+        "article_quality_status": "",
+        "article_body_source": "",
+        "article_body_chars": 0,
+        "article_last_checked": "",
+    }
+    df = ensure_columns(df, defaults)
+    rows = []
+    total = len(df)
+    for idx, row in df.iterrows():
+        body, status, source_type, ok, qstat, bsource, chars, final_url = extract_article_for_row(row, is_regulation=is_regulation)
+        r = row.to_dict()
+        r["original_url"] = final_url or s(row.get("URL", ""))
+        r["article_body"] = body
+        r["article_extract_status"] = status
+        r["article_source_type"] = source_type
+        r["article_body_ok"] = ok
+        r["article_quality_status"] = qstat
+        r["article_body_source"] = bsource
+        r["article_body_chars"] = chars
+        r["article_last_checked"] = now_str()
+        rows.append(r)
+        if not is_regulation and len(rows) % 25 == 0:
+            log(f"[NEWS] extracted={len(rows)}/{total}")
+    out = pd.DataFrame(rows)
+    out = add_hints(out)
+    return out
+
+# -----------------------------------------------------------------------------
+# REPRESENTATIVE CLUSTERING
+# -----------------------------------------------------------------------------
+def source_priority(row):
+    text = " ".join([s(row.get("Agency", "")), s(row.get("Source", "")), s(row.get("Publisher", "")), domain_of(row.get("URL", ""))]).lower()
+    best = 0
+    for k, v in SOURCE_PRIORITY.items():
+        if k in text:
+            best = max(best, v)
+    return best
+
+
+def issue_signature(row):
+    title = s(row.get("Headline", ""))
+    body = s(row.get("article_body", ""))[:2000]
+    country = s(row.get("Country", ""))
+    issue = s(row.get("IssueKey", "")) or s(row.get("Category", ""))
+    text = (title + " " + body).lower()
+
+    matched = []
+    for kw in ISSUE_KEYWORDS:
+        if kw.lower() in text:
+            matched.append(kw.replace(" ", "_"))
+    if not matched:
+        toks = title_tokens(title)
+        # 숫자/고유명사성 토큰 우선
+        scored = []
+        for tok in toks:
+            if tok in STOPWORDS:
+                continue
+            weight = 1
+            if re.search(r"\d", tok):
+                weight += 2
+            if len(tok) >= 6:
+                weight += 1
+            scored.append((weight, tok))
+        scored.sort(reverse=True)
+        matched = [t for _, t in scored[:5]]
+
+    country_norm = re.sub(r"[^a-z가-힣,]+", "", country.lower())[:30]
+    issue_norm = re.sub(r"[^a-z0-9가-힣_]+", "", issue.lower())[:30]
+    sig = "_".join([x for x in [issue_norm, country_norm] + matched[:6] if x])
+    if not sig:
+        sig = normalize_title(title)[:80]
+    return sig
+
+
+def initial_cluster_key(row):
+    # 기존 IssueClusterKey가 충분히 의미 있으면 우선 활용
+    existing = s(row.get("IssueClusterKey", ""))
+    if existing and len(existing) >= 8 and existing.lower() not in ["nan", "none", "null"]:
+        return "EXISTING_" + re.sub(r"[^a-zA-Z0-9가-힣_\-]+", "_", existing.lower())[:100]
+
+    url = normalize_url(row.get("URL", ""))
+    dom = domain_of(url)
+    title_norm = normalize_title(row.get("Headline", ""))
+    toks = title_tokens(title_norm)
+
+    # Google/MSN/Yahoo 등 재배포는 제목 기반으로 강하게 묶음
+    if any(x in dom for x in ["google", "yahoo", "msn", "news.google", "finance.yahoo"]):
+        return "TITLE_" + md5_short(" ".join(toks[:12]))
+
+    # 일반 기사도 이슈 서명 기반 1차 묶음
+    return "ISSUE_" + md5_short(issue_signature(row))
+
+
+def refine_clusters(df):
+    """
+    1차 key로 묶은 후, key가 다르더라도 제목 토큰 유사도가 높은 singleton/소형 cluster를 추가 병합.
+    외부 라이브러리 없이 300건 수준에서 충분히 빠르게 동작.
+    """
+    df = df.copy()
+    df["_tokens"] = df["Headline"].map(title_tokens)
+    df["_sig"] = df.apply(issue_signature, axis=1)
+    df["_cluster_key"] = df.apply(initial_cluster_key, axis=1)
+
+    # Union-Find
+    parent = list(range(len(df)))
+
+    def find(x):
+        while parent[x] != x:
+            parent[x] = parent[parent[x]]
+            x = parent[x]
+        return x
+
+    def union(a, b):
+        ra, rb = find(a), find(b)
+        if ra != rb:
+            parent[rb] = ra
+
+    # 같은 1차 key 병합
+    key_to_idx = {}
+    for i, k in enumerate(df["_cluster_key"].tolist()):
+        if k in key_to_idx:
+            union(key_to_idx[k], i)
+        else:
+            key_to_idx[k] = i
+
+    # 제목/이슈 유사도 병합
+    records = df.to_dict("records")
+    n = len(records)
+    for i in range(n):
+        ti = records[i]["_tokens"]
+        if len(ti) < 3:
+            continue
+        for j in range(i + 1, n):
+            tj = records[j]["_tokens"]
+            if len(tj) < 3:
+                continue
+            sim = jaccard(ti, tj)
+            same_issue = records[i]["_sig"] == records[j]["_sig"]
+            # Reuters/Bloomberg/Yahoo/MSN 같은 같은 기사 제목은 대체로 0.55 이상
+            if sim >= 0.58 or (same_issue and sim >= 0.42):
+                union(i, j)
+
+    root_to_id = {}
+    ids = []
+    for i in range(n):
+        r = find(i)
+        if r not in root_to_id:
+            # 날짜 + 이슈 signature 기반 ID
+            d = date_yyyymmdd(records[i].get("Date", ""))
+            sig = re.sub(r"[^a-zA-Z0-9가-힣_]+", "_", records[i]["_sig"])[:60]
+            root_to_id[r] = f"CL_{d}_{md5_short(sig, 8)}"
+        ids.append(root_to_id[r])
+    df["ClusterID"] = ids
+    return df
+
+
+def representative_score(row):
+    score = 0.0
+    score += to_num(row.get("FinalScore"), 0) * 10
+    score += to_num(row.get("Score"), 0) * 4
+    score += to_num(row.get("TopicScore"), 0) * 2
+    score += to_num(row.get("SamsungImpactScore"), 0) * 2
+    score += source_priority(row) * 3
+    if s(row.get("article_body_ok")) == "Y":
+        score += 180
+    score += min(to_num(row.get("article_body_chars"), 0), 8000) / 30
+    if s(row.get("Priority", "")).upper() == "CORE":
+        score += 120
+    if s(row.get("Tier", "")).upper() == "CORE":
+        score += 120
+    # Google Alert URL 자체는 대표기사에서 감점. 단 원문 URL 해결됐으면 감점 적음.
+    dom = domain_of(row.get("URL", ""))
+    if "google" in dom:
+        score -= 80
+    if "msn" in dom:
+        score -= 20
     return score
 
 
-def add_score(df):
-    df["score"] = df["title"].apply(samsung_policy_score)
-    return df.sort_values(["score", "date"], ascending=[False, False]).reset_index(drop=True)
+def make_cluster_representatives(df):
+    if df.empty:
+        return df, df
+    work = refine_clusters(df)
+    work["_rep_score"] = work.apply(representative_score, axis=1)
 
+    rep_rows = []
+    audit_rows = []
+    for cid, g in work.groupby("ClusterID", dropna=False):
+        g = g.copy().sort_values("_rep_score", ascending=False)
+        rep = g.iloc[0].copy()
+        cluster_size = len(g)
+        related_count = max(0, cluster_size - 1)
+        urls = [s(x) for x in g.get("URL", pd.Series()).tolist() if s(x)]
+        original_urls = [s(x) for x in g.get("original_url", pd.Series()).tolist() if s(x)]
+        all_urls = list(dict.fromkeys(urls + original_urls))
+        titles = [clean_text(x, 250) for x in g.get("Headline", pd.Series()).tolist() if s(x)]
+        sources = []
+        for _, rr in g.iterrows():
+            src = s(rr.get("Agency", "")) or s(rr.get("Publisher", "")) or s(rr.get("Source", "")) or domain_of(rr.get("URL", ""))
+            if src:
+                sources.append(src)
+        sources = list(dict.fromkeys(sources))
 
-def filter_recent_relaxed(df):
-    cutoff = datetime.now() - timedelta(hours=36)
-    return df[df["date"] >= cutoff].reset_index(drop=True)
+        rep["ClusterID"] = cid
+        rep["ClusterSize"] = cluster_size
+        rep["RelatedCount"] = related_count
+        rep["DuplicateCount"] = related_count
+        rep["RepresentativeURL"] = s(rep.get("URL", ""))
+        rep["RelatedURLs"] = " | ".join(all_urls[:30])
+        rep["RelatedSources"] = " | ".join(sources[:30])
+        rep["ClusterSources"] = " | ".join(sources[:30])
+        rep["ClusterHeadlines"] = " | ".join(titles[:20])
+        rep["ClusterMemberTitles"] = " | ".join(titles[:30])
+        rep["RepresentativeReason"] = (
+            f"대표기사 선정: FinalScore={s(rep.get('FinalScore'))}, "
+            f"SourcePriority={source_priority(rep)}, BodyOK={s(rep.get('article_body_ok'))}, "
+            f"ClusterSize={cluster_size}"
+        )
+        members = []
+        for _, m in g.iterrows():
+            members.append({
+                "Headline": s(m.get("Headline", "")),
+                "URL": s(m.get("URL", "")),
+                "Source": s(m.get("Agency", "")) or s(m.get("Publisher", "")) or s(m.get("Source", "")),
+                "FinalScore": to_num(m.get("FinalScore"), 0),
+                "BodyOK": s(m.get("article_body_ok", "")),
+            })
+        rep["ClusterMembersJSON"] = json.dumps(members, ensure_ascii=False)
+        rep_rows.append(rep)
 
+        rank = 1
+        for _, m in g.iterrows():
+            ar = m.copy()
+            ar["ClusterID"] = cid
+            ar["ClusterRank"] = rank
+            ar["IsRepresentative"] = "Y" if rank == 1 else "N"
+            ar["RepresentativeHeadline"] = s(rep.get("Headline", ""))
+            ar["RepresentativeURL"] = s(rep.get("URL", ""))
+            ar["RelatedCount"] = related_count
+            audit_rows.append(ar)
+            rank += 1
 
-def fallback_if_zero_or_too_low(original_df, current_df, keywords, min_rows=50):
-    if len(current_df) >= min_rows:
-        return current_df
+    reps = pd.DataFrame(rep_rows)
+    audit = pd.DataFrame(audit_rows)
 
-    print(f"fallback 작동: 현재 {len(current_df)}건 → 최소 {min_rows}건 확보 시도")
+    # 대표기사 재정렬: CORE/FinalScore/클러스터크기/본문품질 우선
+    sort_cols = []
+    for c in ["Priority", "Tier"]:
+        if c in reps.columns:
+            reps[f"_{c}_sort"] = reps[c].astype(str).str.upper().map(lambda x: 1 if x == "CORE" else 0)
+            sort_cols.append(f"_{c}_sort")
+    for c in ["FinalScore", "Score", "ClusterSize", "article_body_chars"]:
+        if c in reps.columns:
+            sort_cols.append(c)
+    if sort_cols:
+        reps = reps.sort_values(sort_cols, ascending=[False] * len(sort_cols), na_position="last")
 
-    df = original_df.copy()
-    df = filter_recent_relaxed(df)
-    df = remove_real_noise(df)
-    df = policy_filter(df, keywords)
-    df = dedup_exact(df)
-    df = dedup_sentence_similarity(df)
-    df = dedup_cosine(df)
-    df = add_score(df)
+    # 목표 180건으로 제한. 단 CORE는 우선 보존.
+    if NEWS_REPRESENTATIVE_TARGET_MAX and len(reps) > NEWS_REPRESENTATIVE_TARGET_MAX:
+        reps = reps.head(NEWS_REPRESENTATIVE_TARGET_MAX).copy()
 
-    combined = pd.concat([current_df, df], ignore_index=True)
-    combined = dedup_exact(combined)
-    combined = dedup_sentence_similarity(combined)
-    combined = add_score(combined)
+    # 내부 컬럼 제거
+    drop_cols = [c for c in reps.columns if c.startswith("_")]
+    reps.drop(columns=drop_cols, inplace=True, errors="ignore")
+    audit.drop(columns=[c for c in audit.columns if c.startswith("_")], inplace=True, errors="ignore")
+    return reps, audit
 
-    return combined
-
-
+# -----------------------------------------------------------------------------
+# MAIN
+# -----------------------------------------------------------------------------
 def main():
-    print("STEP3 FINAL - POLICY CANDIDATE ENGINE v3")
+    log("STEP3 REGULATION/NEWS ARTICLE SUMMARY START")
 
-    df = load_data()
-    print("Loaded:", len(df))
+    # 1) Regulation
+    reg = load_regulation_input()
+    if not reg.empty:
+        reg2 = process_articles(reg, is_regulation=True)
+        body_ok = int((reg2.get("article_body_ok", "") == "Y").sum())
+        bad = len(reg2) - body_ok
+        fetched = int((reg2.get("article_body_source", "") == "FETCHED_HTML").sum())
+        fallback = int((reg2.get("article_body_source", "") == "INPUT_FALLBACK").sum())
+        google_unresolved = int(reg2.get("article_extract_status", pd.Series(dtype=str)).astype(str).str.contains("GOOGLE", case=False, na=False).sum())
+        log(f"[REGULATION] rows={len(reg2)}, body_ok={body_ok}, fetched_ok={fetched}, fallback_ok={fallback}, google_unresolved={google_unresolved}, bad_or_empty={bad}")
+        save_excel(reg2, REG_OUT)
+    else:
+        log("[REGULATION] skipped")
 
-    df = standardize(df)
-    df.to_excel(RAW_FILE, index=False)
+    # 2) News
+    news = load_news_input()
+    if news.empty:
+        log("[NEWS] skipped - no input")
+        return
 
-    original_df = df.copy()
+    news2 = process_articles(news, is_regulation=False)
+    save_excel(news2, NEWS_BEFORE_CLUSTER_OUT)
 
-    df = filter_recent(df)
-    print("24h:", len(df))
+    before_rows = len(news2)
+    body_ok = int((news2.get("article_body_ok", "") == "Y").sum())
+    fetched = int((news2.get("article_body_source", "") == "FETCHED_HTML").sum())
+    fallback = int((news2.get("article_body_source", "") == "INPUT_FALLBACK").sum())
+    google_unresolved = int(news2.get("article_extract_status", pd.Series(dtype=str)).astype(str).str.contains("GOOGLE|google|alerts|EMPTY_URL", na=False).sum())
+    bad = before_rows - body_ok
+    log(f"[NEWS-BEFORE-CLUSTER] rows={before_rows}, body_ok={body_ok}, fetched_ok={fetched}, fallback_ok={fallback}, google_unresolved={google_unresolved}, bad_or_empty={bad}")
 
-    keywords = load_keywords()
+    reps, audit = make_cluster_representatives(news2)
+    after_rows = len(reps)
+    reduced = before_rows - after_rows
+    rate = (reduced / before_rows * 100) if before_rows else 0
+    clustered_groups = int((audit.groupby("ClusterID").size() > 1).sum()) if not audit.empty and "ClusterID" in audit.columns else 0
+    max_cluster = int(audit.groupby("ClusterID").size().max()) if not audit.empty and "ClusterID" in audit.columns else 0
 
-    df = remove_real_noise(df)
-    print("real noise 제거:", len(df))
+    save_excel(reps, NEWS_OUT)
+    save_excel(audit, NEWS_CLUSTER_AUDIT_OUT)
 
-    df = policy_filter(df, keywords)
-    print("policy:", len(df))
+    body_ok2 = int((reps.get("article_body_ok", "") == "Y").sum()) if not reps.empty else 0
+    fetched2 = int((reps.get("article_body_source", "") == "FETCHED_HTML").sum()) if not reps.empty else 0
+    fallback2 = int((reps.get("article_body_source", "") == "INPUT_FALLBACK").sum()) if not reps.empty else 0
+    bad2 = after_rows - body_ok2
 
-    df = dedup_exact(df)
-    print("exact dedup 후:", len(df))
+    log(f"[NEWS-REP-CLUSTER] before={before_rows}, after={after_rows}, reduced={reduced}, reduction_rate={rate:.1f}%")
+    log(f"[NEWS-REP-CLUSTER] clustered_groups={clustered_groups}, max_cluster_size={max_cluster}")
+    log(f"[NEWS] rows={after_rows}, body_ok={body_ok2}, fetched_ok={fetched2}, fallback_ok={fallback2}, bad_or_empty={bad2}")
+    log("STEP3 DONE")
 
-    df = dedup_sentence_similarity(df)
-    print("sentence dedup 후:", len(df))
 
-    df = dedup_cosine(df)
-    print("cosine dedup 후:", len(df))
+# =========================================================
+# GTI Regulation body recovery override
+# Keep this block immediately before __main__.
+# =========================================================
 
-    df = remove_cumulative(df)
-    print("cumulative 후:", len(df))
+def _u_reg(s0: str) -> str:
+    return s0.encode("ascii").decode("unicode_escape")
 
-    df = add_score(df)
 
-    df = fallback_if_zero_or_too_low(original_df, df, keywords, min_rows=50)
-    print("fallback 후:", len(df))
+REG_TARIFF_TERMS = [
+    _u_reg("\\uad00\\uc138"), _u_reg("\\uad00\\uc138\\uc728"), _u_reg("\\ud1b5\\uad00"),
+    _u_reg("\\uc218\\uc785"), _u_reg("\\uc218\\ucd9c"), _u_reg("\\uc6d0\\uc0b0\\uc9c0"),
+    _u_reg("\\ud488\\ubaa9\\ubd84\\ub958"), _u_reg("\\ubc18\\ub364\\ud551"),
+    _u_reg("\\uc0c1\\uacc4\\uad00\\uc138"), _u_reg("\\uc218\\ucd9c\\ud1b5\\uc81c"),
+    "customs", "tariff", "duty", "import", "export", "rules of origin",
+    "origin", "fta", "cepa", "epa", "hs code", "classification",
+    "anti-dumping", "antidumping", "countervailing", "safeguard",
+    "section 301", "section 232", "export control", "entity list", "cbam",
+]
 
-    df = add_score(df)
-    df = df.head(MAX_OUTPUT)
+REG_OFFICIAL_DOMAINS = [
+    "law.go.kr", "gwanbo.go.kr", "customs.go.kr", "unipass.customs.go.kr",
+    "motir.go.kr", "federalregister.gov", "ustr.gov", "cbp.gov", "usitc.gov",
+    "eur-lex.europa.eu", "taxation-customs.ec.europa.eu", "wto.org",
+]
 
-    df.to_excel(SUMMARY_FILE, index=False)
-    update_cumulative(df)
 
-    print("STEP3 COMPLETE:", len(df))
-    print("SAVE:", SUMMARY_FILE)
+def _pick_value_case(row, names):
+    for name in names:
+        if name in row and s(row.get(name)):
+            return s(row.get(name))
+    lower = {str(k).lower(): k for k in getattr(row, "index", [])}
+    for name in names:
+        k = lower.get(str(name).lower())
+        if k is not None and s(row.get(k)):
+            return s(row.get(k))
+    return ""
+
+
+def _reg_join(row) -> str:
+    return " ".join([
+        _pick_value_case(row, ["Headline", "Title", "title"]),
+        _pick_value_case(row, ["URL", "url", "Link", "link"]),
+        _pick_value_case(row, ["Source", "source"]),
+        _pick_value_case(row, ["Agency", "agency"]),
+        _pick_value_case(row, ["official_regulation_reason"]),
+        _pick_value_case(row, ["matched_policy_terms"]),
+    ])
+
+
+def _is_official_reg_row(row) -> bool:
+    text = _reg_join(row).lower()
+    if _pick_value_case(row, ["official_regulation_flag"]).upper() == "Y":
+        return True
+    if any(d in text for d in REG_OFFICIAL_DOMAINS):
+        return True
+    return _pick_value_case(row, ["site_type"]).lower() == "regulation"
+
+
+def _has_trade_reg_signal(row) -> bool:
+    text = _reg_join(row).lower()
+    return any(str(t).lower() in text for t in REG_TARIFF_TERMS)
+
+
+def _build_reg_fallback_body(row, fetch_status="") -> str:
+    parts = [
+        "OFFICIAL REGULATION FALLBACK BODY",
+        f"Title: {_pick_value_case(row, ['Headline', 'Title', 'title'])}",
+        f"Date: {_pick_value_case(row, ['Date', 'date'])}",
+        f"Agency: {_pick_value_case(row, ['Agency', 'agency'])}",
+        f"URL: {_pick_value_case(row, ['URL', 'url', 'original_url', 'Link', 'link'])}",
+        f"Source: {_pick_value_case(row, ['Source', 'source'])}",
+        f"FetchStatus: {fetch_status}",
+        f"Signals: {_pick_value_case(row, ['official_regulation_reason', 'matched_policy_terms'])}",
+        f"ExistingText: {_pick_value_case(row, ['regulation_fallback_body', 'Summary', 'summary', 'Description', 'description', 'Snippet', 'Content', 'article_body'])}",
+    ]
+    return clean_text(" | ".join([p for p in parts if p and not p.endswith(': ')]), 6000)
+
+
+def extract_article_for_row(row, is_regulation=False):
+    url = normalize_url(_pick_value_case(row, ["URL", "url", "original_url", "Link", "link"]))
+    original_url = url
+    existing = clean_text(_pick_value_case(row, ["article_body"]))
+    if existing:
+        bad, status = is_bad_body(existing)
+        if not bad:
+            return existing, "EXISTING_BODY_OK", "OFFICIAL" if is_regulation else "MEDIA", "Y", "OK", "EXISTING", len(existing), original_url
+
+    fallback = clean_text(" ".join(
+        _pick_value_case(row, [c]) for c in [
+            "regulation_fallback_body", "Summary", "summary", "Description", "description",
+            "Snippet", "Content", "Headline", "Title", "title",
+        ] if _pick_value_case(row, [c])
+    ), 4000)
+
+    body = ""
+    status = "EMPTY_URL"
+    final_url = original_url
+    if url.startswith("http"):
+        body, status, final_url = requests_get_text(url)
+        time.sleep(SLEEP_SEC)
+
+    body = clean_text(body, 12000)
+    bad, q = is_bad_body(body)
+    if not bad:
+        return body, status, "OFFICIAL" if is_regulation else "MEDIA", "Y", "OK", "FETCHED_HTML", len(body), final_url
+
+    if is_regulation and _is_official_reg_row(row):
+        reg_body = _build_reg_fallback_body(row, fetch_status=f"{status}:{q}")
+        quality = "OFFICIAL_TRADE_FALLBACK" if _has_trade_reg_signal(row) else "OFFICIAL_FALLBACK_REVIEW"
+        return reg_body, f"{status}:{q}:OFFICIAL_FALLBACK", "OFFICIAL", "Y", quality, "OFFICIAL_METADATA_FALLBACK", len(reg_body), final_url
+
+    if len(fallback) >= 40:
+        return fallback, "INPUT_FALLBACK", "OFFICIAL" if is_regulation else "MEDIA", "Y", "FALLBACK_OK", "INPUT_FALLBACK", len(fallback), final_url
+
+    return "", f"{status}:{q}", "OFFICIAL" if is_regulation else "MEDIA", "N", q if q else "EMPTY", "EMPTY", 0, final_url
+
+
+def load_regulation_input():
+    p = first_existing(REG_INPUT_CANDIDATES)
+    if not p:
+        log("[REGULATION] input not found")
+        return pd.DataFrame()
+    df = read_excel_safe(p)
+    log(f"[REGULATION] input={p} rows={len(df)}")
+    if df.empty:
+        return df
+    hcol = pick_col(df, ["Headline", "Title", "title"])
+    ucol = pick_col(df, ["URL", "url", "Link", "link"])
+    dcol = pick_col(df, ["Date", "date"])
+    acol = pick_col(df, ["Agency", "agency"])
+    scol = pick_col(df, ["Source", "source"])
+    if hcol and hcol != "Headline":
+        df["Headline"] = df[hcol]
+    if ucol and ucol != "URL":
+        df["URL"] = df[ucol]
+    if dcol and dcol != "Date":
+        df["Date"] = df[dcol]
+    if acol and acol != "Agency":
+        df["Agency"] = df[acol]
+    if scol and scol != "Source":
+        df["Source"] = df[scol]
+    return ensure_columns(df, {"Headline": "", "URL": "", "Date": "", "Agency": "", "Source": ""})
+
+
+def add_hints(df):
+    for c in ["effective_date_hint", "change_detail_hint", "hs_hint", "tariff_rate_hint"]:
+        if c not in df.columns:
+            df[c] = ""
+    bodies = df.get("article_body", pd.Series([""] * len(df)))
+    def hint_effective_safe(text):
+        t = s(text)
+        hits = re.findall(r"20\d{2}[.\-/]\s*\d{1,2}[.\-/]\s*\d{1,2}", t)
+        hits += re.findall(r"effective\s+(?:on\s+)?[A-Z][a-z]+\s+\d{1,2},\s*20\d{2}", t, flags=re.I)
+        return "; ".join(dict.fromkeys([clean_text(x) for x in hits[:6]]))
+    def hint_hs_safe(text):
+        t = s(text)
+        hits = re.findall(r"\b(?:HS|HTS|HTSUS|hs code|tariff classification).{0,20}?([0-9]{4}(?:\.[0-9]{2,6})?)", t, flags=re.I)
+        hits += re.findall(r"\b([0-9]{4}\.[0-9]{2,6})\b", t)
+        return "; ".join(dict.fromkeys(hits[:10]))
+    def hint_rate_safe(text):
+        t = s(text)
+        hits = re.findall(r"(?:tariff|duty|rate).{0,40}?\b([0-9]{1,3}(?:\.[0-9]+)?\s*%)", t, flags=re.I)
+        hits += re.findall(r"\b([0-9]{1,3}(?:\.[0-9]+)?\s*%)", t)
+        return "; ".join(dict.fromkeys([clean_text(x) for x in hits[:10]]))
+    def hint_change_safe(text):
+        t = clean_text(text, 2000)
+        sent = re.split(r"(?<=[.!?])\s+", t)
+        keys = ["tariff", "duty", "customs", "export control", "fta", "origin", "hs", "notice", "regulation"]
+        picked = [x for x in sent if any(k in x.lower() for k in keys)]
+        return clean_text("; ".join(picked[:4]) or t[:600], 1200)
+    df["effective_date_hint"] = [hint_effective_safe(x) for x in bodies]
+    df["change_detail_hint"] = [hint_change_safe(x) for x in bodies]
+    df["hs_hint"] = [hint_hs_safe(x) for x in bodies]
+    df["tariff_rate_hint"] = [hint_rate_safe(x) for x in bodies]
+    return df
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except Exception as e:
+        log("FATAL ERROR")
+        log(str(e))
+        traceback.print_exc()
+        raise
