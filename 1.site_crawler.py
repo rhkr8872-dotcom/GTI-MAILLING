@@ -2940,5 +2940,283 @@ def save_split_files(df):
     news.to_excel(OUT_NEWS_FILE, index=False)
 
 
+OUT_REG_REVIEW_FILE = BASE_DIR / "1-1.regulation_review_raw.xlsx"
+
+PROTECTED_FOREIGN_REG_DOMAINS = [
+    "federalregister.gov", "ustr.gov", "cbp.gov", "usitc.gov", "commerce.gov",
+    "bis.doc.gov", "trade.gov", "ecfr.gov",
+    "eur-lex.europa.eu", "taxation-customs.ec.europa.eu", "trade.ec.europa.eu",
+    "ec.europa.eu", "commission.europa.eu",
+    "wto.org", "eping.wto.org",
+    "customs.gov.cn", "gacc.gov.cn", "mofcom.gov.cn", "gov.cn",
+    "dgft.gov.in", "cbic.gov.in", "commerce.gov.in",
+    "customs.gov.vn", "mof.gov.vn", "moit.gov.vn",
+    "customs.go.th", "mof.go.th",
+    "dof.gob.mx", "sat.gob.mx", "siicex.gob.mx",
+    "in.gov.br", "receita.economia.gov.br", "gov.br",
+    "customs.gov.my", "miti.gov.my",
+    "beacukai.go.id", "kemendag.go.id",
+]
+
+PROTECTED_FOREIGN_REG_AGENCY_HINTS = [
+    "federal register", "ustr", "cbp", "usitc", "bis", "bureau of industry and security",
+    "taxation and customs union", "taxud", "eur-lex", "european commission",
+    "wto", "dgft", "cbic", "gacc", "china customs", "mofcom",
+    "vietnam customs", "moit", "mexico", "sat", "receita federal",
+]
+
+PROTECTED_FOREIGN_REG_TERMS = [
+    "customs", "tariff", "duty", "duties", "import", "export", "origin",
+    "rules of origin", "fta", "cepa", "epa", "hs code", "classification",
+    "ruling", "advance ruling", "valuation", "drawback", "bonded",
+    "anti-dumping", "antidumping", "countervailing", "safeguard",
+    "section 301", "section 232", "uflpa", "forced labor",
+    "export control", "entity list", "restricted party", "sanction",
+    "cbam", "carbon border", "regulation", "notice", "directive",
+    "final rule", "proposed rule", "official journal", "gazette",
+]
+
+PROTECTED_FINAL_EXCLUDE_REASONS = [
+    "date_status=no_date",
+    "date_status=old_date",
+    "title_too_long_over_180",
+]
+
+PROTECTED_BLOCK_REASONS = [
+    "menu_or_category_link",
+    "menu_or_agency_list_text",
+    "url_equals_source",
+    "fragment_or_menu_url",
+    "diagnostic_hint_title",
+    "invalid_title",
+    "invalid_url",
+]
+
+PROTECTED_CONTENT_TERMS = [
+    "tariff", "duty", "duties", "import", "export", "origin",
+    "rules of origin", "fta", "cepa", "epa", "hs code", "classification",
+    "ruling", "advance ruling", "valuation", "drawback", "bonded",
+    "anti-dumping", "antidumping", "countervailing", "safeguard",
+    "section 301", "section 232", "uflpa", "forced labor",
+    "export control", "entity list", "sanction", "cbam", "carbon border",
+    "executive order", "final rule", "proposed rule", "regulation", "notice",
+    "directive", "announcement", "gazette",
+]
+
+PROTECTED_GENERIC_TITLES = [
+    "download (type : pdf)", "download", "laws & regulations", "federal register notices",
+    "help for exporters and importers", "coverage of major imports & exports",
+    "business, economy, euro", "application of eu law", "value added tax",
+    "national tax administrations", "organizational structure", "service navigation",
+]
+
+PROTECTED_DOCUMENT_URL_HINTS = [
+    ".pdf", "/documents/20", "/document/20", "/notice/", "/notices/",
+    "/announcement", "/announcements", "/press-releases/20", "/statics/",
+    "public notice", "trade notice", "notification", "circular",
+]
+
+PROTECTED_NON_TRADE_NOISE = [
+    "repatriation", "bureau of land management", "department of the interior",
+    "museum", "cultural item", "archaeology", "career", "hiring", "vacancy",
+]
+
+
+def _protected_foreign_reg_text(row) -> str:
+    return " ".join([
+        clean_text(row.get("title", "")),
+        clean_text(row.get("url", "")),
+        clean_text(row.get("source", "")),
+        clean_text(row.get("agency", "")),
+        clean_text(row.get("matched_policy_terms", "")),
+        clean_text(row.get("official_regulation_reason", "")),
+    ]).lower()
+
+
+def _protected_hits(text: str, terms: list[str]) -> list[str]:
+    return [term for term in terms if str(term).lower() in text]
+
+
+def _looks_like_actual_official_document_url(row) -> bool:
+    url = clean_text(row.get("url", "")).lower()
+    return any(h in url for h in PROTECTED_DOCUMENT_URL_HINTS)
+
+
+def _normalized_protected_title(title: str) -> str:
+    title = clean_text(title).lower()
+    title = re.sub(r"^[\s\-\*\u2022·ㆍ]+", "", title)
+    title = re.sub(r"\s+", " ", title).strip()
+    return title
+
+
+def _repair_protected_title(row):
+    title = clean_text(row.get("title", ""))
+    if _normalized_protected_title(title) not in PROTECTED_GENERIC_TITLES:
+        return title
+
+    url = clean_text(row.get("url", ""))
+    tail = urlparse(url).path.rsplit("/", 1)[-1]
+    tail = unescape(tail).replace("%20", " ").replace("_", " ").replace("-", " ")
+    tail = re.sub(r"\.(pdf|html?|aspx?)$", "", tail, flags=re.I)
+    tail = re.sub(r"\s+", " ", tail).strip()
+    if len(tail) >= 12:
+        return tail[:180]
+    return title
+
+
+def is_protected_foreign_regulation_candidate(row, exclude_reason: str = "") -> tuple[bool, str, int]:
+    """Keep official overseas regulation candidates for review instead of dropping them.
+
+    STEP1 often cannot parse dates from foreign official sites. For Samsung customs
+    monitoring, it is safer to preserve those official candidates and let STEP3/4
+    or a human review decide relevance.
+    """
+    text = _protected_foreign_reg_text(row)
+    reason_text = str(exclude_reason or "")
+
+    if not any(r in reason_text for r in PROTECTED_FINAL_EXCLUDE_REASONS):
+        return False, "", 0
+    if any(r in reason_text for r in PROTECTED_BLOCK_REASONS):
+        return False, "", 0
+    if any(noise in text for noise in PROTECTED_NON_TRADE_NOISE):
+        return False, "", 0
+
+    url_low = clean_text(row.get("url", "")).lower()
+    title_low = _normalized_protected_title(row.get("title", ""))
+    if title_low in PROTECTED_GENERIC_TITLES and not _looks_like_actual_official_document_url(row):
+        return False, "", 0
+    if "federalregister.gov" in url_low and "/documents/20" not in url_low:
+        return False, "", 0
+
+    domain_hits = _protected_hits(text, PROTECTED_FOREIGN_REG_DOMAINS)
+    agency_hits = _protected_hits(text, PROTECTED_FOREIGN_REG_AGENCY_HINTS)
+    term_hits = _protected_hits(text, PROTECTED_FOREIGN_REG_TERMS)
+    content_text = " ".join([
+        clean_text(row.get("title", "")),
+        clean_text(row.get("url", "")),
+    ]).lower()
+    content_hits = _protected_hits(content_text, PROTECTED_CONTENT_TERMS)
+
+    score = 0
+    if domain_hits:
+        score += 45
+    if agency_hits:
+        score += 20
+    if term_hits:
+        score += min(35, len(term_hits) * 7)
+    if content_hits:
+        score += min(25, len(content_hits) * 8)
+    if normalize_site_type(row.get("site_type", "")) == "regulation":
+        score += 15
+
+    # Existing official regulation scoring, if available, is used as supporting evidence.
+    try:
+        reg_score, reg_kind, reg_reason = _reg_signal(row)
+    except Exception:
+        reg_score, reg_kind, reg_reason = 0, "", ""
+    if reg_score >= 45:
+        score += 15
+
+    if any(noise in text for noise in ["career", "hiring", "vacancy", "press officer", "social media"]):
+        score -= 25
+
+    keep = bool((domain_hits or agency_hits) and term_hits and content_hits and score >= 65)
+    reason = "; ".join([
+        "protected_foreign_official_regulation",
+        f"score={max(0, min(score, 100))}",
+        "domains=" + ",".join(domain_hits[:5]) if domain_hits else "",
+        "agencies=" + ",".join(agency_hits[:5]) if agency_hits else "",
+        "terms=" + ",".join(term_hits[:8]) if term_hits else "",
+        "content_terms=" + ",".join(content_hits[:8]) if content_hits else "",
+        f"base_reg={reg_kind}:{reg_score}" if reg_score else "",
+        f"original_exclude={reason_text}",
+    ])
+    reason = "; ".join([x for x in reason.split("; ") if x])
+    return keep, reason, max(0, min(score, 100))
+
+
+_base_split_final_rows = split_final_rows
+
+
+def split_final_rows(df, keyword_terms=None):
+    final, excluded = _base_split_final_rows(df, keyword_terms)
+    if excluded is None or excluded.empty:
+        return final, excluded
+
+    review_rows = []
+    review_indices = []
+    keep_rows = []
+
+    for idx, row in excluded.iterrows():
+        reason = clean_text(row.get("_final_exclude_reason", ""))
+        keep, keep_reason, keep_score = is_protected_foreign_regulation_candidate(row, reason)
+        if not keep:
+            continue
+
+        recovered = row.copy()
+        recovered["site_type"] = "regulation"
+        recovered["title"] = _repair_protected_title(row)
+        recovered["date_quality"] = clean_text(row.get("date_status", "")) or "unknown"
+        recovered["protected_regulation_candidate"] = "Y"
+        recovered["protected_regulation_score"] = keep_score
+        recovered["protected_regulation_reason"] = keep_reason
+        recovered["step1_relevance_status"] = "REVIEW_OFFICIAL_FOREIGN_REG"
+        recovered["_final_exclude_reason"] = ""
+        keep_rows.append(recovered)
+
+        review_copy = row.copy()
+        review_copy["title"] = _repair_protected_title(row)
+        review_copy["protected_regulation_candidate"] = "Y"
+        review_copy["protected_regulation_score"] = keep_score
+        review_copy["protected_regulation_reason"] = keep_reason
+        review_rows.append(review_copy)
+        review_indices.append(idx)
+
+    if keep_rows:
+        recovered_df = pd.DataFrame(keep_rows)
+        recovered_df.drop(columns=["_final_exclude_reason"], inplace=True, errors="ignore")
+        final = pd.concat([final, recovered_df], ignore_index=True, sort=False)
+        excluded = excluded.drop(index=review_indices, errors="ignore").copy()
+        print(f"[REG REVIEW KEEP] foreign official regulation candidates preserved: {len(recovered_df)}")
+
+    if review_rows:
+        review_df = pd.DataFrame(review_rows)
+        try:
+            review_df.to_excel(OUT_REG_REVIEW_FILE, index=False)
+            print(f"[REG REVIEW SAVE] {OUT_REG_REVIEW_FILE} rows={len(review_df)}")
+        except Exception as e:
+            print(f"[REG REVIEW SAVE WARN] skipped: {OUT_REG_REVIEW_FILE} / {e}")
+
+    return final, excluded
+
+
+_previous_save_split_files = save_split_files
+
+
+def save_split_files(df):
+    enhanced = enhance_regulation_rows(df)
+    enhanced.to_excel(OUT_ALL_FILE, index=False)
+
+    reg = enhanced[enhanced["site_type"] == "regulation"].copy()
+    news = enhanced[enhanced["site_type"] == "news"].copy()
+
+    if not reg.empty and "official_regulation_score" in reg.columns:
+        sort_cols = [c for c in ["protected_regulation_candidate", "official_regulation_score", "date"] if c in reg.columns]
+        if sort_cols:
+            ascending = [False if c != "date" else False for c in sort_cols]
+            reg = reg.sort_values(sort_cols, ascending=ascending, kind="stable")
+
+    reg.to_excel(OUT_REG_FILE, index=False)
+    news.to_excel(OUT_NEWS_FILE, index=False)
+
+    if "protected_regulation_candidate" in enhanced.columns:
+        review = enhanced[enhanced["protected_regulation_candidate"].fillna("").astype(str).eq("Y")].copy()
+        if not review.empty:
+            try:
+                review.to_excel(OUT_REG_REVIEW_FILE, index=False)
+            except Exception as e:
+                print(f"[REG REVIEW SAVE WARN] skipped: {OUT_REG_REVIEW_FILE} / {e}")
+
+
 if __name__ == "__main__":
     main()
