@@ -118,6 +118,9 @@ FINAL_COLS = [
     "CollectedAt",
     "Headline",
     "URL",
+    "GoogleURL",
+    "OriginalURLCandidate",
+    "BestLinkURL",
     "Country",
     "Agency",
     "Risk",
@@ -148,6 +151,9 @@ FINAL_COLS = [
     "Publisher",
     "Importance",
     "Category",
+    "URLRestoreStatus",
+    "Step4Hint",
+    "SourceScoreReason",
 ]
 
 SOURCE_PRIORITY_DOMAINS = [
@@ -215,13 +221,48 @@ FALLBACK_TRADE_KEYWORDS = [
 ]
 
 POLICY_RULES = [
-    ("TARIFF", ["tariff", "tariffs", "duty", "duties", "관세", "관세율", "additional tariff"]),
+    ("AD_CVD", [
+        "anti-dumping", "anti dumping", "antidumping", "countervailing",
+        "countervailing duty", "countervailing duties", "dumping", "ad/cvd",
+        "cvd", "반덤핑", "덤핑방지관세", "상계관세", "무역구제",
+    ]),
+    ("TARIFF", ["tariff", "tariffs", "duty", "duties", "관세", "관세율", "additional tariff", "tariff cap", "tariff ceiling", "관세상한"]),
     ("ORIGIN_FTA", ["fta", "cepa", "usmca", "rules of origin", "origin", "원산지", "자유무역협정"]),
-    ("AD_CVD", ["anti-dumping", "antidumping", "countervailing", "dumping", "반덤핑", "상계관세"]),
     ("EXPORT_CONTROL", ["export control", "export controls", "sanction", "restriction", "수출통제", "제재"]),
     ("CBAM_CARBON", ["cbam", "carbon border", "carbon tariff", "탄소국경"]),
     ("CUSTOMS", ["customs", "clearance", "declaration", "통관", "세관"]),
     ("HS_CLASSIFICATION", ["hs code", "classification", "품목분류", "hs코드"]),
+]
+
+AD_CVD_FORCE_TERMS = [
+    "anti-dumping", "anti dumping", "antidumping", "countervailing",
+    "countervailing duty", "countervailing duties", "ad/cvd", "cvd",
+    "dumping duties", "반덤핑", "덤핑방지관세", "상계관세", "무역구제",
+]
+
+STEP4_REVIEW_TERMS = [
+    "forced labor", "uflpa", "section 301", "301조", "section 232",
+    "cbam", "carbon border", "fta", "cepa", "rules of origin",
+    "tariff cap", "tariff ceiling", "관세상한", "강제노동", "원산지",
+]
+
+STANDALONE_NOISE_KEYWORDS = ["bis", "aeo", "수출", "관세", "customs", "export", "tariff"]
+
+BIS_VALID_CONTEXT = [
+    "export control", "entity list", "denied persons", "bureau of industry and security",
+    "department of commerce", "commerce department", "수출통제", "산업안보국", "산업보안국",
+    "미 상무부", "미국 상무부", "전략물자", "반도체", "semiconductor", "chip",
+]
+
+AEO_VALID_CONTEXT = [
+    "authorized economic operator", "mutual recognition", "mra", "customs",
+    "관세청", "통관", "수출입안전관리", "종합인증우수업체",
+]
+
+GENERIC_EXPORT_TARIFF_NOISE = [
+    "수출 호조", "수출 증가", "수출 감소", "수출 실적", "수출액", "수출입 동향",
+    "import price", "export growth", "export data", "수입물가", "관세청 통계",
+    "customs seizure", "airport seizure", "drug seizure",
 ]
 
 SAMSUNG_RULES = [
@@ -546,14 +587,89 @@ def normalize_issue_title(title: object) -> str:
 def unwrap_google_url(url: object) -> str:
     raw = clean(url)
     parsed = urlparse(raw)
-    if "google.com" not in parsed.netloc.lower():
+    host = parsed.netloc.lower()
+    if "google.com" not in host and "google.co" not in host and "news.google" not in host:
         return raw
 
     params = parse_qs(parsed.query)
-    for key in ["url", "q"]:
+    for key in ["url", "q", "u"]:
         if key in params and params[key]:
             return unquote(params[key][0])
     return raw
+
+
+def is_google_unresolved_url(url: object) -> bool:
+    raw = clean(url)
+    if not raw:
+        return False
+    parsed = urlparse(raw)
+    host = parsed.netloc.lower()
+    return "news.google" in host or "google.com" in host or "google.co" in host
+
+
+def is_google_article_redirect_url(url: object) -> bool:
+    """Return True for Google News article redirect URLs that open the original article in a browser.
+
+    Important:
+    - https://news.google.com/ is NOT useful.
+    - https://news.google.com/rss/articles/... or /articles/... is useful as a report link.
+    """
+    raw = clean(url).lower()
+    if not raw.startswith(("http://", "https://")):
+        return False
+    parsed = urlparse(raw)
+    host = parsed.netloc.lower()
+    path = parsed.path.lower()
+    if "news.google" not in host:
+        return False
+    return "/rss/articles/" in path or "/articles/" in path
+
+
+def choose_article_url(
+    url: object,
+    original_candidate: object = "",
+    canonical_candidate: object = "",
+    google_candidate: object = "",
+) -> tuple[str, str]:
+    """Choose the best report link and preserve Google News redirect when needed.
+
+    Priority:
+    1) verified original_url_candidate
+    2) verified canonical_url
+    3) Google query parameter unwrap, if it becomes a non-Google URL
+    4) Google News article redirect URL, e.g. /rss/articles/CBMi...
+    5) non-Google raw URL
+
+    Do not return generic https://news.google.com because it does not open the article.
+    """
+    raw = clean(url)
+    original = clean(original_candidate)
+    canonical = clean(canonical_candidate)
+    google = clean(google_candidate)
+
+    for candidate, status in [
+        (original, "RESTORED_ORIGINAL_CANDIDATE"),
+        (canonical, "RESTORED_CANONICAL_CANDIDATE"),
+        (unwrap_google_url(raw), "RESTORED_GOOGLE_QUERY"),
+    ]:
+        if not candidate:
+            continue
+        if not is_google_unresolved_url(candidate):
+            return candidate, status
+
+    for candidate, status in [
+        (google, "GOOGLE_ARTICLE_REDIRECT"),
+        (raw, "GOOGLE_ARTICLE_REDIRECT"),
+    ]:
+        if is_google_article_redirect_url(candidate):
+            return clean(candidate), status
+
+    if raw and not is_google_unresolved_url(raw):
+        return raw, "ORIGINAL_INPUT"
+
+    if raw:
+        return raw, "GOOGLE_UNRESOLVED"
+    return "", "EMPTY_URL"
 
 
 def normalize_query(query: str) -> str:
@@ -611,6 +727,7 @@ def analysis_text(row: pd.Series) -> str:
     return " ".join(
         [
             clean(row.get("Headline", "")),
+            clean(row.get("Summary", "")),
             analysis_url_text(row.get("Source", "")),
             clean(row.get("Publisher", "")),
             clean(row.get("InputKeyword", "")),
@@ -681,6 +798,11 @@ def load_one_file(path: Path) -> pd.DataFrame:
     keyword_col = pick_column(raw, ["keyword"])
     category_col = pick_column(raw, ["category"])
     importance_col = pick_column(raw, ["importance"])
+    summary_col = pick_column(raw, ["summary", "description", "body"])
+    google_url_col = pick_column(raw, ["google_url"])
+    original_url_col = pick_column(raw, ["original_url_candidate", "original_url", "article_url"])
+    canonical_url_col = pick_column(raw, ["canonical_url"])
+    score_reason_col = pick_column(raw, ["score_reason"])
     site_type_col = pick_column(raw, ["site_type"])
     date_status_col = pick_column(raw, ["date_status"])
 
@@ -688,13 +810,27 @@ def load_one_file(path: Path) -> pd.DataFrame:
     df["Date"] = raw[date_col].apply(parse_datetime) if date_col else pd.NaT
     df["CollectedAt"] = raw[collected_col].apply(parse_datetime) if collected_col else pd.NaT
     df["Headline"] = raw[title_col].astype(str).str.strip()
-    df["URL"] = raw[url_col].astype(str).str.strip() if url_col else ""
+    raw_url = raw[url_col].astype(str).str.strip() if url_col else pd.Series([""] * len(raw), index=raw.index)
+    original_candidate = raw[original_url_col].astype(str).str.strip() if original_url_col else pd.Series([""] * len(raw), index=raw.index)
+    canonical_candidate = raw[canonical_url_col].astype(str).str.strip() if canonical_url_col else pd.Series([""] * len(raw), index=raw.index)
+    google_candidate = raw[google_url_col].astype(str).str.strip() if google_url_col else raw_url
+    restored = [
+        choose_article_url(url, original, canonical, google)
+        for url, original, canonical, google in zip(raw_url, original_candidate, canonical_candidate, google_candidate)
+    ]
+    df["URL"] = [item[0] for item in restored]
+    df["BestLinkURL"] = df["URL"]
+    df["URLRestoreStatus"] = [item[1] for item in restored]
+    df["GoogleURL"] = google_candidate
+    df["OriginalURLCandidate"] = original_candidate
     df["Source"] = raw[source_col].astype(str).str.strip() if source_col else ""
     df["AgencyRaw"] = raw[agency_col].astype(str).str.strip() if agency_col else ""
     df["Publisher"] = raw[publisher_col].astype(str).str.strip() if publisher_col else ""
     df["InputKeyword"] = raw[keyword_col].astype(str).str.strip() if keyword_col else ""
     df["Category"] = raw[category_col].astype(str).str.strip() if category_col else ""
     df["Importance"] = raw[importance_col].astype(str).str.strip() if importance_col else ""
+    df["Summary"] = raw[summary_col].astype(str).str.strip() if summary_col else ""
+    df["SourceScoreReason"] = raw[score_reason_col].astype(str).str.strip() if score_reason_col else ""
     df["site_type"] = raw[site_type_col].astype(str).str.strip() if site_type_col else ""
     df["date_status"] = raw[date_status_col].astype(str).str.strip() if date_status_col else ""
     df["SourceFile"] = path.name
@@ -840,6 +976,9 @@ def add_signals(df: pd.DataFrame, keywords: list[str]) -> pd.DataFrame:
         matches = keyword_matches(text, keywords)
         policy_signals = [label for label, terms in POLICY_RULES if contains_any(text, terms)]
         samsung_signals = [label for label, terms in SAMSUNG_RULES if contains_any(text, terms)]
+
+        if contains_any(text, AD_CVD_FORCE_TERMS):
+            policy_signals = ["AD_CVD"] + [x for x in policy_signals if x != "AD_CVD"]
 
         item = row.to_dict()
         item["KeywordMatches"] = "; ".join(matches)
@@ -996,7 +1135,63 @@ def calculate_final_score(row: pd.Series) -> int:
     topic = int(row.get("TopicScore", 0) or 0)
     samsung = int(row.get("SamsungImpactScore", 0) or 0)
     risk = int(row.get("RiskScore", 0) or 0)
-    return int(round(topic * 0.50 + samsung * 0.30 + risk * 0.20))
+    score = int(round(topic * 0.50 + samsung * 0.30 + risk * 0.20))
+    return max(0, min(score + step3_score_adjustment(row), 100))
+
+
+def has_step4_review_signal(row: pd.Series) -> bool:
+    return contains_any(analysis_text(row), STEP4_REVIEW_TERMS)
+
+
+def has_standalone_noise_signal(row: pd.Series) -> bool:
+    text = analysis_text(row)
+    input_keyword = clean(row.get("InputKeyword", "")).lower()
+    issue = clean(row.get("IssueKey", ""))
+
+    if input_keyword == "bis" and not contains_any(text, BIS_VALID_CONTEXT):
+        return True
+    if input_keyword == "aeo" and not contains_any(text, AEO_VALID_CONTEXT):
+        return True
+    if input_keyword in ["수출", "관세", "customs", "export", "tariff"] and contains_any(text, GENERIC_EXPORT_TARIFF_NOISE):
+        return True
+    if issue in ["CUSTOMS", "TRADE_GENERAL"] and contains_any(text, GENERIC_EXPORT_TARIFF_NOISE) and not has_step4_review_signal(row):
+        return True
+    return False
+
+
+def google_url_penalty(row: pd.Series) -> int:
+    status = clean(row.get("URLRestoreStatus", ""))
+    if status == "GOOGLE_UNRESOLVED":
+        return -8
+    return 0
+
+
+def step3_score_adjustment(row: pd.Series) -> int:
+    adjust = 0
+    text = analysis_text(row)
+
+    if contains_any(text, AD_CVD_FORCE_TERMS):
+        adjust += 8
+    if has_step4_review_signal(row):
+        adjust += 6
+    if has_standalone_noise_signal(row):
+        adjust -= 18
+    adjust += google_url_penalty(row)
+
+    return adjust
+
+
+def step4_hint(row: pd.Series) -> str:
+    hints = []
+    if clean(row.get("URLRestoreStatus", "")) == "GOOGLE_UNRESOLVED":
+        hints.append("google_url_unresolved_step4_discount")
+    if contains_any(analysis_text(row), AD_CVD_FORCE_TERMS):
+        hints.append("force_ad_cvd_review")
+    if has_step4_review_signal(row):
+        hints.append("review_upgrade_signal")
+    if has_standalone_noise_signal(row):
+        hints.append("standalone_keyword_noise_penalty")
+    return "; ".join(hints)
 
 
 def source_priority(row: pd.Series) -> int:
@@ -1085,40 +1280,82 @@ def add_analysis_fields(df: pd.DataFrame) -> pd.DataFrame:
     result["RiskScore"] = result.apply(calculate_risk_score, axis=1)
     result["FinalScore"] = result.apply(calculate_final_score, axis=1)
     result["Score"] = result["FinalScore"]
+    result["Step4Hint"] = result.apply(step4_hint, axis=1)
     result["NewsType"] = "NEWS"
     result["RegulationRelated"] = result.apply(regulation_related_flag, axis=1)
     result["RegulationTransferType"] = result.apply(classify_regulation_transfer_type, axis=1)
     result["Priority"] = result["Score"].rank(method="first", ascending=False).astype(int)
+    if "BestLinkURL" not in result.columns:
+        result["BestLinkURL"] = result["URL"]
+    if "GoogleURL" not in result.columns:
+        result["GoogleURL"] = ""
+    if "OriginalURLCandidate" not in result.columns:
+        result["OriginalURLCandidate"] = ""
     result["title_norm"] = result["Headline"].apply(normalize_title)
     result["url_norm"] = result["URL"].apply(normalize_url)
     return result
 
 
+def best_link_for_dedup(row: pd.Series) -> str:
+    """Return a stable URL key source for STEP3 duplicate removal.
+
+    The report click link may be a Google News /rss/articles/ redirect. That is
+    useful for mail, but it is not enough for de-duplication because the same
+    article can appear through multiple Google/portal/RSS URLs. Therefore STEP3
+    de-duplicates by:
+      1) real OriginalURLCandidate when available,
+      2) non-Google BestLinkURL/URL,
+      3) Google article redirect URL only as a fallback,
+      4) title_norm as the second pass for cross-source duplicates.
+    """
+    for col in ["OriginalURLCandidate", "BestLinkURL", "URL", "GoogleURL"]:
+        v = clean(row.get(col, ""))
+        if not v:
+            continue
+        # Prefer non-Google original URLs for dedup keys.
+        if not is_google_unresolved_url(v):
+            return v
+    for col in ["BestLinkURL", "GoogleURL", "URL"]:
+        v = clean(row.get(col, ""))
+        if is_google_article_redirect_url(v):
+            return v
+    return clean(row.get("URL", ""))
+
+
 def dedup_news(df: pd.DataFrame) -> pd.DataFrame:
+    """Two-pass de-duplication.
+
+    v3.4 fix:
+    - Keep GoogleURL/BestLinkURL for mail links.
+    - Do not let unique Google RSS article IDs prevent duplicate removal.
+    - After URL de-dup, always run title_norm de-dup across all rows.
+    This restores the expected 250~350 duplicate reduction range.
+    """
     if df.empty:
         log("뉴스 중복 제거 skip: 0 rows")
         return df
 
     before = len(df)
     result = df.copy()
-    result["url_norm"] = result["URL"].apply(normalize_url)
+    result["dedup_url_source"] = result.apply(best_link_for_dedup, axis=1)
+    result["url_norm"] = result["dedup_url_source"].apply(normalize_url)
     result["title_norm"] = result["Headline"].apply(normalize_title)
 
-    has_url = result[result["url_norm"] != ""].copy()
-    no_url = result[result["url_norm"] == ""].copy()
+    result = result.sort_values(["Score", "FilterDate"], ascending=[False, False])
 
-    has_url = has_url.sort_values(["Score", "FilterDate"], ascending=[False, False])
-    has_url = has_url.drop_duplicates(subset=["url_norm"], keep="first")
-
-    no_url = no_url.sort_values(["Score", "FilterDate"], ascending=[False, False])
-    no_url = no_url.drop_duplicates(subset=["title_norm"], keep="first")
-
+    # 1차: URL 기준 중복 제거. URL이 없는 건은 title 기준으로 처리.
+    has_url = result[result["url_norm"] != ""].drop_duplicates(subset=["url_norm"], keep="first")
+    no_url = result[result["url_norm"] == ""].drop_duplicates(subset=["title_norm"], keep="first")
     result = pd.concat([has_url, no_url], ignore_index=True, sort=False)
+
+    # 2차: 동일 기사 제목이 Naver/Google/RSS/portal별로 남는 것을 제거.
+    result = result.sort_values(["Score", "FilterDate"], ascending=[False, False])
+    result = result.drop_duplicates(subset=["title_norm"], keep="first")
+    result = result.drop(columns=["dedup_url_source"], errors="ignore")
     result = result.sort_values(["Score", "FilterDate"], ascending=[False, False]).reset_index(drop=True)
 
     log(f"뉴스 중복 제거: {before - len(result)}")
     return result
-
 
 def make_issue_cluster_key(row: pd.Series) -> str:
     issue = clean(row.get("IssueKey", "")) or "TRADE_GENERAL"
@@ -1274,6 +1511,10 @@ def assign_tier_and_reasons(df: pd.DataFrame) -> pd.DataFrame:
         samsung = clean(row.get("SamsungSignal", ""))
         product_samsung = has_product_samsung_signal(samsung)
         major_notice_policy = is_major_tariff_regulation_news(row)
+        unresolved_google = clean(row.get("URLRestoreStatus", "")) == "GOOGLE_UNRESOLVED"
+        standalone_noise = has_standalone_noise_signal(row)
+        review_signal = has_step4_review_signal(row)
+        ad_cvd_forced = contains_any(analysis_text(row), AD_CVD_FORCE_TERMS)
 
         reasons = []
         rejects = []
@@ -1286,6 +1527,14 @@ def assign_tier_and_reasons(df: pd.DataFrame) -> pd.DataFrame:
             reasons.append("keyword_match")
         if major_notice_policy:
             reasons.append("notice_news_tariff_regulation")
+        if unresolved_google:
+            reasons.append("google_url_unresolved")
+        if standalone_noise:
+            reasons.append("standalone_keyword_noise_penalty")
+        if review_signal:
+            reasons.append("step4_review_upgrade_signal")
+        if ad_cvd_forced:
+            reasons.append("ad_cvd_forced")
 
         if issue == "TRADE_GENERAL":
             tier = "REFERENCE" if score >= MIN_SCORE else "REJECT"
@@ -1295,6 +1544,8 @@ def assign_tier_and_reasons(df: pd.DataFrame) -> pd.DataFrame:
             score >= 70
             and (product_samsung or score >= 80)
             and issue in ["TARIFF", "AD_CVD", "EXPORT_CONTROL", "CBAM_CARBON", "ORIGIN_FTA"]
+            and not unresolved_google
+            and not standalone_noise
         ):
             tier = "CORE"
         elif score >= 45:
@@ -1308,6 +1559,10 @@ def assign_tier_and_reasons(df: pd.DataFrame) -> pd.DataFrame:
         if issue == "CUSTOMS" and not product_samsung and tier == "CORE":
             tier = "USABLE"
         if major_notice_policy and tier == "REFERENCE" and score >= MIN_SCORE:
+            tier = "USABLE"
+        if review_signal and tier == "REFERENCE" and score >= MIN_SCORE:
+            tier = "USABLE"
+        if ad_cvd_forced and tier == "REFERENCE" and score >= MIN_SCORE:
             tier = "USABLE"
 
         tiers.append(tier)
@@ -1360,10 +1615,22 @@ def enforce_tier_buckets(df: pd.DataFrame) -> pd.DataFrame:
     result["TierOriginal"] = result["Tier"]
 
     result.loc[:, "Tier"] = "REFERENCE"
-    if core_end > 0:
-        result.loc[result.index[:core_end], "Tier"] = "CORE"
-    if usable_end > core_end:
-        result.loc[result.index[core_end:usable_end], "Tier"] = "USABLE"
+    core_candidates = [
+        idx for idx, row in result.iterrows()
+        if clean(row.get("TierOriginal", "")) == "CORE"
+        and clean(row.get("URLRestoreStatus", "")) != "GOOGLE_UNRESOLVED"
+        and not has_standalone_noise_signal(row)
+    ]
+    core_selected = core_candidates[:core_end]
+    if core_selected:
+        result.loc[core_selected, "Tier"] = "CORE"
+
+    non_core = [idx for idx in result.index if idx not in set(core_selected)]
+    usable_slots = min(TIER_USABLE_LIMIT, len(non_core))
+    if usable_slots > 0:
+        result.loc[non_core[:usable_slots], "Tier"] = "USABLE"
+
+    bucket_note = []
 
     # SelectReason에 강제 배분 흔적을 남겨 감사 가능하게 함
     bucket_note = []
@@ -1404,6 +1671,9 @@ def finalize(df: pd.DataFrame) -> pd.DataFrame:
     final["CollectedAt"] = pd.to_datetime(result["CollectedAt"], errors="coerce").dt.strftime("%Y-%m-%d %H:%M:%S")
     final["Headline"] = result["Headline"]
     final["URL"] = result["URL"]
+    final["GoogleURL"] = result["GoogleURL"] if "GoogleURL" in result.columns else ""
+    final["OriginalURLCandidate"] = result["OriginalURLCandidate"] if "OriginalURLCandidate" in result.columns else ""
+    final["BestLinkURL"] = result["BestLinkURL"] if "BestLinkURL" in result.columns else result["URL"]
     final["Country"] = result["Country"]
     final["Agency"] = result["Agency"]
     final["Risk"] = result["Risk"]
@@ -1434,6 +1704,9 @@ def finalize(df: pd.DataFrame) -> pd.DataFrame:
     final["Publisher"] = result["Publisher"]
     final["Importance"] = result["Importance"]
     final["Category"] = result["Category"]
+    final["URLRestoreStatus"] = result.get("URLRestoreStatus", "")
+    final["Step4Hint"] = result.get("Step4Hint", "")
+    final["SourceScoreReason"] = result.get("SourceScoreReason", "")
 
     return final[FINAL_COLS].reset_index(drop=True)
 
@@ -1508,6 +1781,18 @@ def standardize_cumulative_columns(df: pd.DataFrame) -> pd.DataFrame:
             rename_map[col] = "Importance"
         elif lower == "category":
             rename_map[col] = "Category"
+        elif lower in ["googleurl", "google_url"]:
+            rename_map[col] = "GoogleURL"
+        elif lower in ["originalurlcandidate", "original_url_candidate", "original_url", "article_url"]:
+            rename_map[col] = "OriginalURLCandidate"
+        elif lower in ["bestlinkurl", "best_link_url", "article_link", "report_url"]:
+            rename_map[col] = "BestLinkURL"
+        elif lower in ["urlrestorestatus", "url_restore_status"]:
+            rename_map[col] = "URLRestoreStatus"
+        elif lower in ["step4hint", "step4_hint"]:
+            rename_map[col] = "Step4Hint"
+        elif lower in ["sourcescorereason", "source_score_reason", "score_reason"]:
+            rename_map[col] = "SourceScoreReason"
 
     result = result.rename(columns=rename_map)
     result = result.loc[:, ~result.columns.duplicated()]
@@ -1520,20 +1805,12 @@ def standardize_cumulative_columns(df: pd.DataFrame) -> pd.DataFrame:
 
 
 def make_merge_key(row: pd.Series) -> str:
-    """Cumulative 비교 키는 URL만 사용한다.
-
-    GTI 구조 원칙:
-      - STEP1/STEP2/STEP3 cumulative는 URL 기준으로만 누적 중복을 제거한다.
-      - 제목 유사도/동일 이슈 압축은 STEP3 클러스터링에서 처리한다.
-      - Topic 중복과 Samsung Impact 재평가는 STEP4에서 처리한다.
-
-    이유:
-      - 제목 기준 cumulative 중복 제거는 서로 다른 날짜/매체/정책 진행상황을 과도하게 제거할 수 있다.
-      - Reuters/Bloomberg/Yahoo/MSN 등 유사 기사는 당일 STEP3 cluster에서 묶고,
-        누적 파일에서는 URL이 실제로 같은 경우만 제외한다.
-    """
-    url_key = normalize_url(row.get("URL", ""))
-    return url_key
+    """Cumulative key: URL based, but prefer stable original/click link columns."""
+    for col in ["OriginalURLCandidate", "BestLinkURL", "URL", "GoogleURL"]:
+        key = normalize_url(row.get(col, ""))
+        if key:
+            return key
+    return ""
 
 
 def update_cumulative(final_df: pd.DataFrame, cumulative_file: Path) -> pd.DataFrame:

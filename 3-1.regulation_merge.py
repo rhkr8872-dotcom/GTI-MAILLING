@@ -156,8 +156,13 @@ def clean_excel_cell(value, max_len=32000):
         return value
 
     value = ILLEGAL_CHARACTERS_RE.sub("", value)
-    value = re.sub(r"[\x00-\x08\x0B\x0C\x0E-\x1F]", "", value)
-    value = value.replace("\ufeff", "").replace("\u200b", "")
+    value = re.sub(r"[\x00-\x08\x0B\x0C\x0E-\x1F\x7F-\x9F]", "", value)
+    value = (
+        value.replace("\ufeff", "")
+        .replace("\u200b", "")
+        .replace("\u200c", "")
+        .replace("\u200d", "")
+    )
     # Excel 셀 최대 32,767자. 여유를 두고 32,000자로 제한.
     if max_len and len(value) > max_len:
         value = value[:max_len] + " ...[TRUNCATED_FOR_EXCEL]"
@@ -170,8 +175,7 @@ def sanitize_dataframe_for_excel(df):
         return pd.DataFrame()
     out = df.copy()
     for col in out.columns:
-        if out[col].dtype == "object":
-            out[col] = out[col].map(clean_excel_cell)
+        out[col] = out[col].map(clean_excel_cell)
     # 컬럼명에도 불법문자 방어
     out.columns = [str(clean_excel_cell(c, max_len=200)) for c in out.columns]
     return out
@@ -450,6 +454,65 @@ def add_hints(df):
     df["tariff_rate_hint"] = [hint_rate(x) for x in bodies]
     return df
 
+
+def article_quality_rank(row):
+    """Higher is better: fetched article text should beat metadata fallback."""
+    source = s(row.get("article_body_source", "")).upper()
+    ok = s(row.get("article_body_ok", "")).upper()
+    chars = to_num(row.get("article_body_chars"), 0)
+    status = s(row.get("article_quality_status", "")).upper()
+
+    if source in {"FETCHED_HTML", "EXISTING"} and ok == "Y":
+        if chars >= 1200:
+            return 100
+        if chars >= 500:
+            return 92
+        return 84
+    if source in {"OFFICIAL_METADATA_FALLBACK"} and ok == "Y":
+        return 78
+    if source in {"INPUT_FALLBACK"} and ok == "Y":
+        if chars >= 500:
+            return 64
+        return 55
+    if "FALLBACK" in status and ok == "Y":
+        return 50
+    return 0
+
+
+def step4_body_penalty(row):
+    rank = article_quality_rank(row)
+    source = s(row.get("article_body_source", "")).upper()
+    ok = s(row.get("article_body_ok", "")).upper()
+
+    if ok != "Y":
+        return -45
+    if source == "INPUT_FALLBACK":
+        return -18
+    if rank < 70:
+        return -12
+    return 0
+
+
+def step4_body_hint(row):
+    source = s(row.get("article_body_source", "")).upper()
+    ok = s(row.get("article_body_ok", "")).upper()
+    status = s(row.get("article_extract_status", ""))
+    hints = []
+
+    if ok != "Y":
+        hints.append("body_missing_step4_exclude_or_heavy_discount")
+    elif source == "INPUT_FALLBACK":
+        hints.append("metadata_fallback_step4_discount")
+    elif source in {"FETCHED_HTML", "EXISTING"}:
+        hints.append("full_body_available")
+    elif "FALLBACK" in source:
+        hints.append("fallback_body_review")
+
+    if "GOOGLE" in status.upper() or "EMPTY_URL" in status.upper():
+        hints.append("url_or_google_resolution_issue")
+
+    return "; ".join(hints)
+
 # -----------------------------------------------------------------------------
 # INPUT LOAD
 # -----------------------------------------------------------------------------
@@ -527,6 +590,9 @@ def process_articles(df, is_regulation=False):
         "article_quality_status": "",
         "article_body_source": "",
         "article_body_chars": 0,
+        "article_quality_rank": 0,
+        "step4_body_penalty": 0,
+        "step4_body_hint": "",
         "article_last_checked": "",
     }
     df = ensure_columns(df, defaults)
@@ -543,6 +609,9 @@ def process_articles(df, is_regulation=False):
         r["article_quality_status"] = qstat
         r["article_body_source"] = bsource
         r["article_body_chars"] = chars
+        r["article_quality_rank"] = article_quality_rank(pd.Series(r))
+        r["step4_body_penalty"] = step4_body_penalty(pd.Series(r))
+        r["step4_body_hint"] = step4_body_hint(pd.Series(r))
         r["article_last_checked"] = now_str()
         rows.append(r)
         if not is_regulation and len(rows) % 25 == 0:
@@ -687,6 +756,15 @@ def representative_score(row):
     score += to_num(row.get("TopicScore"), 0) * 2
     score += to_num(row.get("SamsungImpactScore"), 0) * 2
     score += source_priority(row) * 3
+    quality_rank = article_quality_rank(row)
+    body_source = s(row.get("article_body_source", "")).upper()
+    score += quality_rank * 5
+    if body_source in {"FETCHED_HTML", "EXISTING"}:
+        score += 260
+    elif body_source == "INPUT_FALLBACK":
+        score -= 120
+    elif s(row.get("article_body_ok")) != "Y":
+        score -= 300
     if s(row.get("article_body_ok")) == "Y":
         score += 180
     score += min(to_num(row.get("article_body_chars"), 0), 8000) / 30
@@ -698,6 +776,8 @@ def representative_score(row):
     dom = domain_of(row.get("URL", ""))
     if "google" in dom:
         score -= 80
+    if s(row.get("URLRestoreStatus", "")).upper() == "GOOGLE_UNRESOLVED":
+        score -= 90
     if "msn" in dom:
         score -= 20
     return score
@@ -740,6 +820,8 @@ def make_cluster_representatives(df):
         rep["RepresentativeReason"] = (
             f"대표기사 선정: FinalScore={s(rep.get('FinalScore'))}, "
             f"SourcePriority={source_priority(rep)}, BodyOK={s(rep.get('article_body_ok'))}, "
+            f"BodySource={s(rep.get('article_body_source'))}, "
+            f"QualityRank={s(rep.get('article_quality_rank'))}, "
             f"ClusterSize={cluster_size}"
         )
         members = []
@@ -750,6 +832,9 @@ def make_cluster_representatives(df):
                 "Source": s(m.get("Agency", "")) or s(m.get("Publisher", "")) or s(m.get("Source", "")),
                 "FinalScore": to_num(m.get("FinalScore"), 0),
                 "BodyOK": s(m.get("article_body_ok", "")),
+                "BodySource": s(m.get("article_body_source", "")),
+                "QualityRank": to_num(m.get("article_quality_rank"), 0),
+                "Step4BodyHint": s(m.get("step4_body_hint", "")),
             })
         rep["ClusterMembersJSON"] = json.dumps(members, ensure_ascii=False)
         rep_rows.append(rep)
@@ -775,7 +860,7 @@ def make_cluster_representatives(df):
         if c in reps.columns:
             reps[f"_{c}_sort"] = reps[c].astype(str).str.upper().map(lambda x: 1 if x == "CORE" else 0)
             sort_cols.append(f"_{c}_sort")
-    for c in ["FinalScore", "Score", "ClusterSize", "article_body_chars"]:
+    for c in ["FinalScore", "Score", "ClusterSize", "article_quality_rank", "article_body_chars"]:
         if c in reps.columns:
             sort_cols.append(c)
     if sort_cols:
@@ -826,7 +911,8 @@ def main():
     fallback = int((news2.get("article_body_source", "") == "INPUT_FALLBACK").sum())
     google_unresolved = int(news2.get("article_extract_status", pd.Series(dtype=str)).astype(str).str.contains("GOOGLE|google|alerts|EMPTY_URL", na=False).sum())
     bad = before_rows - body_ok
-    log(f"[NEWS-BEFORE-CLUSTER] rows={before_rows}, body_ok={body_ok}, fetched_ok={fetched}, fallback_ok={fallback}, google_unresolved={google_unresolved}, bad_or_empty={bad}")
+    step4_discount = int(news2.get("step4_body_penalty", pd.Series(dtype=int)).astype(str).ne("0").sum())
+    log(f"[NEWS-BEFORE-CLUSTER] rows={before_rows}, body_ok={body_ok}, fetched_ok={fetched}, fallback_ok={fallback}, google_unresolved={google_unresolved}, bad_or_empty={bad}, step4_body_discount={step4_discount}")
 
     reps, audit = make_cluster_representatives(news2)
     after_rows = len(reps)
@@ -842,10 +928,11 @@ def main():
     fetched2 = int((reps.get("article_body_source", "") == "FETCHED_HTML").sum()) if not reps.empty else 0
     fallback2 = int((reps.get("article_body_source", "") == "INPUT_FALLBACK").sum()) if not reps.empty else 0
     bad2 = after_rows - body_ok2
+    step4_discount2 = int(reps.get("step4_body_penalty", pd.Series(dtype=int)).astype(str).ne("0").sum()) if not reps.empty else 0
 
     log(f"[NEWS-REP-CLUSTER] before={before_rows}, after={after_rows}, reduced={reduced}, reduction_rate={rate:.1f}%")
     log(f"[NEWS-REP-CLUSTER] clustered_groups={clustered_groups}, max_cluster_size={max_cluster}")
-    log(f"[NEWS] rows={after_rows}, body_ok={body_ok2}, fetched_ok={fetched2}, fallback_ok={fallback2}, bad_or_empty={bad2}")
+    log(f"[NEWS] rows={after_rows}, body_ok={body_ok2}, fetched_ok={fetched2}, fallback_ok={fallback2}, bad_or_empty={bad2}, step4_body_discount={step4_discount2}")
     log("STEP3 DONE")
 
 

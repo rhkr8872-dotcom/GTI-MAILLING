@@ -1,3 +1,4 @@
+
 # 7.run_gti_pipeline.py
 # -*- coding: utf-8 -*-
 """
@@ -58,16 +59,10 @@ STAGE_1 = [
 STAGE_2 = [
     Step("STEP2_NAVER", "2-1.naver_news_collector.py", required=False, expected_outputs=("2-1.naver_news_raw.xlsx",)),
     Step("STEP2_GOOGLE", "2-2.google_news_collector.py", required=False, expected_outputs=("2-2.google_news_raw.xlsx",)),
-    Step("STEP2_RSS", "2-3._rss_news_raw.py", required=False, expected_outputs=("2-3.rss_news_raw.xlsx",)),
+    Step("STEP2_RSS", "2-3.rss_news_raw.py", required=False, expected_outputs=("2-3.rss_news_raw.xlsx",)),
 ]
 
 STAGE_3 = [
-    Step(
-        "STEP3_1_REGULATION_MERGE",
-        "3-1.regulation_merge.py",
-        required=True,
-        expected_outputs=("3-1.regulation_summary.xlsx", "3-1.regulation_cumulative.xlsx"),
-    ),
     Step(
         "STEP3_2_NEWS_MERGE",
         "3-2.news_merge.py",
@@ -76,12 +71,16 @@ STAGE_3 = [
     ),
 ]
 
-STAGE_3_1_ARTICLE = [
+STAGE_3_ARTICLE = [
     Step(
-        "STEP3_1_ARTICLE_EXTRACTOR",
-        "3-1.article_extractor.py",
+        "STEP3_ARTICLE_SUMMARY",
+        "3-1.regulation_merge.py",
         required=True,
-        expected_outputs=("3-1.regulation_article_summary.xlsx", "3-2.news_article_summary.xlsx"),
+        expected_outputs=(
+            "3-1.regulation_article_summary.xlsx",
+            "3-2.news_article_summary.xlsx",
+            "3-2.news_article_cluster_audit.xlsx",
+        ),
     ),
 ]
 
@@ -103,10 +102,17 @@ STAGE_4 = [
 STAGE_5 = [
     Step(
         "STEP5_MAIL_ENGINE",
-        "5.GTI_Mail Engine.py",
+        "5.GTI_Mail_Engine.py",
         required=True,
         expected_outputs=(),
-        args=("--input", str(MAIL_INPUT_FILE), "--output-dir", str(MAIL_OUTPUT_DIR)),
+        args=(
+            "--regulation-input",
+            str(BASE_DIR / "4-1.regulation_ai_summary.xlsx"),
+            "--news-input",
+            str(BASE_DIR / "4-2.news_ai_summary.xlsx"),
+            "--output-dir",
+            str(MAIL_OUTPUT_DIR),
+        ),
     ),
 ]
 
@@ -230,7 +236,7 @@ def run_script(step: Step, python_exe: str, dry_run: bool = False) -> str:
 
     if result.returncode != 0:
         log(f"{step.name} FAILED : return_code={result.returncode} / {elapsed} sec")
-        return "FAILED"
+        return "FAILED" if step.required else "WARNING"
 
     ok, bad_outputs = validate_outputs(step)
     if not ok:
@@ -443,8 +449,8 @@ def main() -> int:
     stages = [
         ("STAGE 1 - SITE LAW/NEWS CRAWL", STAGE_1),
         ("STAGE 2 - NEWS COLLECTORS", STAGE_2),
-        ("STAGE 3 - LAW/NEWS MERGE", STAGE_3),
-        ("STAGE 3-1 - ARTICLE EXTRACTION", STAGE_3_1_ARTICLE),
+        ("STAGE 3 - NEWS MERGE", STAGE_3),
+        ("STAGE 3-1 - LAW/NEWS ARTICLE SUMMARY", STAGE_3_ARTICLE),
         ("STAGE 4 - LAW/NEWS AI ANALYSIS", STAGE_4),
     ]
 

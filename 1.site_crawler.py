@@ -2439,6 +2439,45 @@ def get_recent_post_col(df):
     return None
 
 
+def prepare_sites_dataframe(sites):
+    """Normalize sites.xlsx after manual edits.
+
+    The workbook is managed as one sheet. When helper columns such as
+    policy_type.1/site_type.1 exist, fill blanks in the primary columns first
+    and then remove helper columns. track is the routing source of truth.
+    """
+    sites = sites.copy()
+
+    for base_col in ["policy_type", "site_type"]:
+        helper_col = f"{base_col}.1"
+        if helper_col in sites.columns:
+            if base_col not in sites.columns:
+                sites[base_col] = sites[helper_col]
+            else:
+                base_blank = sites[base_col].isna() | sites[base_col].astype(str).str.strip().eq("")
+                sites.loc[base_blank, base_col] = sites.loc[base_blank, helper_col]
+
+    drop_cols = [
+        c for c in sites.columns
+        if str(c).startswith("Unnamed") or str(c).endswith(".1")
+    ]
+    if drop_cols:
+        sites = sites.drop(columns=drop_cols, errors="ignore")
+
+    for col in ["track", "official_flag", "priority_group", "must_keep"]:
+        if col not in sites.columns:
+            sites[col] = ""
+
+    if "site_type" not in sites.columns:
+        sites["site_type"] = ""
+
+    track = sites["track"].fillna("").astype(str).str.strip().str.lower()
+    track_valid = track.isin(["regulation", "news"])
+    sites.loc[track_valid, "site_type"] = track[track_valid]
+
+    return sites
+
+
 def apply_site_recent_date(start_idx, agency, site_type, site_recent_dt):
     if site_type != "news" or not site_recent_dt or not is_recent(site_recent_dt):
         return
@@ -2535,7 +2574,7 @@ def split_final_rows(df, keyword_terms=None):
     return final, excluded
 
 def main():
-    print("🚀 GTI STEP1 SITES MODE START")
+    print("🚀 GTI STEP1 REGULATION-ONLY MODE START")
 
     BASE_DIR.mkdir(parents=True, exist_ok=True)
 
@@ -2543,9 +2582,7 @@ def main():
         print(f"❌ sites.xlsx 없음: {SITE_FILE}")
         return
 
-    sites = pd.read_excel(SITE_FILE)
-    sites = sites.loc[:, ~sites.columns.astype(str).str.contains("^Unnamed")]
-    sites = sites.loc[:, ~sites.columns.astype(str).str.endswith(".1")]
+    sites = prepare_sites_dataframe(pd.read_excel(SITE_FILE))
 
     for col in ["parser", "site_type", "collected_count", "total_collected", "last_checked", "status"]:
         if col not in sites.columns:
@@ -2585,6 +2622,16 @@ def main():
         sites.at[idx, "type"] = type_value
         sites.at[idx, "parser"] = parser
         sites.at[idx, "site_type"] = site_type
+
+        # STEP1 is now regulation-only.
+        # News/site bulletin collection has moved to STEP2-3.
+        if normalize_site_type(site_type) != "regulation":
+            skipped_count += 1
+            sites.at[idx, "collected_count"] = 0
+            sites.at[idx, "last_checked"] = now_str()
+            sites.at[idx, "status"] = "SKIP_NEWS_MOVED_TO_STEP2_3"
+            print(f"[SKIP] news moved to STEP2-3: {site_name}")
+            continue
 
         if not source_url.startswith("http"):
             count = 0
@@ -2649,7 +2696,7 @@ def main():
             print(f"   ERROR: {e}")
             count = 0
 
-        if count == 0:
+        if count == 0 and parser not in {"gwanbo_parser", "gwanbo_selenium_parser"}:
             hint_count = crawl_site_hint(row, source_url, agency, site_type)
             if hint_count > 0:
                 print(f"   [HINT FALLBACK] 최근게시일 기준 {hint_count}건")
@@ -2720,9 +2767,24 @@ def main():
 
     audit_df = df.copy()
     final_df, excluded_df = split_final_rows(df, keyword_terms)
-    final_df, cumulative_excluded_df = split_cumulative_new_rows(final_df, cumulative_keys)
-    if not cumulative_excluded_df.empty:
-        excluded_df = pd.concat([excluded_df, cumulative_excluded_df], ignore_index=True, sort=False)
+
+    # GTI 운영 원칙 변경(2026-06-07):
+    # 1.site 단계의 raw 파일은 "최근 24시간 수집분"을 보존해야 한다.
+    # cumulative 중복은 메일/누적 관리용 참고정보일 뿐, raw 저장 제외 사유가 아니다.
+    # 따라서 기존 split_cumulative_new_rows()로 final_df에서 제거하지 않고
+    # is_cumulative_duplicate 컬럼만 부여한다.
+    if final_df.empty:
+        cumulative_excluded_df = final_df.copy()
+        final_df["is_cumulative_duplicate"] = ""
+    else:
+        final_df = final_df.copy()
+        final_df["_norm_url_for_cumulative"] = final_df["url"].map(normalize_url_for_compare)
+        final_df["is_cumulative_duplicate"] = final_df["_norm_url_for_cumulative"].apply(
+            lambda x: "Y" if x and x in cumulative_keys else "N"
+        )
+        cumulative_excluded_df = final_df[final_df["is_cumulative_duplicate"] == "Y"].copy()
+        final_df.drop(columns=["_norm_url_for_cumulative"], inplace=True, errors="ignore")
+
     final_count = len(final_df)
     final_filter_removed = len(excluded_df)
     cumulative_dedup_removed = len(cumulative_excluded_df)
@@ -2730,6 +2792,7 @@ def main():
     try:
         audit_df.to_excel(OUT_AUDIT_FILE, index=False)
         save_split_files(final_df)
+        # cumulative 파일은 이력/중복판정용으로만 갱신한다. raw 저장 건수에는 영향 없음.
         update_cumulative_file(final_df)
         if not excluded_df.empty:
             excluded_df.to_excel(FINAL_EXCLUDED_FILE, index=False)
@@ -2751,13 +2814,13 @@ def main():
     print(f"📌 inactive skip: {skipped_count}")
     print(f"📊 RAW 수집: {raw_count}")
     print(f"🧹 중복 제거: {dup_removed}")
-    print(f"🧹 최종/누적 필터 제외: {final_filter_removed}")
-    print(f"🧹 누적 중복 제외: {cumulative_dedup_removed}")
-    print(f"✅ 최종 신규 저장: {final_count}")
-    print(f"📁 전체 파일: {OUT_ALL_FILE}")
+    print(f"🧹 최종 필터 제외(누적 제외 미포함): {final_filter_removed}")
+    print(f"🧾 누적 중복 표시만(Y): {cumulative_dedup_removed}")
+    print(f"✅ 최근 24시간 최종 저장: {final_count}")
+    print(f"📁 법규 전체 파일: {OUT_ALL_FILE}")
     print(f"📁 감사 파일: {OUT_AUDIT_FILE}")
     print(f"📁 법규 파일: {OUT_REG_FILE}")
-    print(f"📁 뉴스 파일: {OUT_NEWS_FILE}")
+    print(f"📁 뉴스 파일: {OUT_NEWS_FILE} (empty compatibility file; site/news moved to STEP2-3)")
     print(f"📁 최종 제외 파일: {FINAL_EXCLUDED_FILE}")
     print(f"🧾 제외 로그: {REJECT_FILE}")
     print(f"📊 RAW 증가: {len(results) - total_before}")
@@ -3195,6 +3258,7 @@ _previous_save_split_files = save_split_files
 
 def save_split_files(df):
     enhanced = enhance_regulation_rows(df)
+    enhanced = enhanced[enhanced["site_type"] == "regulation"].copy()
     enhanced.to_excel(OUT_ALL_FILE, index=False)
 
     reg = enhanced[enhanced["site_type"] == "regulation"].copy()
@@ -3207,7 +3271,8 @@ def save_split_files(df):
             reg = reg.sort_values(sort_cols, ascending=ascending, kind="stable")
 
     reg.to_excel(OUT_REG_FILE, index=False)
-    news.to_excel(OUT_NEWS_FILE, index=False)
+    # Compatibility only. Site/news collection is now handled by STEP2-3.
+    news.head(0).to_excel(OUT_NEWS_FILE, index=False)
 
     if "protected_regulation_candidate" in enhanced.columns:
         review = enhanced[enhanced["protected_regulation_candidate"].fillna("").astype(str).eq("Y")].copy()
@@ -3216,6 +3281,163 @@ def save_split_files(df):
                 review.to_excel(OUT_REG_REVIEW_FILE, index=False)
             except Exception as e:
                 print(f"[REG REVIEW SAVE WARN] skipped: {OUT_REG_REVIEW_FILE} / {e}")
+
+
+def parse_gwanbo_text(text, source_url, agency, site_type, page_date):
+    """Robust Korean gazette parser.
+
+    The original parser can fail when Korean regex literals are damaged by
+    encoding display issues. This version uses explicit Unicode ranges and
+    refuses to create diagnostic/menu rows.
+    """
+    before = len(results)
+    text = clean_text(text)
+    if not text:
+        return 0
+
+    bad_terms = [
+        "\ucd5c\uc2e0 \uac8c\uc2dc\ubb3c \ud655\uc778 \ud544\uc694",
+        "\uad00\ubcf4\ubcf4\uae30",
+        "\ubaa9\ucc28 \ub2e4\uc6b4\ub85c\ub4dc",
+        "\uc804\uccb4 \ub2e4\uc6b4\ub85c\ub4dc",
+        "\ub9c8\uc774\ud398\uc774\uc9c0",
+    ]
+
+    patterns = [
+        r"([가-힣A-Za-z0-9ㆍ·\.\-\s]{1,80}(?:법률|대통령령|총리령|부령|고시|공고|훈령|예규)제?\s*\d{4}[-–]?\d{0,5}호\s*\([^)]{2,180}\)?)",
+        r"([가-힣A-Za-z0-9ㆍ·\.\-\s]{1,80}(?:법률|대통령령|총리령|부령|고시|공고|훈령|예규)제?\s*\d{1,5}호\s*\([^)]{2,180}\)?)",
+    ]
+
+    seen = set()
+    for pattern in patterns:
+        for match in re.finditer(pattern, text):
+            title = clean_text(match.group(1))
+            if len(title) < 10 or len(title) > MAX_TITLE_LEN:
+                continue
+            if any(term in title for term in bad_terms):
+                continue
+            if is_menu_or_category_link(title, source_url, source_url):
+                continue
+
+            title = re.sub(r"\s+", " ", title).strip()
+            key = title.lower()
+            if key in seen:
+                continue
+            seen.add(key)
+
+            item_url = f"{source_url}?gwanboDate={page_date:%Y%m%d}&gwanboTitle={quote(title[:160])}"
+            add_result(page_date, title, item_url, source_url, agency, site_type)
+            if len(seen) >= MAX_GWANBO_ITEMS:
+                break
+
+    return len(results) - before
+
+
+def crawl_gwanbo_requests(source_url, agency, site_type):
+    before = len(results)
+    res = fetch_html(source_url)
+    if not res:
+        return 0
+
+    soup = BeautifulSoup(res.text, "html.parser")
+    text = clean_text(soup.get_text("\n", strip=True))
+    page_date = extract_date_from_text(text) or datetime.now()
+    count = parse_gwanbo_text(text, source_url, agency, site_type, page_date)
+    if count == 0:
+        print("   [GWANBO WARN] no gazette item parsed; diagnostic fallback suppressed")
+    return len(results) - before
+
+
+def crawl_gwanbo(source_url, agency, site_type):
+    return crawl_gwanbo_selenium(source_url, agency, site_type)
+
+
+TRADE_REMEDY_REVIEW_TERMS = [
+    "\ub364\ud551", "\ubc18\ub364\ud551", "\uc0c1\uacc4\uad00\uc138",
+    "\ub364\ud551\ubc29\uc9c0\uad00\uc138", "\ubb34\uc5ed\uc704\uc6d0\ud68c",
+    "\ubb34\uc5ed\uad6c\uc81c", "\uc0b0\uc5c5\ud53c\ud574\uc870\uc0ac",
+    "anti-dumping", "antidumping", "countervailing", "trade remedy",
+    "safeguard", "ad/cvd", "dumping",
+]
+
+TRADE_REMEDY_OFFICIAL_HINTS = [
+    "law.go.kr", "unipass.customs.go.kr", "customs.go.kr", "gwanbo.go.kr",
+    "clhs.co.kr", "krcaa.or.kr", "motie.go.kr", "mofa.go.kr",
+]
+
+
+def is_trade_remedy_review_candidate(row, exclude_reason=""):
+    reason = str(exclude_reason or "").lower()
+    if "date_status=old_date" not in reason and "date_status=no_date" not in reason:
+        return False, "", 0
+    if any(block in reason for block in PROTECTED_BLOCK_REASONS):
+        return False, "", 0
+
+    text = " ".join([
+        clean_text(row.get("title", "")),
+        clean_text(row.get("url", "")),
+        clean_text(row.get("source", "")),
+        clean_text(row.get("agency", "")),
+        clean_text(row.get("matched_policy_terms", "")),
+    ]).lower()
+
+    term_hits = [t for t in TRADE_REMEDY_REVIEW_TERMS if t.lower() in text]
+    official_hits = [h for h in TRADE_REMEDY_OFFICIAL_HINTS if h in text]
+    if not term_hits:
+        return False, "", 0
+
+    score = min(100, 45 + len(term_hits) * 12 + len(official_hits) * 10)
+    keep = score >= 55
+    reason_text = "; ".join([
+        "review_trade_remedy_old_or_no_date",
+        f"score={score}",
+        "terms=" + ",".join(term_hits[:8]),
+        "official_hints=" + ",".join(official_hits[:5]) if official_hits else "",
+        f"original_exclude={exclude_reason}",
+    ])
+    reason_text = "; ".join([x for x in reason_text.split("; ") if x])
+    return keep, reason_text, score
+
+
+_protected_split_final_rows = split_final_rows
+
+
+def split_final_rows(df, keyword_terms=None):
+    final, excluded = _protected_split_final_rows(df, keyword_terms)
+    if excluded is None or excluded.empty:
+        return final, excluded
+
+    review_rows = []
+    for _, row in excluded.iterrows():
+        reason = clean_text(row.get("_final_exclude_reason", ""))
+        keep, keep_reason, keep_score = is_trade_remedy_review_candidate(row, reason)
+        if not keep:
+            continue
+        review_copy = row.copy()
+        review_copy["site_type"] = "regulation"
+        review_copy["date_quality"] = clean_text(row.get("date_status", "")) or "unknown"
+        review_copy["protected_regulation_candidate"] = "REVIEW_AD_CVD_OLD_DATE"
+        review_copy["protected_regulation_score"] = keep_score
+        review_copy["protected_regulation_reason"] = keep_reason
+        review_copy["step1_relevance_status"] = "REVIEW_TRADE_REMEDY_OLD_DATE"
+        review_rows.append(review_copy)
+
+    if review_rows:
+        review_df = pd.DataFrame(review_rows)
+        try:
+            if OUT_REG_REVIEW_FILE.exists():
+                old_review = pd.read_excel(OUT_REG_REVIEW_FILE)
+                review_df = pd.concat([old_review, review_df], ignore_index=True, sort=False)
+                if "url" in review_df.columns:
+                    review_df["_norm_url"] = review_df["url"].map(normalize_url_for_compare)
+                    review_df = review_df.drop_duplicates(subset=["_norm_url"], keep="first")
+                    review_df = review_df.drop(columns=["_norm_url"], errors="ignore")
+            review_df.to_excel(OUT_REG_REVIEW_FILE, index=False)
+            print(f"[REG REVIEW SAVE] trade remedy old/no-date candidates appended: {len(review_rows)}")
+        except Exception as e:
+            print(f"[REG REVIEW SAVE WARN] trade remedy review skipped: {OUT_REG_REVIEW_FILE} / {e}")
+
+    return final, excluded
 
 
 if __name__ == "__main__":

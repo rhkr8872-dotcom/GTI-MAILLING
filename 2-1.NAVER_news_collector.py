@@ -214,10 +214,61 @@ SPECIFIC_CRITICAL_TERMS = [
     "section 301", "301조", "232조", "cbam", "수출통제", "전략물자", "반덤핑", "상계관세", "세이프가드",
 ]
 
+BIS_KEYWORDS = ["bis"]
+
+BIS_EXPORT_CONTROL_CONTEXT = [
+    "export control", "export controls", "commerce department", "department of commerce",
+    "bureau of industry and security", "industry and security", "entity list", "denied persons",
+    "수출통제", "수출 통제", "산업안보국", "산업보안국", "미 상무부", "미국 상무부",
+    "상무부 산업안보국", "상무부 산업보안국", "전략물자", "제재", "중국 기업",
+    "ai chip", "ai chips", "ai 칩", "첨단 칩", "반도체",
+]
+
+BIS_FINANCE_NOISE_CONTEXT = [
+    "bis 자기자본", "bis비율", "bis 비율", "자기자본비율", "국제결제은행",
+    "저축은행", "은행", "금융지주", "자본비율", "건전성", "bank for international settlements",
+]
+
+BROAD_WEAK_KEYWORDS = [
+    "통상", "세관", "수출입", "수출", "수입", "무역",
+    "customs", "trade", "import", "export",
+]
+
+TRADE_REMEDY_KEYWORDS = [
+    "반덤핑", "덤핑방지관세", "덤핑 방지 관세", "상계관세", "상계 관세",
+    "무역구제", "세이프가드", "ad/cvd", "anti-dumping", "antidumping",
+    "countervailing", "countervailing duty", "trade remedy", "safeguard",
+]
+
+
+def keyword_equals_any(keyword, terms):
+    k = normalize_match_text(keyword)
+    return any(k == normalize_match_text(t) for t in terms)
+
 
 def is_broad_keyword(keyword):
     k = normalize_match_text(keyword)
     return any(k == b.lower() for b in BROAD_KEYWORDS)
+
+
+def is_weak_broad_keyword(keyword):
+    return keyword_equals_any(keyword, BROAD_WEAK_KEYWORDS)
+
+
+def is_bis_keyword(keyword):
+    return keyword_equals_any(keyword, BIS_KEYWORDS)
+
+
+def has_bis_export_control_context(text):
+    return contains_any(text, BIS_EXPORT_CONTROL_CONTEXT)
+
+
+def is_bis_finance_noise(text):
+    return contains_any(text, BIS_FINANCE_NOISE_CONTEXT) and not has_bis_export_control_context(text)
+
+
+def is_trade_remedy_candidate(keyword, text):
+    return contains_any(keyword, TRADE_REMEDY_KEYWORDS) or contains_any(text, TRADE_REMEDY_KEYWORDS)
 
 
 def has_strong_policy_context(text):
@@ -259,20 +310,39 @@ def calculate_relevance_score(title, description, keyword, priority):
     """
     text = f"{title} {description}"
     score = int(priority)
+    bis_kw = is_bis_keyword(keyword)
+    trade_remedy = is_trade_remedy_candidate(keyword, text)
+    strong_policy = has_strong_policy_context(text)
+    weak_policy = has_weak_policy_context(text)
+    sector = has_sector_context(text)
 
-    if has_strong_policy_context(text):
+    if strong_policy:
         score += 25
-    elif has_weak_policy_context(text):
+    elif weak_policy:
         score += 10
 
-    if has_sector_context(text):
+    if sector:
         score += 15
 
     if is_specific_critical_keyword(keyword):
         score += 15
 
+    if trade_remedy:
+        score += 35
+
+    if bis_kw:
+        if has_bis_export_control_context(text):
+            score += 25
+        else:
+            score -= 60
+        if is_bis_finance_noise(text):
+            score -= 80
+
     if is_broad_keyword(keyword):
         score -= 10
+
+    if is_weak_broad_keyword(keyword) and not strong_policy:
+        score -= 25
 
     if is_soft_noise_without_policy(text):
         score -= 30
@@ -308,7 +378,19 @@ def should_keep_article(title, description, keyword, priority):
     weak_policy = has_weak_policy_context(text)
     sector = has_sector_context(text)
     broad_kw = is_broad_keyword(keyword)
+    weak_broad_kw = is_weak_broad_keyword(keyword)
     specific_kw = is_specific_critical_keyword(keyword)
+    bis_kw = is_bis_keyword(keyword)
+    trade_remedy = is_trade_remedy_candidate(keyword, text)
+
+    if bis_kw and is_bis_finance_noise(text):
+        return False, "bis_finance_noise"
+
+    if bis_kw and not has_bis_export_control_context(text):
+        return False, "bis_without_export_control_context"
+
+    if trade_remedy:
+        return True, "trade_remedy_forced_candidate"
 
     if priority >= CRITICAL_PRIORITY:
         return True, "critical_priority_candidate"
@@ -318,15 +400,19 @@ def should_keep_article(title, description, keyword, priority):
             return True, "specific_high_priority_candidate"
         if strong_policy:
             return True, "high_priority_with_strong_policy_context"
+        if weak_broad_kw:
+            return False, "broad_keyword_without_strong_policy_context"
         if weak_policy or sector:
             return True, "high_priority_with_weak_policy_or_sector_context"
         if broad_kw:
-            return True, "broad_high_priority_loose_candidate"
+            return False, "broad_high_priority_without_context"
         return True, "high_priority_loose_candidate"
 
     if priority >= MID_PRIORITY:
         if strong_policy:
             return True, "mid_priority_with_strong_policy_context"
+        if weak_broad_kw:
+            return False, "broad_mid_priority_without_strong_policy_context"
         if weak_policy and sector:
             return True, "mid_priority_with_policy_and_sector_context"
         if broad_kw and (weak_policy or sector):
