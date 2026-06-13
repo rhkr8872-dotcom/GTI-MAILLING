@@ -291,6 +291,23 @@ def is_generic_google_main(url: str) -> bool:
     return False
 
 
+def is_real_original_url(url: str) -> bool:
+    u = safe_url(url)
+    if not is_valid_link(u):
+        return False
+    if is_google_article_redirect(u):
+        return False
+    if is_generic_google_main(u):
+        return False
+    try:
+        p = urlparse(u.lower())
+        if "news.google" in p.netloc or "google." in p.netloc:
+            return False
+    except Exception:
+        return False
+    return True
+
+
 def is_google_article_redirect(url: str) -> bool:
     u = clean(url).lower()
     if not u.startswith(("http://", "https://")):
@@ -330,7 +347,7 @@ def load_google_resolve_cache() -> None:
         for _, row in df.iterrows():
             google_url = safe_url(row.get("google_url", ""))
             resolved_url = safe_url(row.get("resolved_url", ""))
-            if google_url and resolved_url:
+            if google_url and is_real_original_url(resolved_url):
                 GOOGLE_RESOLVE_CACHE[google_url] = resolved_url
     except Exception:
         return
@@ -341,7 +358,7 @@ def save_google_resolve_cache() -> None:
         rows = [
             {"google_url": google_url, "resolved_url": resolved_url, "last_checked": datetime.now().strftime("%Y-%m-%d %H:%M:%S")}
             for google_url, resolved_url in GOOGLE_RESOLVE_CACHE.items()
-            if google_url and resolved_url
+            if google_url and is_real_original_url(resolved_url)
         ]
         if rows:
             pd.DataFrame(rows).drop_duplicates(subset=["google_url"], keep="last").to_csv(
@@ -406,7 +423,7 @@ def resolve_google_news_url(url: str) -> str:
             signature, timestamp = fetch_google_decode_params(token)
             if signature and timestamp:
                 resolved = safe_url(decode_google_news_token(token, signature, timestamp))
-                if resolved and is_valid_link(resolved) and not is_google_article_redirect(resolved):
+                if resolved and is_real_original_url(resolved):
                     GOOGLE_RESOLVE_CACHE[u] = resolved
                     save_google_resolve_cache()
                     if GOOGLE_RESOLVE_INTERVAL > 0:
@@ -780,13 +797,21 @@ def resolve_selected_google_links(audit: pd.DataFrame) -> pd.DataFrame:
         current = safe_url(audit.at[idx, "BestLinkURL"] if "BestLinkURL" in audit.columns else audit.at[idx, "URL"])
         if not is_google_article_redirect(current):
             fixed = safe_url(current)
+            if not is_real_original_url(fixed):
+                audit.at[idx, "selected"] = "N"
+                audit.at[idx, "priority_group"] = "EXCLUDED"
+                audit.at[idx, "mail_section"] = "Excluded"
+                audit.at[idx, "Risk"] = "??"
+                audit.at[idx, "final_score"] = min(int(audit.at[idx, "final_score"] or 0), MIN_SELECT_SCORE - 1)
+                audit.at[idx, "RejectReason"] = append_reason(audit.at[idx, "RejectReason"], "non_original_or_google_home_url")
+                continue
             audit.at[idx, "URL"] = fixed
             audit.at[idx, "BestLinkURL"] = fixed
             audit.at[idx, "original_url"] = fixed
             continue
 
         resolved = resolve_google_news_url(current)
-        if resolved:
+        if resolved and is_real_original_url(resolved):
             audit.at[idx, "URL"] = resolved
             audit.at[idx, "BestLinkURL"] = resolved
             audit.at[idx, "original_url"] = resolved

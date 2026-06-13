@@ -129,6 +129,11 @@ INDIRECT_CUSTOMS_TAX_LAW_TERMS = [
     "import vat", "vat exemption", "zero-rated vat",
 ]
 
+POLICY_BRIEFING_NEWS_TERMS = [
+    "정책브리핑", "korea.kr/briefing/pressreleaseview", "pressreleaseview.do",
+    "press release", "보도자료",
+]
+
 BIS_VALID_CONTEXT = [
     "bis", "bureau of industry and security", "department of commerce", "commerce department",
     "entity list", "denied persons", "export control", "수출통제", "산업안보국", "산업보안국",
@@ -286,6 +291,12 @@ def is_indirect_customs_tax_law(row, text):
         return False
     return contains_terms(blob, LEGAL_FORM_TITLE_TERMS) or contains_terms(blob, ["법률안", "일부개정법률안", "개정안"])
 
+def is_policy_briefing_press_release(row):
+    blob = normalize_text(" ".join(clean(row.get(c, "")) for c in [
+        "Headline", "title", "Agency", "agency", "Source", "source", "URL", "url", "original_url",
+    ]))
+    return contains_terms(blob, POLICY_BRIEFING_NEWS_TERMS)
+
 def is_pure_regulation_candidate(row, text, topic):
     t = normalize_text(text)
     headline = normalize_text(row.get("Headline", row.get("title", "")))
@@ -300,6 +311,9 @@ def is_pure_regulation_candidate(row, text, topic):
         "date_status",
     ]))
     blob = " ".join([headline, url, agency, source, official_type, meta, t])
+
+    if is_policy_briefing_press_release(row):
+        return False
 
     if is_unipass_notice_candidate(row):
         return True
@@ -400,8 +414,9 @@ def score_row(row):
     rejects = []
     keyword_hits = soft_trade_keyword_hits(row, text)
     metadata_trade_signal = source_trade_reg_signal(row, text)
+    policy_briefing_news = is_policy_briefing_press_release(row)
     unipass_notice_force = is_unipass_notice_candidate(row)
-    indirect_tax_law_force = is_indirect_customs_tax_law(row, text)
+    indirect_tax_law_force = is_indirect_customs_tax_law(row, text) and not policy_briefing_news
     forced_customs_trade_regulation = unipass_notice_force or indirect_tax_law_force
     strict_trade_signal = has_strict_trade_reg_signal(text, row) or metadata_trade_signal or forced_customs_trade_regulation
     old_ad_cvd_review = is_old_ad_cvd_review(topic, text, age_days)
@@ -418,6 +433,8 @@ def score_row(row):
         rejects.append("event_training_tender_noise")
     if is_general_law_noise(text) and not metadata_trade_signal and not forced_customs_trade_regulation:
         rejects.append("general_law_not_customs_trade")
+    if policy_briefing_news:
+        rejects.append("policy_briefing_press_release_to_news")
     if not strict_trade_signal:
         rejects.append("not_customs_trade_keyword")
     if not pure_regulation:
