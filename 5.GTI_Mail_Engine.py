@@ -881,6 +881,1018 @@ def send_email(html_body: str, attachment: Path) -> None:
     print(f"[MAIL SENT] {len(recipients)} recipients")
 
 
+
+# ======================================================================
+# GTI STEP5 Executive Quality Patch v3
+# ----------------------------------------------------------------------
+# Purpose
+# 1) Re-rank Top3 by Samsung relevance + customs actionability, not keywords only
+# 2) Auto-demote low-relevance items such as wheat/agriculture/general economy to REFERENCE
+# 3) Expand Top3 Deep Analysis into issue summary / Samsung impact / customs impact / risk / action / owner
+# 4) Keep STEP4 selected rows, but improve mail report quality at STEP5
+# ======================================================================
+
+SAMSUNG_RELEVANCE_TERMS = {
+    "high": [
+        "semiconductor", "chip", "memory", "dram", "nand", "hbm", "foundry", "wafer",
+        "반도체", "메모리", "파운드리", "웨이퍼",
+        "display", "oled", "lcd", "디스플레이",
+        "battery", "cell", "cathode", "anode", "lithium", "nickel", "cobalt", "graphite",
+        "배터리", "양극재", "음극재", "리튬", "니켈", "코발트", "흑연",
+        "electronics", "smartphone", "mobile", "tv", "appliance", "home appliance",
+        "전자", "스마트폰", "모바일", "가전", "tv",
+        "pcb", "substrate", "module", "camera module", "sensor", "mlcc",
+        "기판", "모듈", "센서", "mlcc",
+        "rare earth", "gallium", "germanium", "gan", "silicon carbide", "sic",
+        "희토류", "갈륨", "게르마늄", "전략물자",
+        "steel", "aluminum", "copper", "zinc", "cold-rolled", "galvanized",
+        "철강", "알루미늄", "구리", "아연", "냉간압연", "도금강판",
+    ],
+    "medium": [
+        "customs", "tariff", "duty", "origin", "fta", "cbam", "ad/cvd", "anti-dumping",
+        "countervailing", "hs code", "classification", "importer", "export control",
+        "forced labor", "uflpa", "section 301", "section 232", "usmca", "cepa",
+        "관세", "통관", "원산지", "수출통제", "강제노동", "반덤핑", "상계관세",
+        "품목분류", "수입자", "보세", "수입신고", "수출신고",
+    ],
+}
+
+LOW_RELEVANCE_TERMS = [
+    "wheat", "rice", "corn", "soybean", "sugar", "agriculture", "agricultural",
+    "livestock", "pork", "beef", "fishery", "food", "grain", "flour",
+    "밀", "쌀", "옥수수", "농산물", "농업", "축산", "식품", "곡물", "밀가루",
+    "염소산업", "혈통관리", "소비자물가", "주식", "배당", "concert", "sports",
+]
+
+GENERAL_NEWS_TERMS = [
+    "수출 85.9", "수출입 현황", "증시", "주가", "배당", "실적", "gdp", "환율",
+    "market outlook", "stock", "shares", "dividend", "budget deficit",
+]
+
+CRITICAL_CUSTOMS_TERMS = [
+    "anti-dumping", "antidumping", "countervailing", "ad/cvd", "반덤핑", "상계관세",
+    "cbam", "carbon border", "탄소국경",
+    "customs enforcement", "cbp", "ior", "importer of record", "bond",
+    "관세청", "세관", "수입신고", "보세", "통관",
+    "export control", "entity list", "strategic goods", "dual-use", "수출통제", "전략물자",
+    "forced labor", "uflpa", "강제노동",
+    "hs code", "classification", "품목분류", "hscode",
+    "section 301", "section 232", "tariff", "관세율", "쿼터", "환급",
+    "fta", "origin", "rules of origin", "certificate of origin", "원산지", "co 발급",
+]
+
+def _row_text(row: pd.Series, cols: list[str] | None = None) -> str:
+    if cols is None:
+        cols = [
+            "Headline", "Summary", "AI Analysis", "Action Plan", "Major Changes", "Issue",
+            "Country", "Agency", "KeywordMatches", "affected_products", "hs_hint",
+            "tariff_rate_hint", "fta_impact", "export_control_impact", "hs_impact", "tariff_impact",
+            "Impact Reason", "Affected Subsidiary",
+        ]
+    return " ".join(clean(row.get(c)) for c in cols).lower()
+
+def _has_any(text: str, terms: list[str]) -> bool:
+    return any(t.lower() in text for t in terms)
+
+def samsung_relevance_score(row: pd.Series) -> int:
+    """Samsung product / subsidiary relevance score.
+
+    This prevents generic trade news from being promoted to Top3 only because it
+    contains words like export, tariff, or FTA.
+    """
+    text = _row_text(row)
+    score = 0
+
+    if clean(row.get("Samsung Impact")) == "Direct":
+        score += 2200
+    elif clean(row.get("Samsung Impact")) == "Indirect":
+        score += 1000
+    elif clean(row.get("Samsung Impact")) == "Watch":
+        score += 200
+
+    if _has_any(text, SAMSUNG_RELEVANCE_TERMS["high"]):
+        score += 1400
+    if _has_any(text, SAMSUNG_RELEVANCE_TERMS["medium"]):
+        score += 500
+
+    subs = clean(row.get("Affected Subsidiary"))
+    if subs and subs not in {"관련 법인 검토", "SEC/HQ", "HQ", "본사"}:
+        score += 400
+    products = clean(row.get("affected_products"))
+    if products:
+        score += 500
+
+    if _has_any(text, LOW_RELEVANCE_TERMS):
+        score -= 1600
+    if _has_any(text, GENERAL_NEWS_TERMS):
+        score -= 800
+
+    return score
+
+def customs_actionability_score(row: pd.Series) -> int:
+    """Score whether the item requires customs/trade compliance action."""
+    text = _row_text(row)
+    issue = clean(row.get("Issue"))
+    score = 0
+
+    if issue in {"관세정책", "AD/CVD", "반덤핑/상계관세", "CBAM", "수출통제", "FTA/원산지", "통관", "통관/세관", "HS/품목분류"}:
+        score += 700
+    if clean(row.get("Content Type")) == "Regulation":
+        score += 500
+    if normalize_risk(row.get("Risk")) == "상":
+        score += 500
+    elif normalize_risk(row.get("Risk")) == "중":
+        score += 200
+
+    if _has_any(text, CRITICAL_CUSTOMS_TERMS):
+        score += 900
+    for col in ["hs_hint", "tariff_rate_hint", "effective_date_hint", "change_detail_hint"]:
+        if non_empty_hint(row.get(col)):
+            score += 250
+
+    # Actionable only when there is a plausible internal task.
+    if any(k in text for k in ["시행", "적용", "신고", "세율", "hs", "관세율", "원산지", "co ", "환급", "증빙", "허가", "license"]):
+        score += 300
+
+    if _has_any(text, LOW_RELEVANCE_TERMS):
+        score -= 1200
+
+    return score
+
+def reference_reason(row: pd.Series) -> str:
+    text = _row_text(row)
+    if _has_any(text, LOW_RELEVANCE_TERMS):
+        return "삼성전자 주요 제품·부품·원재료와 직접 관련성이 낮은 일반 품목/농산물성 규제입니다."
+    if samsung_relevance_score(row) < 200 and customs_actionability_score(row) < 700:
+        return "관세업무 실행 조치가 필요한 수준의 HS·세율·원산지·신고절차 변경이 확인되지 않았습니다."
+    if _has_any(text, GENERAL_NEWS_TERMS):
+        return "일반 경제/시장 동향 성격이 강해 임원 보고 Top3보다는 참고 모니터링에 적합합니다."
+    return ""
+
+def executive_priority(row: pd.Series) -> str:
+    """CORE / WATCH / REFERENCE override for STEP5 mail quality."""
+    ref = reference_reason(row)
+    if ref:
+        return "REFERENCE"
+    srel = samsung_relevance_score(row)
+    act = customs_actionability_score(row)
+    if srel >= 1800 and act >= 1400:
+        return "CORE"
+    if act >= 1400:
+        return "POLICY_WATCH"
+    if srel >= 1000 and act >= 900:
+        return "USABLE"
+    return clean(row.get("Priority Group")) or "WATCH"
+
+def report_score(row: pd.Series) -> float:
+    """Override: report score based on relevance/actionability, not raw keyword score."""
+    base = safe_num(row.get("Importance Score"))
+    impact_weight = {"Direct": 2200, "Indirect": 900, "Watch": 100, "Reference": -800}.get(clean(row.get("Samsung Impact")), 0)
+    risk = risk_weight(row.get("Risk"))
+    type_weight = 350 if clean(row.get("Content Type")) == "Regulation" else 0
+    priority = executive_priority(row)
+    pri_weight = {"CORE": 1200, "POLICY_WATCH": 800, "USABLE": 450, "WATCH": 200, "REFERENCE": -1200}.get(priority, 0)
+    return base + impact_weight + risk + type_weight + pri_weight + samsung_relevance_score(row) + customs_actionability_score(row)
+
+def top3_deep_score(row: pd.Series) -> float:
+    """Override: choose Top3 only when Samsung relevance + customs actionability are high."""
+    score = report_score(row)
+    text = _row_text(row)
+    priority = executive_priority(row)
+
+    if priority == "REFERENCE":
+        score -= 10000
+    if clean(row.get("Content Type")) == "Regulation":
+        score += 300
+    if normalize_risk(row.get("Risk")) == "상":
+        score += 300
+
+    # Strong boost for issues that usually require HQ action.
+    if clean(row.get("Issue")) in {"AD/CVD", "반덤핑/상계관세", "수출통제", "CBAM", "관세정책", "HS/품목분류", "통관"}:
+        score += 700
+
+    # Explicitly avoid "export" only items without Samsung/customs action.
+    if "export" in text and not _has_any(text, CRITICAL_CUSTOMS_TERMS) and samsung_relevance_score(row) < 800:
+        score -= 2500
+
+    return score
+
+def choose_top3(rows: pd.DataFrame) -> pd.DataFrame:
+    """Override: exclude REFERENCE/low-actionability from Top3 and keep issue diversity."""
+    pool = rows.copy()
+    pool["Executive Priority"] = pool.apply(executive_priority, axis=1)
+    pool["_top3_score"] = pool.apply(top3_deep_score, axis=1)
+
+    # Top3 후보 필터: Reference 제외 + 업무 실행성 최소값
+    candidate = pool[
+        (pool["Executive Priority"].ne("REFERENCE")) &
+        (pool.apply(customs_actionability_score, axis=1) >= 700)
+    ].copy()
+
+    if candidate.empty:
+        candidate = pool[pool["Executive Priority"].ne("REFERENCE")].copy()
+    if candidate.empty:
+        candidate = pool.copy()
+
+    candidate = candidate.sort_values(["_top3_score", "_sort_date"], ascending=[False, False])
+    selected = []
+    used_issues = set()
+    for _, row in candidate.iterrows():
+        issue = clean(row.get("Issue"))
+        if issue in used_issues and len(selected) < 3:
+            continue
+        selected.append(row)
+        used_issues.add(issue)
+        if len(selected) == 3:
+            break
+
+    if len(selected) < 3:
+        for _, row in candidate.iterrows():
+            if any(clean(row.get("Headline")) == clean(x.get("Headline")) for x in selected):
+                continue
+            selected.append(row)
+            if len(selected) == 3:
+                break
+
+    out = pd.DataFrame(selected).reset_index(drop=True)
+    if not out.empty:
+        out["No"] = range(1, len(out) + 1)
+    return out
+
+def prepare_rows(rows: pd.DataFrame) -> pd.DataFrame:
+    """Override: rewrite report fields and demote low relevance rows at STEP5."""
+    rows = rows.copy()
+    rows["Issue"] = rows.apply(issue_for, axis=1)
+    rows = dedup_report_rows(rows)
+    rows["Mail Group"] = rows["Content Type"].map({"Regulation": GROUP_REGULATION}).fillna(GROUP_NEWS)
+    rows["Executive Priority"] = rows.apply(executive_priority, axis=1)
+
+    # Demote low relevance items so they remain in report table but do not become Top3.
+    rows.loc[rows["Executive Priority"].eq("REFERENCE"), "Priority Group"] = "REFERENCE"
+    rows.loc[rows["Executive Priority"].eq("REFERENCE"), "Samsung Impact"] = "Reference"
+
+    rows["Major Changes"] = rows.apply(major_changes, axis=1)
+    rows["Summary"] = rows.apply(report_summary, axis=1)
+    rows["AI Analysis"] = rows.apply(report_impact, axis=1)
+    rows["Action Plan"] = rows.apply(report_action, axis=1)
+    rows["_report_score"] = rows.apply(report_score, axis=1)
+
+    # Final mail ordering should reflect executive relevance.
+    rows = rows.sort_values(["_report_score", "_sort_date"], ascending=[False, False]).reset_index(drop=True)
+    rows["No"] = range(1, len(rows) + 1)
+    return rows
+
+def _issue_summary_detail(row: pd.Series) -> str:
+    issue = clean(row.get("Issue"))
+    country = clean(row.get("Country")) or "확인 필요"
+    date = clean(row.get("Date")) or "확인 필요"
+    hs = non_empty_hint(row.get("hs_hint")) or "원문/법인 품목 기준 확인 필요"
+    rate = non_empty_hint(row.get("tariff_rate_hint")) or "해당 시 별도 산출 필요"
+    change = short_text(row.get("Major Changes"), "주요 변경내역 확인 필요", 420)
+    return (
+        f"• 이슈구분: {issue}\n"
+        f"• 대상국가: {country}\n"
+        f"• 게시/시행일: {date}\n"
+        f"• 대상 HS/품목: {hs}\n"
+        f"• 세율/쿼터/허가 변화: {rate}\n"
+        f"• 핵심내용: {change}"
+    )
+
+def _samsung_impact_detail(row: pd.Series) -> str:
+    issue = clean(row.get("Issue"))
+    subs = clean(row.get("Affected Subsidiary")) or "SEC/HQ 및 관련 해외법인"
+    products = non_empty_hint(row.get("affected_products")) or "법인별 수입·수출 실적 기준 매핑 필요"
+    impact = clean(row.get("Samsung Impact")) or "Watch"
+
+    if impact == "Reference":
+        ref = reference_reason(row)
+        return (
+            f"• 영향등급: Reference\n"
+            f"• 판단사유: {ref or '삼성전자 직접 영향은 낮고 정책 방향성 모니터링 가치 중심입니다.'}\n"
+            f"• 영향법인: 즉시 특정 불필요\n"
+            f"• 영향품목: {products}"
+        )
+
+    base = [
+        f"• 영향등급: {impact}",
+        f"• 영향법인 후보: {subs}",
+        f"• 영향제품 후보: {products}",
+    ]
+
+    if issue in {"AD/CVD", "반덤핑/상계관세"}:
+        base.append("• 영향업무: 공급국 변경, 원산지 증빙, 가격자료 방어, AD/CVD 추가관세 비용 산출")
+        base.append("• 리스크: 대상 HS를 사용하는 원재료·부품 수입 시 추가 관세 및 사후심사 대응 부담 발생 가능")
+    elif issue == "CBAM":
+        base.append("• 영향업무: EU향 품목의 배출량 자료 확보, CBAM 신고, 인증서 비용 반영")
+        base.append("• 리스크: 공급사 배출량 자료 미확보 시 신고 오류 또는 비용 추정 누락 가능")
+    elif issue == "수출통제":
+        base.append("• 영향업무: ECCN/전략물자 분류, 최종사용자 확인, 우회수출 스크리닝")
+        base.append("• 리스크: 허가 필요 품목을 무허가 수출하거나 제재 거래처와 거래할 가능성")
+    elif issue == "FTA/원산지":
+        base.append("• 영향업무: BOM 원산지 판정, CO 발급요건, 직접운송, 누적기준, FTA Master 정합성")
+        base.append("• 리스크: 원산지 기준 미충족 상태에서 특혜세율 적용 또는 CO 발급 오류 가능")
+    elif issue in {"통관", "통관/세관"}:
+        base.append("• 영향업무: 수입신고, 보세운송/보세공장, 관세사 제출자료, 통관 SOP")
+        base.append("• 리스크: 신고 지연, 자동수리 조건 오류, 세관 제출자료 누락 가능")
+    elif issue == "HS/품목분류":
+        base.append("• 영향업무: HS Master, 품목 설명, 관세율, FTA 판정 기준")
+        base.append("• 리스크: 법인별 HS 불일치 및 관세율 오적용 가능")
+    else:
+        base.append("• 영향업무: 관련 국가·품목 기준 통상 리스크 모니터링")
+        base.append("• 리스크: 현재 직접 영향은 제한적이나 정책 확산 여부 확인 필요")
+
+    return "\n".join(base)
+
+def _customs_impact_detail(row: pd.Series) -> str:
+    issue = clean(row.get("Issue"))
+    lines = []
+    if issue in {"AD/CVD", "반덤핑/상계관세"}:
+        lines = [
+            "• 관세비용: 대상 HS 수입금액 × 추가관세율로 잠재 비용 산출 필요",
+            "• 신고리스크: 공급국·원산지·제조자 기준이 불명확하면 AD/CVD 회피 의심 가능",
+            "• 증빙자료: 구매계약서, 원산지증명, 가격결정자료, 공급자 진술서 보관 필요",
+        ]
+    elif issue == "CBAM":
+        lines = [
+            "• 관세/준조세 비용: CBAM 인증서 가격 및 내재배출량 기준 비용 반영 필요",
+            "• 신고리스크: EU 수입자 신고자료와 공급사 배출량 자료 불일치 가능",
+            "• 증빙자료: 배출량 산정서, 공급사 확인서, 품목별 CN/HS 매핑 필요",
+        ]
+    elif issue == "수출통제":
+        lines = [
+            "• 수출허가: ECCN/전략물자 해당 여부 및 최종사용자 확인 필요",
+            "• 거래심사: 제재국·제재자·우회수출 경로 스크리닝 필요",
+            "• 시스템: Item Master에 전략물자/ECCN/허가필요 여부 필드 반영 검토",
+        ]
+    elif issue == "FTA/원산지":
+        lines = [
+            "• FTA 비용: 특혜세율 적용 가능 여부 및 미적용 시 관세비용 차이 산출 필요",
+            "• 원산지 리스크: BOM, Vendor 원산지확인서, HS 기준 불일치 가능",
+            "• 시스템: FTA Master·HS Master·Item Master 정합성 점검 필요",
+        ]
+    elif issue in {"통관", "통관/세관"}:
+        lines = [
+            "• 신고절차: 관세사 신고 양식, 제출자료, 자동수리 조건 변경 여부 확인 필요",
+            "• 운영리스크: 보세·수입신고 오류 또는 지연 시 비용/가산세 발생 가능",
+            "• 시스템: 통관 체크리스트와 법인 SOP 업데이트 필요",
+        ]
+    elif issue == "HS/품목분류":
+        lines = [
+            "• HS 리스크: 동일 품목에 대한 법인·관세사별 HS 불일치 가능",
+            "• 비용영향: HS 변경 시 기본세율, FTA 세율, AD/CVD 적용 여부 재산정 필요",
+            "• 시스템: HS Master 변경 승인 Workflow 필요",
+        ]
+    else:
+        lines = [
+            "• 직접 관세비용 영향은 현재 낮음",
+            "• 정책 방향성 모니터링 후 유사 규제가 전자부품·전략물자로 확대되는지 확인 필요",
+        ]
+    return "\n".join(lines)
+
+def _action_detail(row: pd.Series) -> str:
+    impact = clean(row.get("Samsung Impact"))
+    issue = clean(row.get("Issue"))
+    subs = clean(row.get("Affected Subsidiary")) or "SEC/HQ"
+
+    if impact == "Reference":
+        return (
+            "• 즉시조치: 불필요\n"
+            "• 모니터링: 동일 국가에서 전자부품·전략물자·관세율 관련 후속 공지가 나오는지 확인\n"
+            "• GTI 처리: 본문 Top3 제외, Reference 뉴스로 보관\n"
+            "• Owner: GTI 운영자"
+        )
+
+    if issue in {"AD/CVD", "반덤핑/상계관세"}:
+        return (
+            f"• 즉시조치: {subs} 대상 HS·공급국·벤더 매핑\n"
+            "• 1주 내: 최근 12개월 수입실적 기준 잠재 AD/CVD 비용 산출\n"
+            "• 1개월 내: 원산지/가격자료 방어 파일 구축 및 관세사 신고 기준 공유\n"
+            "• Owner: HQ Customs + 구매 + 해당 법인 통관담당"
+        )
+    if issue == "CBAM":
+        return (
+            f"• 즉시조치: {subs} EU향 대상품목 및 공급사 배출량 자료 보유 여부 확인\n"
+            "• 1주 내: CBAM 신고 대상 CN/HS와 공급사별 배출량 Gap List 작성\n"
+            "• 1개월 내: 인증서 비용 반영 로직 및 ESG/통관 공동관리 체계 수립\n"
+            "• Owner: HQ Customs + ESG + EU 판매법인"
+        )
+    if issue == "수출통제":
+        return (
+            f"• 즉시조치: {subs} 대상 제품의 ECCN/전략물자 분류 확인\n"
+            "• 1주 내: 거래처·최종사용자·목적지 스크리닝 결과 재점검\n"
+            "• 1개월 내: Item Master에 Export Control Flag 반영\n"
+            "• Owner: HQ Export Control + 사업부 + 해외법인"
+        )
+    if issue == "FTA/원산지":
+        return (
+            f"• 즉시조치: {subs} 대상 품목의 FTA 적용 여부와 CO 발급/수취 현황 확인\n"
+            "• 1주 내: BOM 원산지, Vendor 원산지확인서, HS 기준 일치 여부 점검\n"
+            "• 1개월 내: FTA Master·HS Master·Item Master 업데이트\n"
+            "• Owner: HQ Customs/FTA + 법인 구매/물류"
+        )
+    if issue in {"통관", "통관/세관"}:
+        return (
+            f"• 즉시조치: {subs} 관세사에 신고절차 변경 여부 확인\n"
+            "• 1주 내: 통관 SOP, 보세운송/보세공장 체크리스트, 제출자료 양식 개정\n"
+            "• 1개월 내: ERP/ONE-Origin 반영 필요 필드 정의\n"
+            "• Owner: HQ Customs + 법인 통관담당 + 관세사"
+        )
+    if issue == "HS/품목분류":
+        return (
+            f"• 즉시조치: {subs} 품목별 HS Master와 신고 HS 비교\n"
+            "• 1주 내: 불일치 품목 Root Cause 분석 및 변경 승인자료 확보\n"
+            "• 1개월 내: HS 변경 Workflow 및 관세율 영향표 반영\n"
+            "• Owner: HQ Customs + 법인 Master Data 담당"
+        )
+    return (
+        f"• 즉시조치: {subs} 적용 가능성 확인\n"
+        "• 1주 내: 대상 국가·품목·HS·법인 매핑\n"
+        "• 1개월 내: 후속 공지 모니터링 및 필요 시 Master 반영\n"
+        "• Owner: HQ Customs"
+    )
+
+def report_summary(row: pd.Series) -> str:
+    return _issue_summary_detail(row).replace("\n", " ")
+
+def report_impact(row: pd.Series) -> str:
+    return _samsung_impact_detail(row).replace("\n", " ")
+
+def report_action(row: pd.Series) -> str:
+    return _action_detail(row).replace("\n", " ")
+
+def top3_summary_sentence(row: pd.Series) -> str:
+    title = clean(row.get("Headline"))
+    issue = clean(row.get("Issue"))
+    impact = clean(row.get("Samsung Impact"))
+    if impact == "Reference":
+        return f"{title}: 삼성전자 직접 영향 낮음. Reference로 관리하고 Top3에서는 제외하는 것이 적절합니다."
+    if issue in {"AD/CVD", "반덤핑/상계관세"}:
+        return f"{title}: 대상 HS·공급국·벤더 기준 AD/CVD 비용과 원산지 방어자료 점검이 필요합니다."
+    if issue == "CBAM":
+        return f"{title}: EU향 품목의 배출량 자료, CBAM 신고 및 인증서 비용 반영 여부를 확인해야 합니다."
+    if issue == "수출통제":
+        return f"{title}: ECCN·전략물자 분류와 최종사용자 스크리닝을 우선 점검해야 합니다."
+    if issue == "FTA/원산지":
+        return f"{title}: CO 발급요건, BOM 원산지, FTA Master 정합성 재검토가 필요합니다."
+    if issue in {"관세정책", "통관", "통관/세관", "HS/품목분류"}:
+        return f"{title}: 대상 HS, 신고절차, 관세율 및 법인 SOP 반영 여부를 확인해야 합니다."
+    return f"{title}: 삼성 관련성과 관세업무 실행 필요성을 확인해야 합니다."
+
+def top3_html(top3: pd.DataFrame) -> str:
+    blocks = []
+    for idx, row in top3.iterrows():
+        blocks.append(f"""
+        <div style="margin:14px 0 18px 0;padding:15px;border-left:5px solid #C00000;background:#FFF7F7;">
+          <div style="font-size:15px;font-weight:bold;margin-bottom:6px;">Top {idx + 1}. {html_link(row.get('Headline'), row.get('URL'))}</div>
+          <div style="font-size:12px;color:#555;margin-bottom:9px;">
+            Type: {html.escape(clean(row.get('Content Type')))} | Topic: {html.escape(clean(row.get('Issue')))} |
+            Samsung Impact: <b>{html.escape(clean(row.get('Samsung Impact')))}</b> |
+            Executive Priority: <b>{html.escape(executive_priority(row))}</b> |
+            Subsidiary: {html.escape(clean(row.get('Affected Subsidiary')) or 'SEC/HQ')} |
+            Agency: {html.escape(clean(row.get('Agency')))} | Publish Date: {html.escape(clean(row.get('Date')))} |
+            Country: {html.escape(clean(row.get('Country')))} |
+            Risk: <span style="color:{risk_color(row.get('Risk'))};font-weight:bold;">{html.escape(clean(row.get('Risk')))}</span> |
+            Score: {report_score(row):.0f}
+          </div>
+          <div style="margin-top:8px;"><b>1) 이슈 요약</b><br><pre style="white-space:pre-wrap;font-family:Arial,'Malgun Gothic',sans-serif;margin:4px 0 0 0;">{html.escape(_issue_summary_detail(row))}</pre></div>
+          <div style="margin-top:8px;"><b>2) 삼성전자 영향</b><br><pre style="white-space:pre-wrap;font-family:Arial,'Malgun Gothic',sans-serif;margin:4px 0 0 0;">{html.escape(_samsung_impact_detail(row))}</pre></div>
+          <div style="margin-top:8px;"><b>3) 관세업무 영향 / 리스크</b><br><pre style="white-space:pre-wrap;font-family:Arial,'Malgun Gothic',sans-serif;margin:4px 0 0 0;">{html.escape(_customs_impact_detail(row))}</pre></div>
+          <div style="margin-top:8px;"><b>4) 대응방안</b><br><pre style="white-space:pre-wrap;font-family:Arial,'Malgun Gothic',sans-serif;margin:4px 0 0 0;">{html.escape(_action_detail(row))}</pre></div>
+        </div>
+        """)
+    return "".join(blocks)
+
+def table_html(title: str, rows: pd.DataFrame, color: str) -> str:
+    """Override: add Executive Priority column to make REFERENCE demotion visible."""
+    if rows.empty:
+        return f"<h3 style='color:{color};'>{html.escape(title)} (0건)</h3>"
+    trs = []
+    for _, row in rows.iterrows():
+        trs.append(f"""
+        <tr>
+          <td style="padding:7px;border:1px solid #ddd;text-align:center;vertical-align:top;">{html.escape(str(row.get('No')))}</td>
+          <td style="padding:7px;border:1px solid #ddd;text-align:center;vertical-align:top;">{html.escape(clean(row.get('Issue')))}</td>
+          <td style="padding:7px;border:1px solid #ddd;vertical-align:top;">{html_link(row.get('Headline'), row.get('URL'))}</td>
+          <td style="padding:7px;border:1px solid #ddd;vertical-align:top;">{html.escape(short_text(row.get('Major Changes'), '주요 변경내역 확인 필요', 260))}</td>
+          <td style="padding:7px;border:1px solid #ddd;vertical-align:top;">{html.escape(short_text(row.get('AI Analysis'), '영향 검토 필요', 300))}</td>
+          <td style="padding:7px;border:1px solid #ddd;vertical-align:top;">{html.escape(short_text(row.get('Action Plan'), '담당 부서 확인 필요', 300))}</td>
+          <td style="padding:7px;border:1px solid #ddd;text-align:center;vertical-align:top;">{html.escape(clean(row.get('Country')))}</td>
+          <td style="padding:7px;border:1px solid #ddd;text-align:center;vertical-align:top;color:{risk_color(row.get('Risk'))};font-weight:bold;">{html.escape(clean(row.get('Risk')))}</td>
+          <td style="padding:7px;border:1px solid #ddd;text-align:center;vertical-align:top;">{html.escape(clean(row.get('Samsung Impact')))}</td>
+          <td style="padding:7px;border:1px solid #ddd;text-align:center;vertical-align:top;">{html.escape(executive_priority(row))}</td>
+        </tr>
+        """)
+    return f"""
+    <h3 style="margin-top:24px;color:{color};">{html.escape(title)} ({len(rows)}건)</h3>
+    <table style="border-collapse:collapse;width:100%;font-size:12px;table-layout:fixed;">
+      <colgroup>
+        <col style="width:3%;"><col style="width:7%;"><col style="width:21%;">
+        <col style="width:20%;"><col style="width:18%;"><col style="width:18%;">
+        <col style="width:5%;"><col style="width:4%;"><col style="width:5%;"><col style="width:7%;">
+      </colgroup>
+      <thead>
+        <tr style="background:{color};color:white;">
+          <th style="padding:7px;border:1px solid #ddd;">No</th>
+          <th style="padding:7px;border:1px solid #ddd;">Issue</th>
+          <th style="padding:7px;border:1px solid #ddd;">Headline</th>
+          <th style="padding:7px;border:1px solid #ddd;">주요 변경내역</th>
+          <th style="padding:7px;border:1px solid #ddd;">삼성 영향</th>
+          <th style="padding:7px;border:1px solid #ddd;">Action</th>
+          <th style="padding:7px;border:1px solid #ddd;">Country</th>
+          <th style="padding:7px;border:1px solid #ddd;">Risk</th>
+          <th style="padding:7px;border:1px solid #ddd;">Impact</th>
+          <th style="padding:7px;border:1px solid #ddd;">Priority</th>
+        </tr>
+      </thead>
+      <tbody>{''.join(trs)}</tbody>
+    </table>
+    """
+
+def overall_html(rows: pd.DataFrame, top3: pd.DataFrame) -> str:
+    reg = rows[rows["Content Type"].eq("Regulation")]
+    news = rows[rows["Content Type"].eq("News")]
+    direct = rows[rows["Samsung Impact"].eq("Direct")]
+    indirect = rows[rows["Samsung Impact"].eq("Indirect")]
+    watch = rows[rows["Samsung Impact"].eq("Watch")]
+    ref = rows[rows["Samsung Impact"].eq("Reference")]
+    issues = rows["Issue"].value_counts().head(6)
+    issue_txt = ", ".join(f"{k} {v}건" for k, v in issues.items())
+    top_lines = "".join(f"<li>{html.escape(top3_summary_sentence(r))}</li>" for _, r in top3.iterrows())
+
+    ref_note = ""
+    if len(ref):
+        ref_note = f"<div style='margin-top:8px;color:#666;'>Reference {len(ref)}건은 삼성 직접 영향 또는 관세업무 실행성이 낮아 Top3 후보에서 제외했습니다.</div>"
+
+    return f"""
+    <div style="padding:15px;background:#F4F6F8;border-left:6px solid #1F4E78;margin-bottom:18px;">
+      <div style="font-size:14px;color:#555;margin-bottom:8px;">
+        금일 선별 결과: 법규 {len(reg)}건, 주요뉴스 {len(news)}건 | Direct {len(direct)}건, Indirect {len(indirect)}건, Watch {len(watch)}건, Reference {len(ref)}건
+      </div>
+      <div style="font-size:15px;font-weight:bold;line-height:1.8;margin-bottom:8px;">
+        금일 GTI Radar는 {html.escape(issue_txt)} 중심으로 관세·통상 변화가 포착되었습니다.
+        Top3는 단순 키워드가 아니라 삼성 관련성, 관세업무 실행성, 시행 긴급성, 비용/리스크 규모를 기준으로 재선정했습니다.
+      </div>
+      <div style="margin-top:8px;"><b>Top3 요약</b><ol style="margin-top:6px;">{top_lines}</ol></div>
+      {ref_note}
+    </div>
+    """
+
+# ======================================================================
+# End of GTI STEP5 Executive Quality Patch v3
+# ======================================================================
+
+
+# ======================================================================
+# GTI STEP5 Executive Quality Patch v4
+# ----------------------------------------------------------------------
+# v3 보완사항
+# 1) REFERENCE 판정이 과도하게 적용되어 AD/CVD, CBAM, 통관, 수출통제까지
+#    Top3 후보에서 제외되는 문제 수정
+# 2) Top3가 1건만 나오는 문제 수정: CORE/POLICY_WATCH/USABLE/WATCH 순서로
+#    반드시 3건까지 보충
+# 3) 공식 법규, 고위험 관세/통관 이슈는 삼성 직접법인이 특정되지 않아도
+#    Top3 후보로 유지
+# ======================================================================
+
+ACTIONABLE_ISSUES = {
+    "관세정책", "AD/CVD", "반덤핑/상계관세", "CBAM",
+    "수출통제", "FTA/원산지", "통관", "통관/세관", "HS/품목분류"
+}
+
+REFERENCE_ONLY_ISSUES = {"무역일반", "일반경제", "시장동향", "기타"}
+
+def reference_reason(row: pd.Series) -> str:
+    """v4 override: only demote clearly non-actionable items.
+
+    Do not demote AD/CVD, CBAM, customs, export control, HS, or official high-risk
+    regulations simply because affected subsidiary is not specified yet.
+    """
+    text = _row_text(row)
+    issue = clean(row.get("Issue"))
+    title = clean(row.get("Headline")).lower()
+    content_type = clean(row.get("Content Type"))
+    risk = normalize_risk(row.get("Risk"))
+
+    # 1) Explicit agriculture/food/general item with no Samsung/customs action.
+    if _has_any(text, LOW_RELEVANCE_TERMS):
+        if issue not in ACTIONABLE_ISSUES or issue in REFERENCE_ONLY_ISSUES or "wheat" in text or "염소산업" in text:
+            return "삼성전자 주요 제품·부품·원재료와 직접 관련성이 낮은 일반 품목/농산물성 규제입니다."
+
+    # 2) General stock/economy news, even if semiconductor appears as macro statistic.
+    if _has_any(text, GENERAL_NEWS_TERMS):
+        if not any(k in text for k in ["tariff rate", "관세율", "수출통제", "cbam", "ad/cvd", "반덤핑", "상계관세", "hs code"]):
+            return "일반 경제/시장 동향 성격이 강해 임원 보고 Top3보다는 참고 모니터링에 적합합니다."
+
+    # 3) Generic trade/export notice without HS/tariff/origin/customs/export-control action.
+    if issue in REFERENCE_ONLY_ISSUES or issue == "무역일반":
+        if not _has_any(text, CRITICAL_CUSTOMS_TERMS):
+            return "관세업무 실행 조치가 필요한 수준의 HS·세율·원산지·신고절차 변경이 확인되지 않았습니다."
+
+    # 4) Weak non-regulation item with no actionable issue.
+    if content_type != "Regulation" and issue not in ACTIONABLE_ISSUES:
+        if samsung_relevance_score(row) < 300 and customs_actionability_score(row) < 600:
+            return "삼성 관련성과 관세업무 실행성이 낮아 Reference 관리가 적절합니다."
+
+    # Keep official regulations and actionable issues as candidates.
+    if content_type == "Regulation" and risk in {"상", "중"}:
+        return ""
+    if issue in ACTIONABLE_ISSUES:
+        return ""
+
+    return ""
+
+def executive_priority(row: pd.Series) -> str:
+    """v4 override: preserve actionable customs issues as candidates."""
+    ref = reference_reason(row)
+    if ref:
+        return "REFERENCE"
+
+    srel = samsung_relevance_score(row)
+    act = customs_actionability_score(row)
+    issue = clean(row.get("Issue"))
+    content_type = clean(row.get("Content Type"))
+    risk = normalize_risk(row.get("Risk"))
+
+    if clean(row.get("Samsung Impact")) == "Direct":
+        return "CORE"
+    if clean(row.get("Samsung Impact")) == "Indirect" and issue in ACTIONABLE_ISSUES:
+        return "CORE"
+    if issue in {"AD/CVD", "반덤핑/상계관세", "수출통제", "CBAM", "HS/품목분류"}:
+        return "POLICY_WATCH" if clean(row.get("Samsung Impact")) != "Indirect" else "CORE"
+    if issue in {"관세정책", "통관", "통관/세관"}:
+        return "POLICY_WATCH"
+    if content_type == "Regulation" and risk == "상":
+        return "POLICY_WATCH"
+    if issue == "FTA/원산지" and (srel >= 900 or "battery" in _row_text(row) or risk == "상"):
+        return "USABLE"
+    if act >= 1100:
+        return "USABLE"
+    return clean(row.get("Priority Group")) or "WATCH"
+
+def report_score(row: pd.Series) -> float:
+    """v4 override: balanced scoring."""
+    base = safe_num(row.get("Importance Score"))
+    issue = clean(row.get("Issue"))
+    priority = executive_priority(row)
+    content_type = clean(row.get("Content Type"))
+
+    issue_weight = {
+        "AD/CVD": 1500,
+        "반덤핑/상계관세": 1500,
+        "수출통제": 1450,
+        "CBAM": 1300,
+        "관세정책": 1150,
+        "통관": 1100,
+        "통관/세관": 1100,
+        "HS/품목분류": 1100,
+        "FTA/원산지": 800,
+        "무역일반": 100,
+    }.get(issue, 250)
+
+    pri_weight = {
+        "CORE": 1800,
+        "POLICY_WATCH": 1300,
+        "USABLE": 800,
+        "WATCH": 300,
+        "REFERENCE": -2500,
+    }.get(priority, 0)
+
+    impact_weight = {
+        "Direct": 2400,
+        "Indirect": 1200,
+        "Watch": 300,
+        "Reference": -1000,
+    }.get(clean(row.get("Samsung Impact")), 0)
+
+    type_weight = 550 if content_type == "Regulation" else 0
+    risk_w = risk_weight(row.get("Risk"))
+
+    return (
+        base + issue_weight + pri_weight + impact_weight + type_weight + risk_w
+        + max(samsung_relevance_score(row), -1000)
+        + max(customs_actionability_score(row), -500)
+    )
+
+def top3_deep_score(row: pd.Series) -> float:
+    """v4 override: Top3 ranking with explicit non-reference and issue priority."""
+    priority = executive_priority(row)
+    if priority == "REFERENCE":
+        return -999999
+
+    issue = clean(row.get("Issue"))
+    score = report_score(row)
+
+    # Favor concrete cost/compliance topics.
+    if issue in {"AD/CVD", "반덤핑/상계관세"}:
+        score += 1800
+    elif issue == "수출통제":
+        score += 1600
+    elif issue == "CBAM":
+        score += 1400
+    elif issue in {"관세정책", "통관", "통관/세관"}:
+        score += 1200
+    elif issue == "HS/품목분류":
+        score += 1000
+    elif issue == "FTA/원산지":
+        score += 600
+
+    if clean(row.get("Content Type")) == "Regulation":
+        score += 500
+    if normalize_risk(row.get("Risk")) == "상":
+        score += 500
+
+    return score
+
+def choose_top3(rows: pd.DataFrame) -> pd.DataFrame:
+    """v4 override: always select up to 3 non-reference rows if available."""
+    pool = rows.copy()
+    pool["Executive Priority"] = pool.apply(executive_priority, axis=1)
+    pool["_top3_score"] = pool.apply(top3_deep_score, axis=1)
+
+    non_ref = pool[pool["Executive Priority"].ne("REFERENCE")].copy()
+    if non_ref.empty:
+        non_ref = pool.copy()
+
+    non_ref = non_ref.sort_values(["_top3_score", "_sort_date"], ascending=[False, False])
+
+    selected = []
+    used_issues = set()
+
+    # 1st pass: issue diversity
+    for _, row in non_ref.iterrows():
+        issue = clean(row.get("Issue"))
+        if issue in used_issues:
+            continue
+        selected.append(row)
+        used_issues.add(issue)
+        if len(selected) == 3:
+            break
+
+    # 2nd pass: fill remaining even if same issue
+    if len(selected) < 3:
+        for _, row in non_ref.iterrows():
+            title = clean(row.get("Headline"))
+            if any(clean(x.get("Headline")) == title for x in selected):
+                continue
+            selected.append(row)
+            if len(selected) == 3:
+                break
+
+    out = pd.DataFrame(selected).reset_index(drop=True)
+    if not out.empty:
+        out["No"] = range(1, len(out) + 1)
+    return out
+
+def prepare_rows(rows: pd.DataFrame) -> pd.DataFrame:
+    """v4 override: demote only true references, keep actionable issues."""
+    rows = rows.copy()
+    rows["Issue"] = rows.apply(issue_for, axis=1)
+    rows = dedup_report_rows(rows)
+    rows["Mail Group"] = rows["Content Type"].map({"Regulation": GROUP_REGULATION}).fillna(GROUP_NEWS)
+    rows["Executive Priority"] = rows.apply(executive_priority, axis=1)
+
+    ref_mask = rows["Executive Priority"].eq("REFERENCE")
+    rows.loc[ref_mask, "Priority Group"] = "REFERENCE"
+    rows.loc[ref_mask, "Samsung Impact"] = "Reference"
+
+    # Preserve Priority Group for actionable issues.
+    rows.loc[~ref_mask, "Priority Group"] = rows.loc[~ref_mask, "Executive Priority"]
+
+    rows["Major Changes"] = rows.apply(major_changes, axis=1)
+    rows["Summary"] = rows.apply(report_summary, axis=1)
+    rows["AI Analysis"] = rows.apply(report_impact, axis=1)
+    rows["Action Plan"] = rows.apply(report_action, axis=1)
+    rows["_report_score"] = rows.apply(report_score, axis=1)
+
+    rows = rows.sort_values(["_report_score", "_sort_date"], ascending=[False, False]).reset_index(drop=True)
+    rows["No"] = range(1, len(rows) + 1)
+    return rows
+
+# ======================================================================
+# End of GTI STEP5 Executive Quality Patch v4
+# ======================================================================
+
+
+# ======================================================================
+# GTI STEP5 Executive Quality Patch v5
+# ----------------------------------------------------------------------
+# v4 보완사항
+# 1) 2.Top3 / 3.Regulation / 4.주요뉴스 모두에 게시물 요약 반영
+# 2) "주요 변경내역" = 기존 변경내역 + 게시물 전체요약 2~3줄
+# 3) STEP4 원본 Summary/AI Analysis를 보존하여 STEP5에서 덮어쓰기 전에 활용
+# ======================================================================
+
+def _source_summary_text(row: pd.Series, limit: int = 520) -> str:
+    """Return original post/article summary from STEP4 before STEP5 rewrite."""
+    candidates = [
+        clean(row.get("Original Summary")),
+        clean(row.get("Original AI Analysis")),
+        clean(row.get("Impact Reason")),
+        clean(row.get("Summary")),
+    ]
+    for text in candidates:
+        if text and text not in {"본문에서 확인 불가", "nan", "None"}:
+            # Remove repetitive generic STEP5-style sentences if already rewritten.
+            bad = [
+                "공식 법규/공지입니다. 핵심은",
+                "에서 포착된",
+                "삼성전자 관련 법인",
+            ]
+            if any(b in text for b in bad) and len(text) < 180:
+                continue
+            text = re.sub(r"\s+", " ", text).strip()
+            return text[:limit] + ("..." if len(text) > limit else "")
+    return "원문 요약 정보가 부족합니다. 원문 링크 기준으로 세부 내용 확인이 필요합니다."
+
+def _two_three_line_summary(row: pd.Series) -> str:
+    """Create 2~3 line bulletin summary for mail display."""
+    src = _source_summary_text(row, 680)
+    issue = clean(row.get("Issue"))
+    country = clean(row.get("Country")) or "관련국"
+    date = clean(row.get("Date")) or "게시일 확인 필요"
+    headline = clean(row.get("Headline"))
+
+    # If source summary is weak, create a structured fallback from available fields.
+    if src.startswith("원문 요약 정보가 부족"):
+        src = (
+            f"{headline} 관련 {issue} 이슈입니다. "
+            f"대상 국가는 {country}이며 게시/확인일은 {date}입니다. "
+            "세부 대상 품목, HS, 세율, 시행일은 원문 및 법인 실적 기준으로 추가 확인이 필요합니다."
+        )
+
+    sentences = re.split(r"(?<=[.!?。？！])\s+|(?<=다\.)\s+|(?<=니다\.)\s+", src)
+    sentences = [s.strip(" -•\n\t") for s in sentences if s.strip()]
+    if len(sentences) >= 2:
+        return "\n".join(f"• {s}" for s in sentences[:3])
+    # Short text fallback: split by length.
+    if len(src) > 180:
+        return f"• {src[:180].strip()}\n• {src[180:360].strip()}"
+    return f"• {src}"
+
+def major_changes(row: pd.Series) -> str:
+    """v5 override: current change detail + article/post full summary 2~3 lines."""
+    issue = clean(row.get("Issue"))
+    headline = clean(row.get("Headline"))
+    title_l = headline.lower()
+
+    if "보세창고" in headline and "특허" in headline:
+        current = (
+            "개정 사유: 자가용보세창고 특허요건 완화 및 불명확한 규정 보완 필요. "
+            "주요 개정 내용: 자가용보세창고 반입 대상에 국제무역선·기 적재 자가화물 외 수리용 예비부분품 및 부속품 장치를 허용하고, "
+            "관세법 제178조상 물품반입 정지기간을 오해 없이 적용할 수 있도록 규정을 명확화하는 내용입니다."
+        )
+    elif "환전영업자" in headline and "관리" in headline:
+        current = (
+            "주요 내용: 환전영업자의 등록·관리, 보고·자료제출, 영업장 운영 및 관세청 관리 기준과 관련된 고시입니다. "
+            "해외출장·주재원·외환거래 지원 프로세스와 연결될 수 있어 실제 법인 업무 해당 여부 확인이 필요합니다."
+        )
+    elif "cbam" in title_l and "certificate price" in title_l:
+        current = (
+            "주요 내용: EU CBAM 인증서 가격이 공표되었거나 공표 일정이 확정된 사안입니다. "
+            "EU 수입품의 내재배출량 신고, 인증서 구매 비용, 공급사 배출량 자료 확보 체계에 영향을 줄 수 있습니다."
+        )
+    elif "customs enforcement" in title_l and "executive order" in title_l:
+        current = (
+            "주요 내용: 미국 세관 집행 강화 행정명령 관련 사안입니다. "
+            "수입신고 정확성, 저가신고·우회수입·전자상거래 물품 관리 및 CBP 심사 강화 가능성을 확인해야 합니다."
+        )
+    elif "수입신고" in headline and "가산세" in headline:
+        current = (
+            "주요 내용: 수입신고 지연 가산세 부과 대상이 되는 매점매석 금지 품목의 적용기간 연장 공고입니다. "
+            "해당 품목 수입 시 신고 지연, 재고 운영, 통관 일정 관리 기준을 확인해야 합니다."
+        )
+    else:
+        parts = [
+            hint_line("시행/적용일", row.get("effective_date_hint")),
+            hint_line("변경 내용", row.get("change_detail_hint")),
+            hint_line("대상 HS", row.get("hs_hint")),
+            hint_line("관세율/쿼터", row.get("tariff_rate_hint")),
+            hint_line("키워드", row.get("KeywordMatches")),
+        ]
+        if any(parts):
+            current = compact_parts(parts, "")
+        elif issue == "관세정책":
+            current = "관세율, 쿼터, 면세/환급 또는 Section 301/232 등 관세 비용에 영향을 줄 수 있는 정책 변화입니다."
+        elif issue in {"AD/CVD", "반덤핑/상계관세"}:
+            current = "반덤핑 또는 상계관세 조사·판정·연장 가능성이 있는 사안입니다. 공급국, 대상 품목, 조사 기간과 관세율 확인이 필요합니다."
+        elif issue == "CBAM":
+            current = "CBAM 신고, 인증서 가격, 배출량 자료 또는 EU 수입통관 절차와 연결되는 탄소국경조정 변화입니다."
+        elif issue == "FTA/원산지":
+            current = "FTA/CEPA 협정, 원산지 기준, CO 발급 또는 특혜관세 적용 가능성에 영향을 주는 변화입니다."
+        elif issue == "수출통제":
+            current = "Entity List, ECCN, UFLPA, forced labor 또는 전략물자·제재 스크리닝 관련 변화입니다."
+        elif issue == "통관":
+            current = "보세, 통관, 신고, 세관 심사 또는 행정절차 기준에 영향을 줄 수 있는 공식 공지입니다."
+        elif issue == "HS/품목분류":
+            current = "HS 분류 기준 또는 품목 해석이 달라질 수 있어 품목 마스터와 신고 기준 점검이 필요한 사안입니다."
+        else:
+            current = f"{headline} 관련 관세·통상 모니터링 사안입니다."
+
+    post_summary = _two_three_line_summary(row)
+    return f"{current}\n\n[게시물 요약]\n{post_summary}"
+
+def _issue_summary_detail(row: pd.Series) -> str:
+    """v5 override: Top3 issue summary includes post summary."""
+    issue = clean(row.get("Issue"))
+    country = clean(row.get("Country")) or "확인 필요"
+    date = clean(row.get("Date")) or "확인 필요"
+    hs = non_empty_hint(row.get("hs_hint")) or "원문/법인 품목 기준 확인 필요"
+    rate = non_empty_hint(row.get("tariff_rate_hint")) or "해당 시 별도 산출 필요"
+    change = clean(row.get("Major Changes")) or major_changes(row)
+    return (
+        f"• 이슈구분: {issue}\n"
+        f"• 대상국가: {country}\n"
+        f"• 게시/시행일: {date}\n"
+        f"• 대상 HS/품목: {hs}\n"
+        f"• 세율/쿼터/허가 변화: {rate}\n"
+        f"• 주요 변경내역 및 게시물 요약:\n{change}"
+    )
+
+def prepare_rows(rows: pd.DataFrame) -> pd.DataFrame:
+    """v5 override: preserve original summaries, then generate Major Changes with post summary."""
+    rows = rows.copy()
+    rows["Issue"] = rows.apply(issue_for, axis=1)
+    rows = dedup_report_rows(rows)
+    rows["Mail Group"] = rows["Content Type"].map({"Regulation": GROUP_REGULATION}).fillna(GROUP_NEWS)
+
+    # Preserve STEP4 source texts before STEP5 overwrites them.
+    if "Original Summary" not in rows.columns:
+        rows["Original Summary"] = rows.get("Summary", "")
+    if "Original AI Analysis" not in rows.columns:
+        rows["Original AI Analysis"] = rows.get("AI Analysis", "")
+    if "Original Action Plan" not in rows.columns:
+        rows["Original Action Plan"] = rows.get("Action Plan", "")
+
+    rows["Executive Priority"] = rows.apply(executive_priority, axis=1)
+
+    ref_mask = rows["Executive Priority"].eq("REFERENCE")
+    rows.loc[ref_mask, "Priority Group"] = "REFERENCE"
+    rows.loc[ref_mask, "Samsung Impact"] = "Reference"
+    rows.loc[~ref_mask, "Priority Group"] = rows.loc[~ref_mask, "Executive Priority"]
+
+    rows["Major Changes"] = rows.apply(major_changes, axis=1)
+    rows["Summary"] = rows.apply(report_summary, axis=1)
+    rows["AI Analysis"] = rows.apply(report_impact, axis=1)
+    rows["Action Plan"] = rows.apply(report_action, axis=1)
+    rows["_report_score"] = rows.apply(report_score, axis=1)
+
+    rows = rows.sort_values(["_report_score", "_sort_date"], ascending=[False, False]).reset_index(drop=True)
+    rows["No"] = range(1, len(rows) + 1)
+    return rows
+
+def table_html(title: str, rows: pd.DataFrame, color: str) -> str:
+    """v5 override: widen Major Changes and show line breaks for post summary."""
+    if rows.empty:
+        return f"<h3 style='color:{color};'>{html.escape(title)} (0건)</h3>"
+    trs = []
+    for _, row in rows.iterrows():
+        major = html.escape(short_text(row.get('Major Changes'), '주요 변경내역 및 게시물 요약 확인 필요', 620)).replace("\n", "<br>")
+        impact = html.escape(short_text(row.get('AI Analysis'), '영향 검토 필요', 360)).replace("\n", "<br>")
+        action = html.escape(short_text(row.get('Action Plan'), '담당 부서 확인 필요', 360)).replace("\n", "<br>")
+        trs.append(f"""
+        <tr>
+          <td style="padding:7px;border:1px solid #ddd;text-align:center;vertical-align:top;">{html.escape(str(row.get('No')))}</td>
+          <td style="padding:7px;border:1px solid #ddd;text-align:center;vertical-align:top;">{html.escape(clean(row.get('Issue')))}</td>
+          <td style="padding:7px;border:1px solid #ddd;vertical-align:top;">{html_link(row.get('Headline'), row.get('URL'))}</td>
+          <td style="padding:7px;border:1px solid #ddd;vertical-align:top;">{major}</td>
+          <td style="padding:7px;border:1px solid #ddd;vertical-align:top;">{impact}</td>
+          <td style="padding:7px;border:1px solid #ddd;vertical-align:top;">{action}</td>
+          <td style="padding:7px;border:1px solid #ddd;text-align:center;vertical-align:top;">{html.escape(clean(row.get('Country')))}</td>
+          <td style="padding:7px;border:1px solid #ddd;text-align:center;vertical-align:top;color:{risk_color(row.get('Risk'))};font-weight:bold;">{html.escape(clean(row.get('Risk')))}</td>
+          <td style="padding:7px;border:1px solid #ddd;text-align:center;vertical-align:top;">{html.escape(clean(row.get('Samsung Impact')))}</td>
+          <td style="padding:7px;border:1px solid #ddd;text-align:center;vertical-align:top;">{html.escape(executive_priority(row))}</td>
+        </tr>
+        """)
+    return f"""
+    <h3 style="margin-top:24px;color:{color};">{html.escape(title)} ({len(rows)}건)</h3>
+    <table style="border-collapse:collapse;width:100%;font-size:12px;table-layout:fixed;">
+      <colgroup>
+        <col style="width:3%;"><col style="width:7%;"><col style="width:19%;">
+        <col style="width:25%;"><col style="width:16%;"><col style="width:16%;">
+        <col style="width:5%;"><col style="width:4%;"><col style="width:5%;"><col style="width:7%;">
+      </colgroup>
+      <thead>
+        <tr style="background:{color};color:white;">
+          <th style="padding:7px;border:1px solid #ddd;">No</th>
+          <th style="padding:7px;border:1px solid #ddd;">Issue</th>
+          <th style="padding:7px;border:1px solid #ddd;">Headline</th>
+          <th style="padding:7px;border:1px solid #ddd;">주요 변경내역 + 게시물 요약</th>
+          <th style="padding:7px;border:1px solid #ddd;">삼성 영향</th>
+          <th style="padding:7px;border:1px solid #ddd;">Action</th>
+          <th style="padding:7px;border:1px solid #ddd;">Country</th>
+          <th style="padding:7px;border:1px solid #ddd;">Risk</th>
+          <th style="padding:7px;border:1px solid #ddd;">Impact</th>
+          <th style="padding:7px;border:1px solid #ddd;">Priority</th>
+        </tr>
+      </thead>
+      <tbody>{''.join(trs)}</tbody>
+    </table>
+    """
+
+# ======================================================================
+# End of GTI STEP5 Executive Quality Patch v5
+# ======================================================================
+
 def main() -> None:
     paths = output_paths()
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)

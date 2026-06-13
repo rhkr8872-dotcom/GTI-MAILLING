@@ -193,6 +193,286 @@ LEGACY_COLS = [
 ]
 
 
+
+# ======================================================================
+# GTI STEP4 Gemini Original-URL Analysis Patch v5.0
+# ======================================================================
+
+GEMINI_API_KEY = (os.getenv("GEMINI_API_KEY") or os.getenv("GOOGLE_API_KEY") or "").strip()
+GEMINI_MODEL = os.getenv("GTI_GEMINI_MODEL", "gemini-1.5-flash").strip()
+USE_GEMINI = os.getenv("GTI_STEP4_USE_GEMINI", "Y").strip().upper() not in {"N", "NO", "0", "FALSE"}
+ARTICLE_FETCH_TIMEOUT = int(os.getenv("GTI_ARTICLE_FETCH_TIMEOUT", "12"))
+ARTICLE_MAX_CHARS = int(os.getenv("GTI_ARTICLE_MAX_CHARS", "12000"))
+GEMINI_CACHE_FILE = BASE_DIR / "gti_step4_gemini_cache.xlsx"
+_GEMINI_CACHE = None
+
+def _ensure_gemini_cache():
+    global _GEMINI_CACHE
+    if _GEMINI_CACHE is not None:
+        return _GEMINI_CACHE
+    _GEMINI_CACHE = {}
+    if GEMINI_CACHE_FILE.exists():
+        try:
+            df_cache = pd.read_excel(GEMINI_CACHE_FILE)
+            for _, r in df_cache.iterrows():
+                key = clean(r.get("cache_key", ""))
+                if key:
+                    _GEMINI_CACHE[key] = {
+                        "Summary": clean(r.get("Summary", "")),
+                        "AI Analysis": clean(r.get("AI Analysis", "")),
+                        "Action Plan": clean(r.get("Action Plan", "")),
+                        "ExecutiveMessage": clean(r.get("ExecutiveMessage", "")),
+                        "article_extract_status": clean(r.get("article_extract_status", "")),
+                    }
+        except Exception:
+            _GEMINI_CACHE = {}
+    return _GEMINI_CACHE
+
+def _save_gemini_cache():
+    try:
+        cache = _ensure_gemini_cache()
+        if not cache:
+            return
+        rows = []
+        for key, val in cache.items():
+            row = {"cache_key": key}
+            row.update(val)
+            rows.append(row)
+        pd.DataFrame(rows).to_excel(GEMINI_CACHE_FILE, index=False)
+    except Exception:
+        pass
+
+def _analysis_cache_key(url: str, headline: str) -> str:
+    u = safe_url(url)
+    try:
+        h = normalize_text(headline)[:120]
+    except Exception:
+        h = clean(headline).lower()[:120]
+    return f"{u}|{h}"
+
+def _html_unescape(text: str) -> str:
+    try:
+        import html as _html
+        return _html.unescape(text or "")
+    except Exception:
+        return text or ""
+
+def _strip_html_to_text(html_text: str) -> str:
+    text = re.sub(r"(?is)<script[^>]*>.*?</script>", " ", html_text or "")
+    text = re.sub(r"(?is)<style[^>]*>.*?</style>", " ", text)
+    text = re.sub(r"(?is)<noscript[^>]*>.*?</noscript>", " ", text)
+    text = re.sub(r"(?i)</(p|div|li|h1|h2|h3|tr|br)>", "\n", text)
+    text = re.sub(r"(?is)<[^>]+>", " ", text)
+    text = _html_unescape(text)
+    text = re.sub(r"[ \t]+", " ", text)
+    text = re.sub(r"\n\s*\n+", "\n", text)
+    return "\n".join(line.strip() for line in text.splitlines() if line.strip()).strip()
+
+def _extract_meta_description(html_text: str) -> str:
+    patterns = [
+        r'<meta[^>]+property=["\']og:description["\'][^>]+content=["\']([^"\']+)["\']',
+        r'<meta[^>]+name=["\']description["\'][^>]+content=["\']([^"\']+)["\']',
+        r'<meta[^>]+content=["\']([^"\']+)["\'][^>]+property=["\']og:description["\']',
+        r'<meta[^>]+content=["\']([^"\']+)["\'][^>]+name=["\']description["\']',
+    ]
+    for pat in patterns:
+        m = re.search(pat, html_text or "", re.I | re.S)
+        if m:
+            return _html_unescape(re.sub(r"\s+", " ", m.group(1))).strip()
+    return ""
+
+def _looks_like_title_only(text: str, title: str) -> bool:
+    t = clean(text)
+    h = clean(title)
+    if not t:
+        return True
+    if h and (t == h or t.replace(" ", "") == h.replace(" ", "")):
+        return True
+    if h and len(t) <= len(h) + 30 and h[:25] in t:
+        return True
+    bad = ["관련 뉴스입니다", "공식 규제/공지 후보입니다", "본문에서 확인 불가"]
+    return any(x in t for x in bad) and len(t) < 160
+
+def fetch_article_body_for_ai(url: str) -> tuple[str, str]:
+    u = safe_url(url)
+    if not u:
+        return "", "NO_URL"
+    if u.lower().endswith(".pdf"):
+        return "", "PDF_URL_BODY_NOT_EXTRACTED"
+    try:
+        req = urllib.request.Request(
+            u,
+            headers={
+                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/129 Safari/537.36",
+                "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+                "Accept-Language": "ko-KR,ko;q=0.9,en-US;q=0.8,en;q=0.7",
+            },
+        )
+        ctx = ssl.create_default_context()
+        with urllib.request.urlopen(req, timeout=ARTICLE_FETCH_TIMEOUT, context=ctx) as resp:
+            raw = resp.read(2_000_000)
+            ctype = resp.headers.get("Content-Type", "")
+        charset = ""
+        m = re.search(r"charset=([\w\-]+)", ctype, re.I)
+        if m:
+            charset = m.group(1)
+        html_text = ""
+        for enc in ["utf-8", charset, "cp949", "euc-kr", "latin-1"]:
+            if not enc:
+                continue
+            try:
+                html_text = raw.decode(enc, "ignore")
+                break
+            except Exception:
+                continue
+        if not html_text:
+            return "", "DECODE_FAILED"
+        meta = _extract_meta_description(html_text)
+        body = _strip_html_to_text(html_text)
+        if meta and meta not in body[:500]:
+            body = meta + "\n" + body
+        body = body[:ARTICLE_MAX_CHARS]
+        if len(body) < 120:
+            return body, "BODY_TOO_SHORT"
+        return body, "FETCHED_URL_BODY"
+    except Exception as exc:
+        return "", f"FETCH_FAILED:{type(exc).__name__}"
+
+def _fallback_source_body(row: pd.Series, headline: str) -> tuple[str, str]:
+    for col in [
+        "article_body", "regulation_fallback_body", "full_text", "FullText",
+        "content", "Content", "body", "Body", "Summary", "AI Analysis",
+        "ClusterHeadlines", "description", "Description",
+    ]:
+        val = clean(row.get(col, ""))
+        if val and not _looks_like_title_only(val, headline) and len(val) >= 80:
+            return val[:ARTICLE_MAX_CHARS], f"INPUT_COLUMN:{col}"
+    return "", "NO_INPUT_BODY"
+
+def _simple_body_summary(body: str, headline: str) -> str:
+    if not body:
+        return "본문 확인 불가: 원문 URL에서 본문을 가져오지 못했습니다. 제목만으로 요약하지 않았습니다."
+    text = re.sub(r"\s+", " ", body).strip()
+    parts = re.split(r"(?<=[.!?。？！])\s+|(?<=다\.)\s+|(?<=니다\.)\s+", text)
+    parts = [p.strip() for p in parts if p.strip() and not _looks_like_title_only(p, headline)]
+    if not parts:
+        return text[:350]
+    return " ".join(parts[:3])[:700]
+
+def call_gemini_json(prompt: str) -> dict:
+    if not USE_GEMINI or not GEMINI_API_KEY:
+        return {}
+    endpoint = f"https://generativelanguage.googleapis.com/v1beta/models/{GEMINI_MODEL}:generateContent?key={GEMINI_API_KEY}"
+    payload = {
+        "contents": [{"parts": [{"text": prompt}]}],
+        "generationConfig": {
+            "temperature": 0.2,
+            "topP": 0.8,
+            "maxOutputTokens": 1200,
+            "responseMimeType": "application/json",
+        },
+    }
+    try:
+        data = json.dumps(payload).encode("utf-8")
+        req = urllib.request.Request(endpoint, data=data, headers={"Content-Type": "application/json"}, method="POST")
+        with urllib.request.urlopen(req, timeout=45) as resp:
+            out = json.loads(resp.read().decode("utf-8", "ignore"))
+        text = out["candidates"][0]["content"]["parts"][0]["text"]
+        return json.loads(text)
+    except Exception as exc:
+        return {"_error": f"{type(exc).__name__}: {exc}"}
+
+def build_gti_ai_analysis(row: pd.Series, *, headline: str, url: str, issue: str, impact: str, products_text: str, default_action: str, content_type: str) -> dict:
+    cache = _ensure_gemini_cache()
+    key = _analysis_cache_key(url, headline)
+    if key in cache and clean(cache[key].get("Summary")):
+        return cache[key]
+
+    body, status = _fallback_source_body(row, headline)
+    if not body:
+        body, status = fetch_article_body_for_ai(url)
+
+    prompt = f"""
+당신은 삼성전자 본사 관세/통상 리스크 분석가입니다.
+아래 원문을 읽고 GTI Radar 임원보고용으로 분석하십시오.
+
+절대 금지:
+- 제목 반복 금지
+- "관련 뉴스입니다", "공식 규제/공지 후보입니다" 같은 템플릿 문장 금지
+- 본문에 없는 세율/HS/국가/시행일을 지어내지 말 것
+- 본문을 읽을 수 없으면 Summary에 "본문 확인 불가"라고 명시
+
+출력은 JSON만:
+{{
+  "Summary": "원문 기준 게시물 요약 2~3줄",
+  "AI Analysis": "삼성전자 관세업무 영향. 수입통관/수출통관/FTA·원산지/HS/관세비용/수출통제 중 해당 항목을 구체적으로 설명",
+  "Action Plan": "즉시조치/1주 내/1개월 내/Owner 형식의 구체적 대응방안",
+  "ExecutiveMessage": "임원용 한 문단 핵심 메시지"
+}}
+
+기본 정보:
+- Content Type: {content_type}
+- Issue: {issue}
+- Samsung Impact: {impact}
+- Affected Products: {products_text}
+- URL: {url}
+- Headline: {headline}
+- Default Action Hint: {default_action}
+
+원문:
+{body[:ARTICLE_MAX_CHARS]}
+""".strip()
+
+    result = call_gemini_json(prompt)
+    if not result or result.get("_error"):
+        summary = _simple_body_summary(body, headline)
+        if body:
+            ai = (
+                f"{issue} 이슈입니다. 삼성 영향도는 {impact}입니다. "
+                f"관련 제품/키워드는 {products_text or '본문에서 확인 불가'}입니다. "
+                "원문 본문 기반 세부 영향은 Summary 내용을 기준으로 대상 국가·품목·HS·세율·시행일을 추가 확인해야 합니다."
+            )
+        else:
+            ai = (
+                f"본문 확인 불가로 정밀 영향 분석이 제한됩니다. "
+                f"다만 제목/메타 기준 {issue} 이슈이며, 삼성 영향도는 {impact}입니다."
+            )
+        action_plan = (
+            f"즉시조치: 원문 URL 접속 가능 여부 및 본문 확보 상태를 확인하십시오. "
+            f"1주 내: 대상 국가·품목·HS·세율·시행일을 검증하십시오. "
+            f"Owner: {default_action}"
+        )
+        executive = summary[:250]
+    else:
+        summary = clean(result.get("Summary", ""))
+        ai = clean(result.get("AI Analysis", ""))
+        action_plan = clean(result.get("Action Plan", ""))
+        executive = clean(result.get("ExecutiveMessage", ""))
+
+        if _looks_like_title_only(summary, headline):
+            summary = _simple_body_summary(body, headline)
+        if not ai:
+            ai = f"{issue} 관련 삼성전자 관세업무 영향 확인 필요. 영향도: {impact}."
+        if not action_plan:
+            action_plan = default_action
+        if not executive:
+            executive = summary[:250]
+
+    final = {
+        "Summary": summary[:900],
+        "AI Analysis": ai[:1200],
+        "Action Plan": action_plan[:1200],
+        "ExecutiveMessage": executive[:700],
+        "article_extract_status": status if body else status,
+    }
+    cache[key] = final
+    _save_gemini_cache()
+    return final
+
+# ======================================================================
+# End of GTI STEP4 Gemini Original-URL Analysis Patch v5.0
+# ======================================================================
+
 def log(msg: str) -> None:
     print(f"[{datetime.now():%Y-%m-%d %H:%M:%S}] {msg}")
 
@@ -642,9 +922,20 @@ def score_row(row: pd.Series) -> dict:
     products_text = "; ".join(products) if products else "본문에서 확인 불가"
     issue_kr = TOPIC_KR.get(topic, topic)
     risk = "상" if final_score >= 85 else "중" if final_score >= MIN_SELECT_SCORE else "하"
-    summary = headline
-    ai_analysis = f"{issue_kr} 관련 뉴스입니다. 삼성 영향도는 {impact}로 분류했습니다. 관련 제품/키워드: {products_text}."
-    executive = f"{issue_kr} 이슈입니다. {action}"
+    analysis = build_gti_ai_analysis(
+        row,
+        headline=headline,
+        url=link,
+        issue=issue_kr,
+        impact=impact,
+        products_text=products_text,
+        default_action=action,
+        content_type="News",
+    )
+    summary = analysis.get("Summary", "")
+    ai_analysis = analysis.get("AI Analysis", "")
+    executive = analysis.get("ExecutiveMessage", "") or f"{issue_kr} 이슈입니다. {action}"
+    action = analysis.get("Action Plan", action)
     priority_group = "CORE" if selected and impact == "Direct" and final_score >= 85 else "POLICY_WATCH" if selected and must_keep_policy and impact == "Watch" else "USABLE" if selected else "EXCLUDED"
 
     return {
@@ -668,8 +959,8 @@ def score_row(row: pd.Series) -> dict:
         "samsung_score": samsung_score, "samsung_reason": "; ".join(reasons) if reasons else "weak_or_reference",
         "Summary": summary, "AI Analysis": ai_analysis, "Action Plan": action,
         "RejectReason": "; ".join(sorted(set(rejects))), "original_url": link,
-        "article_extract_status": clean(row.get("article_extract_status", "NOT_FETCHED_STEP4_GUARDRAIL")),
-        "article_source_type": clean(row.get("article_source_type", "STEP3_SUMMARY")),
+        "article_extract_status": analysis.get("article_extract_status", clean(row.get("article_extract_status", "NOT_FETCHED_STEP4_GUARDRAIL"))),
+        "article_source_type": clean(row.get("article_source_type", "STEP4_GEMINI_URL_BODY")),
         "effective_date_hint": "본문에서 확인 불가", "change_detail_hint": "본문에서 확인 불가", "hs_hint": "본문에서 확인 불가",
         "tariff_rate_hint": "본문에서 확인 불가", "last_checked": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
     }
