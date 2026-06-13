@@ -1893,6 +1893,499 @@ def table_html(title: str, rows: pd.DataFrame, color: str) -> str:
 # End of GTI STEP5 Executive Quality Patch v5
 # ======================================================================
 
+
+# ======================================================================
+# GTI STEP5 Final Mail Patch - 2026-06-14
+# ----------------------------------------------------------------------
+# 1) Top3는 같은 이슈를 중복 선정하지 않음
+# 2) 뉴스는 30~50건 범위 유지: Step4 summary가 적으면 audit candidates에서 보강
+# 3) 삼성전자 본사 관세담당자 관점으로 영향도 재분류
+# 4) Mail 표기: Priority -> Publish Date, 주요 변경내역+게시물 요약 -> Summary
+# 5) 총평은 짧고 실행형 문장으로 구성
+# ======================================================================
+
+NEWS_MIN_REPORT_ROWS = int(os.getenv("GTI_NEWS_MIN_REPORT_ROWS", "30"))
+NEWS_MAX_REPORT_ROWS = int(os.getenv("GTI_NEWS_MAX_REPORT_ROWS", "50"))
+NEWS_AUDIT_INPUT_FILE = Path(os.getenv("GTI_NEWS_AUDIT_INPUT_FILE", r"C:\Temp\4-2.news_ai_audit_candidates.xlsx"))
+
+
+def _text_blob(row: pd.Series) -> str:
+    return " ".join(
+        clean(row.get(c))
+        for c in [
+            "Headline", "Major Changes", "Summary", "Original Summary", "AI Analysis",
+            "Original AI Analysis", "Action Plan", "Impact Reason", "Issue",
+            "Country", "Agency", "KeywordMatches"
+        ]
+    )
+
+
+def _is_bad_report_url(url: str) -> bool:
+    low = clean(url).lower()
+    if not low:
+        return True
+    if "news.google.com" in low:
+        return True
+    return low in {
+        "https://news.google.com", "https://news.google.com/",
+        "https://google.com", "https://www.google.com", "https://www.google.com/",
+    }
+
+
+def _canonical_issue_key(row: pd.Series) -> str:
+    text = _text_blob(row).lower()
+    issue = clean(row.get("Issue")) or issue_for(row)
+
+    if any(k in text for k in ["anti-dumping", "antidumping", "countervailing", "ad/cvd", "덤핑", "반덤핑", "상계관세"]):
+        if any(k in text for k in ["zinc", "아연", "galvanized", "도금", "cold-rolled", "냉간압연", "steel", "철강"]):
+            return "AD_CVD_STEEL_ZINC"
+        return "AD_CVD_GENERAL"
+    if "cbam" in text:
+        return "CBAM_CERTIFICATE_PRICE" if ("certificate price" in text or "certificate" in text or "인증서" in text) else "CBAM_GENERAL"
+    if ("morocco" in text or "모로코" in text) and ("cepa" in text or "fta" in text):
+        return "FTA_CEPA_MOROCCO"
+    if "rare earth" in text or "희토류" in text:
+        return "EXPORT_CONTROL_RARE_EARTH"
+    if "forced labor" in text or "uflpa" in text or "강제노동" in text:
+        return "FORCED_LABOR_CUSTOMS"
+    if "section 301" in text or "section 232" in text or "301조" in text or "232조" in text:
+        return "US_SECTION_TARIFF"
+    if "보세창고" in text:
+        return "CUSTOMS_BONDED_WAREHOUSE"
+    if "보세공장" in text:
+        return "CUSTOMS_BONDED_FACTORY"
+    if "과세가격" in text or "customs valuation" in text:
+        return "CUSTOMS_VALUATION"
+
+    title = clean(row.get("Headline")).lower()
+    title = re.sub(r"\([^)]*\)|\[[^]]*\]", " ", title)
+    title = re.sub(r"[^0-9a-z가-힣]+", " ", title)
+    tokens = [t for t in title.split() if len(t) >= 2]
+    return f"{issue}:{' '.join(tokens[:7])}"
+
+
+def _normalized_issue_type(row: pd.Series) -> str:
+    issue = clean(row.get("Issue")) or issue_for(row)
+    text = _text_blob(row).lower()
+    if issue in {"AD/CVD", "반덤핑/상계관세"} or any(k in text for k in ["anti-dumping", "antidumping", "countervailing", "ad/cvd", "반덤핑", "상계관세", "덤핑방지"]):
+        return "AD_CVD"
+    if issue == "FTA/원산지" or any(k in text for k in ["fta", "cepa", "origin", "원산지"]):
+        return "FTA_ORIGIN"
+    if issue == "CBAM" or "cbam" in text:
+        return "CBAM"
+    if issue == "수출통제" or any(k in text for k in ["export control", "entity list", "uflpa", "forced labor", "수출통제", "강제노동"]):
+        return "EXPORT_CONTROL"
+    if issue in {"통관", "통관/세관"} or any(k in text for k in ["customs", "통관", "보세", "과세가격"]):
+        return "CUSTOMS"
+    if issue == "관세정책" or any(k in text for k in ["tariff", "관세", "quota", "쿼터", "section 301", "section 232"]):
+        return "TARIFF_POLICY"
+    if issue == "HS/품목분류" or any(k in text for k in ["hs code", "품목분류"]):
+        return "HS_CLASSIFICATION"
+    return issue
+
+
+def _display_issue(row: pd.Series) -> str:
+    issue = clean(row.get("Issue")) or issue_for(row)
+    text = _text_blob(row).lower()
+    if issue in {"반덤핑/상계관세", "AD/CVD"} or any(k in text for k in ["anti-dumping", "antidumping", "countervailing", "덤핑방지", "상계관세"]):
+        return "AD/CVD"
+    if any(k in text for k in ["보세공장", "보세창고", "보세운송", "반출입신고", "통관", "customs clearance", "과세가격"]):
+        return "통관/세관"
+    if issue in {"FTA/원산지"} or any(k in text for k in ["fta", "cepa", "origin", "원산지"]):
+        return "FTA/원산지"
+    return issue
+
+
+def _mail_news_score(row: pd.Series) -> float:
+    text = _text_blob(row).lower()
+    score = safe_num(row.get("Importance Score")) + risk_weight(row.get("Risk")) + priority_weight(row.get("Priority Group"))
+
+    high_terms = [
+        "anti-dumping", "antidumping", "countervailing", "ad/cvd", "덤핑", "반덤핑", "상계관세",
+        "cbam", "section 301", "section 232", "301조", "232조", "tariff", "관세", "quota", "쿼터",
+        "export control", "entity list", "forced labor", "uflpa", "수출통제", "강제노동",
+        "fta", "cepa", "origin", "원산지", "customs", "통관", "보세", "hs code", "품목분류",
+        "rare earth", "희토류", "battery", "배터리", "semiconductor", "반도체", "steel", "철강",
+    ]
+    for term in high_terms:
+        if term in text:
+            score += 220
+
+    weak_terms = [
+        "주가", "증시", "코스피", "코스닥", "환율", "부동산", "금리", "은행", "채권",
+        "혈통관리", "연예", "스포츠", "신간", "서평", "bookreview",
+        "세관인", "주무관 선정", "공무원 선정", "표창", "수상",
+    ]
+    for term in weak_terms:
+        if term in text:
+            score -= 500
+    if "수출 85.9" in text and not any(k in text for k in ["관세", "통관", "fta", "원산지", "수출통제"]):
+        score -= 700
+    if _is_bad_report_url(row.get("URL")):
+        score -= 1500
+    if _hard_reference_news(row):
+        score -= 3000
+    if clean(row.get("Content Type")) == "News":
+        score += 50
+    return score
+
+
+def _hard_reference_news(row: pd.Series) -> bool:
+    if clean(row.get("Content Type")) != "News":
+        return False
+    text = _text_blob(row).lower()
+    url = clean(row.get("URL")).lower()
+    hard_weak = [
+        "신간", "서평", "bookreview", "/culture/", "문화", "혈통관리",
+        "세관인", "주무관 선정", "공무원 선정", "표창", "수상",
+    ]
+    explicit_trade = [
+        "tariff", "관세", "customs", "통관", "fta", "cepa", "origin", "원산지",
+        "cbam", "anti-dumping", "antidumping", "countervailing", "덤핑", "상계관세",
+        "export control", "수출통제", "entity list", "forced labor", "uflpa",
+    ]
+    return any(k in text or k in url for k in hard_weak) and not any(k in text for k in explicit_trade)
+
+
+def _dedup_by_issue_or_url(rows: pd.DataFrame) -> pd.DataFrame:
+    if rows.empty:
+        return rows
+    rows = rows.copy()
+    rows["_mail_url_key"] = rows["URL"].apply(lambda v: clean(v).lower())
+    rows["_mail_issue_key"] = rows.apply(_canonical_issue_key, axis=1)
+    rows["_mail_score"] = rows.apply(_mail_news_score, axis=1)
+    rows = rows.sort_values(["_mail_score", "_sort_date"], ascending=[False, False])
+    rows = rows.drop_duplicates(subset=["_mail_url_key"], keep="first")
+    rows = rows.drop_duplicates(subset=["_mail_issue_key"], keep="first")
+    return rows.drop(columns=["_mail_url_key", "_mail_issue_key", "_mail_score"], errors="ignore").reset_index(drop=True)
+
+
+def read_step4_results() -> pd.DataFrame:
+    frames = []
+    if REGULATION_INPUT_FILE.exists():
+        frames.append(normalize_input(pd.read_excel(REGULATION_INPUT_FILE), "Regulation", REGULATION_INPUT_FILE))
+
+    news_frames = []
+    if NEWS_INPUT_FILE.exists():
+        news_frames.append(normalize_input(pd.read_excel(NEWS_INPUT_FILE), "News", NEWS_INPUT_FILE))
+    if NEWS_AUDIT_INPUT_FILE.exists():
+        try:
+            news_frames.append(normalize_input(pd.read_excel(NEWS_AUDIT_INPUT_FILE), "News", NEWS_AUDIT_INPUT_FILE))
+        except Exception as exc:
+            print(f"[WARN] news audit top-up skipped: {NEWS_AUDIT_INPUT_FILE} / {exc}")
+
+    if news_frames:
+        news = pd.concat(news_frames, ignore_index=True)
+        news = news[~news["URL"].apply(_is_bad_report_url)].copy()
+        news = _dedup_by_issue_or_url(news)
+        max_rows = NEWS_MAX_ROWS if NEWS_MAX_ROWS > 0 else NEWS_MAX_REPORT_ROWS
+        max_rows = max(NEWS_MIN_REPORT_ROWS, min(NEWS_MAX_REPORT_ROWS, max_rows))
+        frames.append(news.head(max_rows))
+
+    if not frames:
+        raise FileNotFoundError(f"STEP4 outputs not found: {REGULATION_INPUT_FILE}, {NEWS_INPUT_FILE}")
+
+    rows = pd.concat(frames, ignore_index=True)
+    rows["_dedup_key"] = rows.apply(
+        lambda r: clean(r.get("URL")).lower() or (
+            clean(r.get("Headline"))[:160] + "|" + clean(r.get("Agency")) + "|" + clean(r.get("Date"))
+        ),
+        axis=1,
+    )
+    rows = rows.drop_duplicates(subset=["_dedup_key"], keep="first").drop(columns=["_dedup_key"], errors="ignore")
+    rows["_integrated_score"] = rows.apply(
+        lambda r: priority_weight(r["Priority Group"])
+        + risk_weight(r["Risk"])
+        + (180 if r["Content Type"] == "Regulation" else 0)
+        + safe_num(r["Importance Score"]),
+        axis=1,
+    )
+    return rows.reset_index(drop=True)
+
+
+def final_samsung_impact(row: pd.Series) -> str:
+    text = _text_blob(row).lower()
+    issue = clean(row.get("Issue")) or issue_for(row)
+
+    if _hard_reference_news(row):
+        return "Reference"
+
+    direct_terms = [
+        "semiconductor", "반도체", "memory", "hbm", "display", "oled", "smartphone",
+        "battery", "배터리", "lithium", "nickel", "cobalt", "rare earth", "희토류",
+        "steel", "철강", "aluminum", "알루미늄", "copper", "zinc", "아연",
+    ]
+    actionable_terms = [
+        "anti-dumping", "antidumping", "countervailing", "ad/cvd", "덤핑", "반덤핑", "상계관세",
+        "cbam", "tariff", "관세", "quota", "쿼터", "section 301", "section 232",
+        "export control", "수출통제", "entity list", "forced labor", "uflpa", "강제노동",
+        "fta", "cepa", "origin", "원산지", "customs", "통관", "보세", "과세가격", "hs code", "품목분류",
+    ]
+    weak_terms = ["주가", "증시", "환율", "금리", "은행", "부동산", "스포츠", "연예", "혈통관리"]
+
+    if any(t in text for t in weak_terms) and not any(t in text for t in actionable_terms):
+        return "Reference"
+    if any(t in text for t in direct_terms) and any(t in text for t in actionable_terms):
+        return "Indirect"
+    if issue in {"AD/CVD", "CBAM", "FTA/원산지", "수출통제", "관세정책", "통관", "통관/세관", "HS/품목분류"}:
+        return "Indirect"
+    if any(t in text for t in actionable_terms):
+        return "Watch"
+    return clean(row.get("Samsung Impact")) or "Watch"
+
+
+def executive_priority(row: pd.Series) -> str:
+    impact = final_samsung_impact(row)
+    issue = clean(row.get("Issue")) or issue_for(row)
+    text = _text_blob(row).lower()
+    if impact == "Reference":
+        return "REFERENCE"
+    if issue in {"AD/CVD", "CBAM", "수출통제", "관세정책", "통관", "통관/세관"}:
+        return "CORE"
+    if issue in {"FTA/원산지", "HS/품목분류"}:
+        return "POLICY_WATCH"
+    if any(k in text for k in ["tariff", "관세", "quota", "쿼터", "customs", "통관", "fta", "cepa"]):
+        return "POLICY_WATCH"
+    return "WATCH"
+
+
+def report_score(row: pd.Series) -> float:
+    impact_weight = {"Direct": 2500, "Indirect": 1200, "Watch": 200, "Reference": -1500}.get(final_samsung_impact(row), 0)
+    priority = executive_priority(row)
+    pri_weight = {"CORE": 1400, "POLICY_WATCH": 900, "USABLE": 500, "WATCH": 200, "REFERENCE": -1600}.get(priority, 0)
+    issue = clean(row.get("Issue")) or issue_for(row)
+    issue_weight = {
+        "AD/CVD": 1800, "수출통제": 1600, "CBAM": 1500, "관세정책": 1400,
+        "통관": 1200, "통관/세관": 1200, "FTA/원산지": 1000, "HS/품목분류": 900,
+    }.get(issue, 250)
+    type_weight = 1100 if clean(row.get("Content Type")) == "Regulation" else 0
+    text = _text_blob(row).lower()
+    if clean(row.get("Content Type")) == "Regulation" and any(k in text for k in ["관세", "통관", "보세", "덤핑", "상계관세", "원산지", "fta", "cepa", "cbam"]):
+        type_weight += 900
+    return safe_num(row.get("Importance Score")) + risk_weight(row.get("Risk")) + impact_weight + pri_weight + issue_weight + type_weight + _mail_news_score(row) / 5
+
+
+def choose_top3(rows: pd.DataFrame) -> pd.DataFrame:
+    pool = rows.copy()
+    pool["Samsung Impact"] = pool.apply(final_samsung_impact, axis=1)
+    pool["Executive Priority"] = pool.apply(executive_priority, axis=1)
+    pool["_top3_score"] = pool.apply(report_score, axis=1)
+    pool["_issue_key"] = pool.apply(_canonical_issue_key, axis=1)
+    pool = pool[pool["Executive Priority"].ne("REFERENCE")].copy()
+    if pool.empty:
+        pool = rows.copy()
+        pool["_top3_score"] = pool.apply(report_score, axis=1)
+        pool["_issue_key"] = pool.apply(_canonical_issue_key, axis=1)
+
+    pool = pool.sort_values(["_top3_score", "_sort_date"], ascending=[False, False])
+    selected, used_keys, used_issue_types = [], set(), set()
+    for _, row in pool.iterrows():
+        key = clean(row.get("_issue_key"))
+        issue = _normalized_issue_type(row)
+        if key in used_keys:
+            continue
+        if issue in used_issue_types and len(selected) < 3:
+            continue
+        selected.append(row)
+        used_keys.add(key)
+        used_issue_types.add(issue)
+        if len(selected) == 3:
+            break
+    if len(selected) < 3:
+        for _, row in pool.iterrows():
+            key = clean(row.get("_issue_key"))
+            title = clean(row.get("Headline"))
+            if key in used_keys or any(clean(x.get("Headline")) == title for x in selected):
+                continue
+            selected.append(row)
+            used_keys.add(key)
+            if len(selected) == 3:
+                break
+    out = pd.DataFrame(selected).drop(columns=["_top3_score", "_issue_key"], errors="ignore").reset_index(drop=True)
+    if not out.empty:
+        out["No"] = range(1, len(out) + 1)
+    return out
+
+
+def prepare_rows(rows: pd.DataFrame) -> pd.DataFrame:
+    rows = rows.copy()
+    rows["Issue"] = rows.apply(issue_for, axis=1)
+    rows["Issue"] = rows.apply(_display_issue, axis=1)
+    if "Original Summary" not in rows.columns:
+        rows["Original Summary"] = rows.get("Summary", "")
+    if "Original AI Analysis" not in rows.columns:
+        rows["Original AI Analysis"] = rows.get("AI Analysis", "")
+    if "Original Action Plan" not in rows.columns:
+        rows["Original Action Plan"] = rows.get("Action Plan", "")
+
+    # Regulation은 신규/변경 법규를 모두 보여야 하므로 이슈 중복 압축을 적용하지 않는다.
+    reg = rows[rows["Content Type"].eq("Regulation")].copy()
+    news = rows[rows["Content Type"].eq("News")].copy()
+    news = news[~news["URL"].apply(_is_bad_report_url)].copy()
+    news = _dedup_by_issue_or_url(news)
+
+    rows = pd.concat([reg, news], ignore_index=True)
+    rows["Mail Group"] = rows["Content Type"].map({"Regulation": GROUP_REGULATION}).fillna(GROUP_NEWS)
+    rows["Samsung Impact"] = rows.apply(final_samsung_impact, axis=1)
+    rows["Executive Priority"] = rows.apply(executive_priority, axis=1)
+    rows.loc[rows["Executive Priority"].eq("REFERENCE"), "Priority Group"] = "REFERENCE"
+    rows.loc[~rows["Executive Priority"].eq("REFERENCE"), "Priority Group"] = rows.loc[~rows["Executive Priority"].eq("REFERENCE"), "Executive Priority"]
+    rows["Major Changes"] = rows.apply(major_changes, axis=1)
+    rows["Summary"] = rows.apply(report_summary, axis=1)
+    rows["AI Analysis"] = rows.apply(report_impact, axis=1)
+    rows["Action Plan"] = rows.apply(report_action, axis=1)
+    rows["_report_score"] = rows.apply(report_score, axis=1)
+
+    reg = rows[rows["Content Type"].eq("Regulation")].copy()
+    news = rows[rows["Content Type"].eq("News")].copy()
+    news = news.sort_values(["_report_score", "_sort_date"], ascending=[False, False]).head(NEWS_MAX_REPORT_ROWS)
+    rows = pd.concat([reg, news], ignore_index=True)
+    rows = rows.sort_values(["_report_score", "_sort_date"], ascending=[False, False]).drop(columns=["_issue_key"], errors="ignore").reset_index(drop=True)
+    rows["No"] = range(1, len(rows) + 1)
+    return rows
+
+
+def top3_summary_sentence(row: pd.Series) -> str:
+    title = clean(row.get("Headline"))
+    issue = clean(row.get("Issue")) or issue_for(row)
+    text = _text_blob(row).lower()
+    if issue == "AD/CVD":
+        if any(k in text for k in ["steel", "철강", "zinc", "아연", "도금", "냉간압연"]):
+            return f"{title} → 중국산 철강재 조달비용 상승 리스크 확대"
+        return f"{title} → 대상 HS·공급국·벤더 기준 AD/CVD 비용 및 원산지 방어자료 점검 필요"
+    if issue == "FTA/원산지":
+        if "morocco" in text or "모로코" in text:
+            return f"{title} → 배터리 공급망 안정화 및 FTA 활용 기회 확대"
+        return f"{title} → CO 발급요건, BOM 원산지, 특혜세율 적용 가능성 재검토 필요"
+    if issue == "CBAM":
+        return f"{title} → EU 수출품 탄소비용 및 CBAM 인증서 구매비용 관리 필요"
+    if issue == "수출통제":
+        return f"{title} → 핵심소재·부품 공급망과 수출통제 스크리닝 강화 필요"
+    if issue in {"통관", "통관/세관"}:
+        return f"{title} → 통관신고, 보세운영, 과세가격 자료관리 절차 점검 필요"
+    if issue == "관세정책":
+        return f"{title} → 관세율·쿼터·공급국 선택에 따른 원가 영향 재산정 필요"
+    return f"{title} → 관련 품목의 HS, 원산지, 관세율 영향 확인 필요"
+
+
+def overall_html(rows: pd.DataFrame, top3: pd.DataFrame) -> str:
+    reg = rows[rows["Content Type"].eq("Regulation")]
+    news = rows[rows["Content Type"].eq("News")]
+    direct = rows[rows["Samsung Impact"].eq("Direct")]
+    indirect = rows[rows["Samsung Impact"].eq("Indirect")]
+    watch = rows[rows["Samsung Impact"].eq("Watch")]
+    ref = rows[rows["Samsung Impact"].eq("Reference")]
+    top_lines = "".join(f"<li>{html.escape(top3_summary_sentence(r))}</li>" for _, r in top3.iterrows())
+    if not top_lines:
+        top_lines = "<li>금일 Top3 후보는 추가 검토가 필요합니다.</li>"
+    return f"""
+    <div style="background:#F7F9FC;border-left:5px solid #1F4E79;padding:13px 15px;line-height:1.65;">
+      <div>
+        금일 GTI Radar는 글로벌 통상환경에서 <b>'규제 강화'</b>와 <b>'FTA 확대'</b>가 동시에 진행되고 있으며,
+        삼성전자는 원가 리스크 관리와 공급망 다변화 전략을 병행할 필요가 있습니다.
+      </div>
+      <ul style="margin-top:8px;margin-bottom:8px;padding-left:20px;">{top_lines}</ul>
+      <div style="margin-top:8px;color:#777;font-size:12px;">
+        * 금일 선별 결과: 법규 {len(reg)}건, 주요뉴스 {len(news)}건 |
+        Direct {len(direct)}건, Indirect {len(indirect)}건, Watch {len(watch)}건, Reference {len(ref)}건
+      </div>
+    </div>
+    """
+
+
+def table_html(title: str, rows: pd.DataFrame, color: str) -> str:
+    if rows.empty:
+        return f"<h3 style='color:{color};'>{html.escape(title)} (0건)</h3>"
+    trs = []
+    for _, row in rows.iterrows():
+        summary = html.escape(short_text(row.get("Major Changes"), "Summary 확인 필요", 650)).replace("\n", "<br>")
+        impact = html.escape(short_text(row.get("AI Analysis"), "영향 검토 필요", 360)).replace("\n", "<br>")
+        action = html.escape(short_text(row.get("Action Plan"), "담당 부서 확인 필요", 360)).replace("\n", "<br>")
+        trs.append(f"""
+        <tr>
+          <td style="padding:7px;border:1px solid #ddd;text-align:center;vertical-align:top;">{html.escape(str(row.get('No')))}</td>
+          <td style="padding:7px;border:1px solid #ddd;text-align:center;vertical-align:top;">{html.escape(clean(row.get('Issue')))}</td>
+          <td style="padding:7px;border:1px solid #ddd;vertical-align:top;">{html_link(row.get('Headline'), row.get('URL'))}</td>
+          <td style="padding:7px;border:1px solid #ddd;vertical-align:top;">{summary}</td>
+          <td style="padding:7px;border:1px solid #ddd;vertical-align:top;">{impact}</td>
+          <td style="padding:7px;border:1px solid #ddd;vertical-align:top;">{action}</td>
+          <td style="padding:7px;border:1px solid #ddd;text-align:center;vertical-align:top;">{html.escape(clean(row.get('Country')))}</td>
+          <td style="padding:7px;border:1px solid #ddd;text-align:center;vertical-align:top;color:{risk_color(row.get('Risk'))};font-weight:bold;">{html.escape(clean(row.get('Risk')))}</td>
+          <td style="padding:7px;border:1px solid #ddd;text-align:center;vertical-align:top;">{html.escape(clean(row.get('Samsung Impact')))}</td>
+          <td style="padding:7px;border:1px solid #ddd;text-align:center;vertical-align:top;">{html.escape(clean(row.get('Date')))}</td>
+        </tr>
+        """)
+    return f"""
+    <h3 style="margin-top:24px;color:{color};">{html.escape(title)} ({len(rows)}건)</h3>
+    <table style="border-collapse:collapse;width:100%;font-size:12px;table-layout:fixed;">
+      <colgroup>
+        <col style="width:3%;"><col style="width:7%;"><col style="width:19%;">
+        <col style="width:25%;"><col style="width:16%;"><col style="width:16%;">
+        <col style="width:5%;"><col style="width:4%;"><col style="width:5%;"><col style="width:7%;">
+      </colgroup>
+      <thead>
+        <tr style="background:{color};color:white;">
+          <th style="padding:7px;border:1px solid #ddd;">No</th>
+          <th style="padding:7px;border:1px solid #ddd;">Issue</th>
+          <th style="padding:7px;border:1px solid #ddd;">Headline</th>
+          <th style="padding:7px;border:1px solid #ddd;">Summary</th>
+          <th style="padding:7px;border:1px solid #ddd;">삼성 영향</th>
+          <th style="padding:7px;border:1px solid #ddd;">Action</th>
+          <th style="padding:7px;border:1px solid #ddd;">Country</th>
+          <th style="padding:7px;border:1px solid #ddd;">Risk</th>
+          <th style="padding:7px;border:1px solid #ddd;">Impact</th>
+          <th style="padding:7px;border:1px solid #ddd;">Publish Date</th>
+        </tr>
+      </thead>
+      <tbody>{''.join(trs)}</tbody>
+    </table>
+    """
+
+
+def save_excel(rows: pd.DataFrame, top3: pd.DataFrame, paths: dict[str, Path]) -> None:
+    wb = Workbook()
+    sheets = [
+        ("GTI Radar", rows),
+        ("Top3 Deep Analysis", top3),
+        ("Regulation", rows[rows["Content Type"].eq("Regulation")]),
+        ("주요뉴스", rows[rows["Content Type"].eq("News")]),
+    ]
+    first = True
+    for name, frame in sheets:
+        ws = wb.active if first else wb.create_sheet(name[:31])
+        first = False
+        ws.title = name[:31]
+        ws.append(OUTPUT_COLUMNS)
+        for _, row in frame.iterrows():
+            append_output_row(ws, row)
+        style_sheet(ws)
+
+    runlog = wb.create_sheet("Run Log")
+    runlog.append(["item", "value"])
+    runlog.append(["regulation_input", str(REGULATION_INPUT_FILE)])
+    runlog.append(["news_input", str(NEWS_INPUT_FILE)])
+    runlog.append(["news_audit_input", str(NEWS_AUDIT_INPUT_FILE)])
+    runlog.append(["run_date", RUN_DATE])
+    runlog.append(["total_rows", len(rows)])
+    runlog.append(["regulation_rows", int(rows["Content Type"].eq("Regulation").sum())])
+    runlog.append(["news_rows", int(rows["Content Type"].eq("News").sum())])
+    runlog.append(["direct_rows", int(rows["Samsung Impact"].eq("Direct").sum())])
+    runlog.append(["indirect_rows", int(rows["Samsung Impact"].eq("Indirect").sum())])
+    runlog.append(["watch_rows", int(rows["Samsung Impact"].eq("Watch").sum())])
+    runlog.append(["reference_rows", int(rows["Samsung Impact"].eq("Reference").sum())])
+    runlog.append(["news_min_report_rows", NEWS_MIN_REPORT_ROWS])
+    runlog.append(["news_max_report_rows", NEWS_MAX_REPORT_ROWS])
+    style_sheet(runlog)
+    wb.save(paths["mail_xlsx"])
+    wb.save(paths["analysis"])
+    rows[OUTPUT_COLUMNS].to_excel(paths["cumulative"], index=False)
+
+
+# ======================================================================
+# End of GTI STEP5 Final Mail Patch - 2026-06-14
+# ======================================================================
+
+
 def main() -> None:
     paths = output_paths()
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
