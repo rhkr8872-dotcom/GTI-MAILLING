@@ -32,7 +32,7 @@ import warnings
 import traceback
 from openpyxl.cell.cell import ILLEGAL_CHARACTERS_RE
 from datetime import datetime, timedelta
-from urllib.parse import urlparse, parse_qs, unquote, urlunparse
+from urllib.parse import urlparse, parse_qs, unquote, urlunparse, quote
 
 import pandas as pd
 
@@ -245,6 +245,134 @@ def normalize_url(url):
         return url
 
 
+# -----------------------------------------------------------------------------
+# ORIGINAL URL RECOVERY - Google News redirect + multi URL columns
+# -----------------------------------------------------------------------------
+GOOGLE_RESOLVE_ENABLED = os.getenv("GTI_STEP3_GOOGLE_NEWS_RESOLVE", "1").strip().upper() not in {"0", "N", "NO", "FALSE"}
+GOOGLE_RESOLVE_TIMEOUT = int(os.getenv("GTI_STEP3_GOOGLE_NEWS_RESOLVE_TIMEOUT", "10"))
+_GOOGLE_RESOLVE_CACHE = {}
+
+
+def is_google_article_redirect_url(url):
+    raw = s(url).lower()
+    if not raw.startswith(("http://", "https://")):
+        return False
+    parsed = urlparse(raw)
+    return "news.google" in parsed.netloc.lower() and ("/rss/articles/" in parsed.path.lower() or "/articles/" in parsed.path.lower())
+
+
+def is_real_original_url(url):
+    raw = s(url)
+    if not raw.startswith(("http://", "https://")):
+        return False
+    parsed = urlparse(raw.lower())
+    if "news.google" in parsed.netloc or "google." in parsed.netloc:
+        return False
+    return True
+
+
+def google_news_token(url):
+    try:
+        parsed = urlparse(s(url))
+        parts = [x for x in parsed.path.split("/") if x]
+        if len(parts) >= 2 and parts[-2] in {"articles", "read"}:
+            return parts[-1]
+    except Exception:
+        pass
+    return ""
+
+
+def fetch_google_decode_params(token):
+    try:
+        import requests
+        headers = {"User-Agent": USER_AGENT}
+        for prefix in ("https://news.google.com/articles/", "https://news.google.com/rss/articles/"):
+            r = requests.get(prefix + token, headers=headers, timeout=GOOGLE_RESOLVE_TIMEOUT)
+            html = r.text or ""
+            sig = re.search(r'data-n-a-sg="([^"]+)"', html)
+            ts = re.search(r'data-n-a-ts="([^"]+)"', html)
+            if sig and ts:
+                return sig.group(1), ts.group(1)
+    except Exception:
+        pass
+    return "", ""
+
+
+def decode_google_news_token(token, signature, timestamp):
+    try:
+        import requests
+        endpoint = "https://news.google.com/_/DotsSplashUi/data/batchexecute"
+        payload = [
+            "Fbv4je",
+            (
+                '["garturlreq",[["X","X",["X","X"],null,null,1,1,"US:en",null,1,'
+                'null,null,null,null,null,0,1],"X","X",1,[1,1,1],1,1,null,0,0,null,0],'
+                f'"{token}",{timestamp},"{signature}"]'
+            ),
+        ]
+        body = "f.req=" + quote(json.dumps([[payload]], separators=(",", ":")))
+        headers = {
+            "Content-Type": "application/x-www-form-urlencoded;charset=UTF-8",
+            "User-Agent": USER_AGENT,
+        }
+        r = requests.post(endpoint, data=body.encode("utf-8"), headers=headers, timeout=GOOGLE_RESOLVE_TIMEOUT)
+        text = r.text or ""
+        parsed = json.loads(text.split("\n\n", 1)[1])[:-2]
+        return json.loads(parsed[0][2])[1]
+    except Exception:
+        return ""
+
+
+def resolve_google_news_url(url):
+    raw = s(url)
+    if not GOOGLE_RESOLVE_ENABLED or not is_google_article_redirect_url(raw):
+        return ""
+    if raw in _GOOGLE_RESOLVE_CACHE:
+        return _GOOGLE_RESOLVE_CACHE[raw]
+    token = google_news_token(raw)
+    if not token:
+        _GOOGLE_RESOLVE_CACHE[raw] = ""
+        return ""
+    signature, timestamp = fetch_google_decode_params(token)
+    if signature and timestamp:
+        resolved = normalize_url(decode_google_news_token(token, signature, timestamp))
+        if is_real_original_url(resolved):
+            _GOOGLE_RESOLVE_CACHE[raw] = resolved
+            return resolved
+    _GOOGLE_RESOLVE_CACHE[raw] = ""
+    return ""
+
+
+def choose_source_url_for_body(row):
+    """Prefer already-restored original links before fetching article body."""
+    candidates = []
+    for col in ["original_url", "OriginalURLCandidate", "BestLinkURL", "URL", "GoogleURL", "Link", "link"]:
+        if col in row and s(row.get(col)):
+            candidates.append(s(row.get(col)))
+
+    # 1) non-Google original URL first
+    for cand in candidates:
+        norm = normalize_url(cand)
+        if is_real_original_url(norm):
+            return norm, "ORIGINAL_URL_SELECTED"
+
+    # 2) Google News article redirect decode
+    for cand in candidates:
+        norm = normalize_url(cand)
+        if is_google_article_redirect_url(norm):
+            resolved = resolve_google_news_url(norm)
+            if resolved:
+                return resolved, "GOOGLE_NEWS_RESOLVED_STEP3"
+            return norm, "GOOGLE_NEWS_REDIRECT_UNRESOLVED"
+
+    # 3) last fallback
+    for cand in candidates:
+        norm = normalize_url(cand)
+        if norm.startswith(("http://", "https://")):
+            return norm, "FALLBACK_URL_SELECTED"
+    return "", "EMPTY_URL"
+
+
 def domain_of(url):
     try:
         return urlparse(normalize_url(url)).netloc.lower().replace("www.", "")
@@ -378,7 +506,10 @@ def is_bad_body(text):
 
 
 def extract_article_for_row(row, is_regulation=False):
-    url = normalize_url(row.get("URL", "") or row.get("original_url", ""))
+    url, url_status = choose_source_url_for_body(row)
+    if not url:
+        url = normalize_url(row.get("URL", "") or row.get("original_url", ""))
+        url_status = "LEGACY_URL_FALLBACK" if url else "EMPTY_URL"
     original_url = url
     existing = clean_text(row.get("article_body", ""))
     if existing:
@@ -394,10 +525,11 @@ def extract_article_for_row(row, is_regulation=False):
     fallback = clean_text(" ".join(fallback_parts), 3000)
 
     body = ""
-    status = "EMPTY_URL"
+    status = url_status or "EMPTY_URL"
     final_url = original_url
     if url.startswith("http"):
-        body, status, final_url = requests_get_text(url)
+        body, fetch_status, final_url = requests_get_text(url)
+        status = f"{url_status}|{fetch_status}" if url_status else fetch_status
         time.sleep(SLEEP_SEC)
 
     body = clean_text(body, 12000)
@@ -1016,11 +1148,30 @@ def _build_reg_fallback_body(row, fetch_status="") -> str:
 
 
 def extract_article_for_row(row, is_regulation=False):
-    url = normalize_url(_pick_value_case(row, ["URL", "url", "original_url", "Link", "link"]))
+    """Final override: recover the best source URL, then fetch article body.
+
+    Fix:
+    - url_status is always defined.
+    - Use choose_source_url_for_body() so BestLinkURL / OriginalURLCandidate / GoogleURL are considered.
+    - For regulation rows, create official metadata fallback instead of failing when body fetch is blocked.
+    """
+    try:
+        url, url_status = choose_source_url_for_body(row)
+    except Exception as exc:
+        url = ""
+        url_status = f"URL_CHOOSE_ERROR:{type(exc).__name__}"
+
+    if not url:
+        legacy = _pick_value_case(row, [
+            "original_url", "OriginalURLCandidate", "BestLinkURL", "URL", "url", "GoogleURL", "Link", "link"
+        ])
+        url = normalize_url(legacy)
+        url_status = "LEGACY_URL_FALLBACK" if url else "EMPTY_URL"
+
     original_url = url
     existing = clean_text(_pick_value_case(row, ["article_body"]))
     if existing:
-        bad, status = is_bad_body(existing)
+        bad, existing_status = is_bad_body(existing)
         if not bad:
             return existing, "EXISTING_BODY_OK", "OFFICIAL" if is_regulation else "MEDIA", "Y", "OK", "EXISTING", len(existing), original_url
 
@@ -1032,10 +1183,11 @@ def extract_article_for_row(row, is_regulation=False):
     ), 4000)
 
     body = ""
-    status = "EMPTY_URL"
+    status = url_status or "EMPTY_URL"
     final_url = original_url
     if url.startswith("http"):
-        body, status, final_url = requests_get_text(url)
+        body, fetch_status, final_url = requests_get_text(url)
+        status = f"{url_status}|{fetch_status}" if url_status else fetch_status
         time.sleep(SLEEP_SEC)
 
     body = clean_text(body, 12000)
@@ -1043,6 +1195,7 @@ def extract_article_for_row(row, is_regulation=False):
     if not bad:
         return body, status, "OFFICIAL" if is_regulation else "MEDIA", "Y", "OK", "FETCHED_HTML", len(body), final_url
 
+    # Regulation is important: if official source/body is blocked, keep metadata body for Step4 review.
     if is_regulation and _is_official_reg_row(row):
         reg_body = _build_reg_fallback_body(row, fetch_status=f"{status}:{q}")
         quality = "OFFICIAL_TRADE_FALLBACK" if _has_trade_reg_signal(row) else "OFFICIAL_FALLBACK_REVIEW"
@@ -1052,7 +1205,6 @@ def extract_article_for_row(row, is_regulation=False):
         return fallback, "INPUT_FALLBACK", "OFFICIAL" if is_regulation else "MEDIA", "Y", "FALLBACK_OK", "INPUT_FALLBACK", len(fallback), final_url
 
     return "", f"{status}:{q}", "OFFICIAL" if is_regulation else "MEDIA", "N", q if q else "EMPTY", "EMPTY", 0, final_url
-
 
 def load_regulation_input():
     p = first_existing(REG_INPUT_CANDIDATES)

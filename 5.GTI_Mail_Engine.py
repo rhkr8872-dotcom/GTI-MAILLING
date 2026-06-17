@@ -3833,82 +3833,47 @@ def choose_top3(rows: pd.DataFrame) -> pd.DataFrame:
 
 
 # ======================================================================
-# GTI STEP5 Weighted Score Display Patch v17 - 2026-06-15
+# GTI STEP5 Weighted Score Patch v18
 # ----------------------------------------------------------------------
-# Reads STEP4-2 weighted score fields:
-# - CustomsTradeLawScore      (30)
-# - CustomsTradePolicyScore   (20)
-# - DirectImpactScore         (40)
-# - IndirectImpactScore       (10)
-# - WeightedScore / ScoreBreakdown
-# and sorts 주요뉴스 / Top3 by the same basis.
+# - Use WeightedScore from STEP4 as the primary report sort/top3 basis.
+# - Preserve score breakdown columns in Excel output when present.
+# - Reclassify noisy/low-action articles as lower priority for mail layout.
 # ======================================================================
 
-for _col in ["WeightedScore", "ScoreBreakdown", "CustomsTradeLawScore", "CustomsTradePolicyScore", "DirectImpactScore", "IndirectImpactScore", "Publish Date"]:
-    try:
-        if _col not in OUTPUT_COLUMNS:
-            insert_at = OUTPUT_COLUMNS.index("Importance Score") + 1 if "Importance Score" in OUTPUT_COLUMNS else len(OUTPUT_COLUMNS)
-            OUTPUT_COLUMNS.insert(insert_at, _col)
-    except Exception:
-        pass
+def weighted_score_value(row: pd.Series) -> float:
+    return safe_num(row.get("WeightedScore")) or safe_num(row.get("Importance Score")) or safe_num(row.get("final_score"))
 
-
-def _s5w_text(value) -> str:
-    return clean(value)
-
-
-def _s5w_num(value) -> float:
-    return safe_num(value)
-
-
-def _s5w_blob(row: pd.Series) -> str:
-    return " ".join(_s5w_text(row.get(c)) for c in ["Headline", "Summary", "AI Analysis", "Action Plan", "Issue", "ScoreBreakdown"]).lower()
-
-
-def _s5w_score(row: pd.Series) -> float:
-    # STEP4 weighted score is source of truth for News.
-    if clean(row.get("Content Type")) == "News":
-        ws = _s5w_num(row.get("WeightedScore")) or _s5w_num(row.get("Importance Score"))
-        return ws
-    # Regulation still gets a small premium in integrated report, but Top3 remains weighted.
-    return _s5w_num(row.get("Importance Score")) + 15
-
-
-def report_score(row: pd.Series) -> float:
-    """v17 override: use STEP4 weighted score for news ordering."""
-    base = _s5w_score(row)
-    issue = clean(row.get("Issue"))
-    bonus = {
-        "AD/CVD": 8,
-        "반덤핑/상계관세": 8,
-        "CBAM": 7,
-        "수출통제": 7,
-        "FTA/원산지": 5,
-        "관세정책": 5,
-        "HS/품목분류": 4,
-        "통관": 3,
-        "통관/세관": 3,
-    }.get(issue, 0)
-    return base + bonus
-
-
-def top3_deep_score(row: pd.Series) -> float:
-    """v17 override: Top3 is based on weighted customs/samsung score."""
-    score = report_score(row)
-    blob = _s5w_blob(row)
-    if any(t in blob for t in ["anti-dumping", "antidumping", "countervailing", "반덤핑", "상계관세", "덤핑방지"]):
-        score += 8
-    if any(t in blob for t in ["cbam", "탄소국경", "export control", "수출통제", "entity list", "forced labor", "uflpa"]):
-        score += 7
-    if any(t in blob for t in ["samsung", "삼성", "semiconductor", "반도체", "battery", "배터리", "steel", "철강"]):
+def weighted_report_score(row: pd.Series) -> float:
+    score = weighted_score_value(row)
+    # Regulation still gets small boost because it is official source.
+    if clean(row.get("Content Type")) == "Regulation":
         score += 5
-    if any(t in blob for t in ["글자크기", "이전 기사보기", "주가", "증시", "신간"]):
-        score -= 30
+    # Penalize obvious non-reportable phrases that may still pass.
+    blob = " ".join(clean(row.get(c)) for c in ["Headline", "Summary", "Major Changes", "AI Analysis"]).lower()
+    noise = ["마케팅", "신약", "비비드", "축제", "브랜드", "주가", "전략회의", "칼럼", "스포츠"]
+    if any(x in blob for x in noise):
+        score -= 50
     return score
 
+def report_score(row: pd.Series) -> float:
+    """v18 override: STEP5 follows STEP4 WeightedScore."""
+    return weighted_report_score(row)
+
+def top3_deep_score(row: pd.Series) -> float:
+    """v18 override: TOP3 by weighted score + strategic issue boost."""
+    score = weighted_report_score(row)
+    issue = clean(row.get("Issue"))
+    if issue in {"AD/CVD", "반덤핑/상계관세"}:
+        score += 12
+    elif issue == "수출통제":
+        score += 10
+    elif issue == "CBAM":
+        score += 9
+    elif issue in {"FTA/원산지", "관세정책", "HS/품목분류"}:
+        score += 6
+    return score
 
 def prepare_rows(rows: pd.DataFrame) -> pd.DataFrame:
-    """v17 override: preserve STEP4 weighted score columns and sort by weighted score."""
     rows = rows.copy()
     rows["Issue"] = rows.apply(issue_for, axis=1)
     rows = dedup_report_rows(rows)
@@ -3922,25 +3887,620 @@ def prepare_rows(rows: pd.DataFrame) -> pd.DataFrame:
     rows["No"] = range(1, len(rows) + 1)
     return rows
 
-
-def top3_summary_sentence(row: pd.Series) -> str:
-    issue = clean(row.get("Issue"))
-    score_info = clean(row.get("ScoreBreakdown"))
-    suffix = f" ({score_info})" if score_info else ""
-    if issue in {"AD/CVD", "반덤핑/상계관세"}:
-        return f"AD/CVD 이슈는 대상 HS·공급국·벤더 기준 추가관세 비용과 원산지·가격자료 방어체계 점검이 필요합니다.{suffix}"
-    if issue == "FTA/원산지":
-        return f"FTA·원산지 이슈는 CO 발급요건, BOM 원산지, FTA Master 정합성 재검토가 필요합니다.{suffix}"
-    if issue == "수출통제":
-        return f"수출통제 이슈는 ECCN·전략물자 분류와 거래처·최종사용자 스크리닝 강화가 필요합니다.{suffix}"
-    if issue == "CBAM":
-        return f"CBAM 이슈는 EU향 품목의 배출량 자료, 인증서 비용, 공급사 데이터 확보 체계 점검이 필요합니다.{suffix}"
-    if issue in {"관세정책", "통관", "통관/세관", "HS/품목분류"}:
-        return f"관세·통관 정책 변화는 대상 품목의 HS, 원산지, 세율 및 신고 프로세스 영향 확인이 필요합니다.{suffix}"
-    return short_text(row.get("Major Changes"), "관세·통상 영향 여부를 원문 기준으로 확인해야 합니다.", 150) + suffix
+# Extend Excel output columns if weighted columns exist.
+for _col in ["WeightedScore", "ScoreBreakdown", "CustomsTradeLawScore", "CustomsTradePolicyScore", "DirectImpactScore", "IndirectImpactScore"]:
+    if _col not in OUTPUT_COLUMNS:
+        OUTPUT_COLUMNS.append(_col)
 
 # ======================================================================
-# End of GTI STEP5 Weighted Score Display Patch v17
+# End of GTI STEP5 Weighted Score Patch v18
+# ======================================================================
+
+
+# ======================================================================
+# GTI STEP5 Weighted Score Patch v19
+# ----------------------------------------------------------------------
+# Fix:
+# - save_excel() KeyError when OUTPUT_COLUMNS contains weighted columns
+#   but rows does not include them.
+# - Ensure missing output columns are created before Excel/HTML generation.
+# - Recalculate weighted columns in STEP5 when STEP4 file does not contain them.
+# ======================================================================
+
+WEIGHTED_COLS_V19 = [
+    "Publish Date",
+    "CustomsTradeLawScore",
+    "CustomsTradePolicyScore",
+    "DirectImpactScore",
+    "IndirectImpactScore",
+    "WeightedScore",
+    "ScoreBreakdown",
+]
+
+def ensure_output_columns_v19(df: pd.DataFrame) -> pd.DataFrame:
+    df = df.copy()
+    for col in WEIGHTED_COLS_V19:
+        if col not in df.columns:
+            df[col] = ""
+    for col in OUTPUT_COLUMNS:
+        if col not in df.columns:
+            df[col] = ""
+    return df
+
+def _v19_blob(row: pd.Series) -> str:
+    return " ".join(clean(row.get(c)) for c in [
+        "Headline", "Issue", "Major Changes", "Summary", "AI Analysis",
+        "Action Plan", "KeywordMatches", "Country", "Agency"
+    ]).lower()
+
+def _v19_contains(blob: str, terms: list[str]) -> bool:
+    return any(t.lower() in blob for t in terms)
+
+def recalc_weighted_score_v19(row: pd.Series) -> pd.Series:
+    """Fallback weighted score calculation inside STEP5."""
+    blob = _v19_blob(row)
+    issue = clean(row.get("Issue"))
+    impact = clean(row.get("Samsung Impact"))
+
+    law_terms = [
+        "법령", "고시", "공고", "규칙", "관세법", "federal register", "regulation",
+        "anti-dumping", "antidumping", "countervailing", "ad/cvd", "반덤핑", "덤핑방지",
+        "상계관세", "cbam", "carbon border", "fta", "cepa", "rules of origin",
+        "원산지", "hs code", "품목분류", "customs", "통관", "세관", "관세청",
+    ]
+    policy_terms = [
+        "관세", "tariff", "section 301", "section 232", "수출통제", "export control",
+        "entity list", "cbam", "탄소국경", "fta", "cepa", "반덤핑", "상계관세",
+        "quota", "쿼터", "제재", "sanction",
+    ]
+    direct_terms = [
+        "samsung electronics", "samsung sdi", "samsung display", "삼성전자",
+        "삼성sdi", "삼성디스플레이", "semiconductor", "반도체", "ai chip",
+        "배터리", "battery", "display", "oled", "스마트폰", "galaxy",
+    ]
+    indirect_terms = [
+        "steel", "철강", "알루미늄", "aluminum", "희토류", "rare earth",
+        "리튬", "lithium", "공급망", "supply chain", "조달", "원가",
+        "중국", "미국", "eu", "베트남", "인도", "멕시코", "폴란드",
+    ]
+
+    law = safe_num(row.get("CustomsTradeLawScore"))
+    policy = safe_num(row.get("CustomsTradePolicyScore"))
+    direct = safe_num(row.get("DirectImpactScore"))
+    indirect = safe_num(row.get("IndirectImpactScore"))
+
+    if not law:
+        if issue in {"AD/CVD", "반덤핑/상계관세", "CBAM", "FTA/원산지", "HS/품목분류"}:
+            law = 30
+        elif _v19_contains(blob, law_terms):
+            law = 20
+        else:
+            law = 0
+
+    if not policy:
+        if issue in {"수출통제", "관세정책", "AD/CVD", "반덤핑/상계관세", "CBAM"}:
+            policy = 20
+        elif _v19_contains(blob, policy_terms):
+            policy = 12
+        else:
+            policy = 0
+
+    if not direct:
+        if impact == "Direct":
+            direct = 40
+        elif _v19_contains(blob, direct_terms) and (law + policy) > 0:
+            direct = 30
+        else:
+            direct = 0
+
+    if not indirect:
+        if impact == "Indirect":
+            indirect = 10
+        elif _v19_contains(blob, indirect_terms) and (law + policy) > 0:
+            indirect = 6
+        elif impact == "Watch" and (law + policy) > 0:
+            indirect = 3
+        else:
+            indirect = 0
+
+    weighted = law + policy + direct + indirect
+    row["CustomsTradeLawScore"] = int(law)
+    row["CustomsTradePolicyScore"] = int(policy)
+    row["DirectImpactScore"] = int(direct)
+    row["IndirectImpactScore"] = int(indirect)
+    row["WeightedScore"] = int(weighted)
+    row["ScoreBreakdown"] = f"법규30={int(law)}; 정책20={int(policy)}; 직접40={int(direct)}; 간접10={int(indirect)}"
+    if not clean(row.get("Publish Date")):
+        row["Publish Date"] = clean(row.get("Date"))
+    return row
+
+def prepare_rows(rows: pd.DataFrame) -> pd.DataFrame:
+    rows = rows.copy()
+    rows["Issue"] = rows.apply(issue_for, axis=1)
+    rows = dedup_report_rows(rows)
+    rows["Mail Group"] = rows["Content Type"].map({"Regulation": GROUP_REGULATION}).fillna(GROUP_NEWS)
+    rows["Major Changes"] = rows.apply(major_changes, axis=1)
+    rows["Summary"] = rows.apply(report_summary, axis=1)
+    rows["AI Analysis"] = rows.apply(report_impact, axis=1)
+    rows["Action Plan"] = rows.apply(report_action, axis=1)
+
+    for col in WEIGHTED_COLS_V19:
+        if col not in rows.columns:
+            rows[col] = ""
+
+    rows = rows.apply(recalc_weighted_score_v19, axis=1)
+    rows["_report_score"] = rows.apply(report_score, axis=1)
+    rows = ensure_output_columns_v19(rows)
+    rows = rows.sort_values(["_report_score", "_sort_date"], ascending=[False, False]).reset_index(drop=True)
+    rows["No"] = range(1, len(rows) + 1)
+    return rows
+
+def save_excel(rows: pd.DataFrame, top3: pd.DataFrame, paths: dict[str, Path]) -> None:
+    """v19 override: ensure all configured OUTPUT_COLUMNS exist before saving."""
+    rows = ensure_output_columns_v19(rows)
+    top3 = ensure_output_columns_v19(top3)
+    paths["mail_xlsx"].parent.mkdir(parents=True, exist_ok=True)
+
+    with pd.ExcelWriter(paths["mail_xlsx"], engine="openpyxl") as writer:
+        rows[OUTPUT_COLUMNS].to_excel(writer, index=False, sheet_name="GTI Radar")
+        top3[OUTPUT_COLUMNS].to_excel(writer, index=False, sheet_name="Top3")
+        ws = writer.book["GTI Radar"]
+        for row in ws.iter_rows():
+            for cell in row:
+                cell.alignment = Alignment(vertical="top", wrap_text=True)
+        for col_cells in ws.columns:
+            width = min(max(len(str(c.value or "")) for c in col_cells) + 2, 60)
+            ws.column_dimensions[col_cells[0].column_letter].width = width
+
+    rows[OUTPUT_COLUMNS].to_excel(paths["cumulative"], index=False)
+
+# Ensure OUTPUT_COLUMNS includes weighted columns safely.
+for _col in WEIGHTED_COLS_V19:
+    if _col not in OUTPUT_COLUMNS:
+        OUTPUT_COLUMNS.append(_col)
+
+# ======================================================================
+# End of GTI STEP5 Weighted Score Patch v19
+# ======================================================================
+
+
+# ======================================================================
+# GTI STEP5 News Recovery Patch v20
+# ----------------------------------------------------------------------
+# Fix:
+# - STEP5 output shows news=0 although STEP4 selected 30 news.
+# - Root cause is usually NEWS_INPUT_FILE path/read/filter mismatch or
+#   later STEP5 candidate filtering dropping all News rows.
+#
+# What v20 does:
+# 1) Reads news from multiple safe fallback sources:
+#    - C:\Temp\4-2.news_ai_summary.xlsx
+#    - C:\Temp\4.news_ai_analysis.xlsx
+#    - C:\Temp\4-2.news_ai_audit_candidates.xlsx
+#    - output_dir\4.news_ai_analysis.xlsx
+# 2) Preserves at least GTI_NEWS_MIN_REPORT_ROWS news rows when available.
+# 3) Uses WeightedScore / final_score to sort news.
+# 4) Logs the source and row counts so you can verify what STEP5 actually read.
+# ======================================================================
+
+NEWS_FALLBACK_FILES_V20 = [
+    NEWS_INPUT_FILE,
+    Path(os.getenv("GTI_NEWS_LEGACY_FILE", r"C:\Temp\4.news_ai_analysis.xlsx")),
+    NEWS_AUDIT_INPUT_FILE if "NEWS_AUDIT_INPUT_FILE" in globals() else Path(r"C:\Temp\4-2.news_ai_audit_candidates.xlsx"),
+    OUTPUT_DIR / "4.news_ai_analysis.xlsx",
+]
+
+def _v20_existing_files(paths: list[Path]) -> list[Path]:
+    out = []
+    seen = set()
+    for p in paths:
+        try:
+            p = Path(p)
+            key = str(p).lower()
+            if key in seen:
+                continue
+            seen.add(key)
+            if p.exists():
+                out.append(p)
+        except Exception:
+            pass
+    return out
+
+def _v20_sort_cols(df: pd.DataFrame) -> tuple[list[str], list[bool]]:
+    cols, asc = [], []
+    for col, ascending in [
+        ("WeightedScore", False),
+        ("final_score", False),
+        ("Importance Score", False),
+        ("_sort_date", False),
+        ("Date", False),
+    ]:
+        if col in df.columns:
+            cols.append(col)
+            asc.append(ascending)
+    return cols, asc
+
+def _v20_normalize_news_file(path: Path) -> pd.DataFrame:
+    try:
+        raw = pd.read_excel(path)
+    except Exception as exc:
+        print(f"[WARN] v20 news read failed: {path} / {type(exc).__name__}: {exc}")
+        return pd.DataFrame()
+
+    if raw is None or raw.empty:
+        print(f"[WARN] v20 news file empty: {path}")
+        return pd.DataFrame()
+
+    # If this is already a STEP5 output, keep News rows only before re-normalizing.
+    if "Content Type" in raw.columns:
+        raw_news = raw[raw["Content Type"].astype(str).str.lower().eq("news")].copy()
+        if not raw_news.empty:
+            raw = raw_news
+
+    try:
+        news = normalize_input(raw, "News", path)
+    except Exception as exc:
+        print(f"[WARN] v20 news normalize failed: {path} / {type(exc).__name__}: {exc}")
+        return pd.DataFrame()
+
+    if news.empty:
+        print(f"[WARN] v20 normalized news empty: {path}")
+        return pd.DataFrame()
+
+    # Preserve weighted columns from raw if normalize_input did not carry them.
+    for col in [
+        "WeightedScore", "ScoreBreakdown", "CustomsTradeLawScore", "CustomsTradePolicyScore",
+        "DirectImpactScore", "IndirectImpactScore", "final_score", "priority_group", "mail_section",
+        "selected",
+    ]:
+        if col in raw.columns and col not in news.columns and len(raw) == len(news):
+            news[col] = raw[col].values
+
+    # If raw was already final STEP5 output, WeightedScore columns may exist but Date order differs.
+    for col in ["WeightedScore", "CustomsTradeLawScore", "CustomsTradePolicyScore", "DirectImpactScore", "IndirectImpactScore"]:
+        if col not in news.columns:
+            news[col] = ""
+
+    news["Content Type"] = "News"
+    news["Mail Group"] = GROUP_NEWS
+    if "Priority Group" not in news.columns or news["Priority Group"].astype(str).str.strip().eq("").all():
+        news["Priority Group"] = "CORE"
+
+    return news
+
+def _v20_collect_news_rows() -> pd.DataFrame:
+    frames = []
+    for path in _v20_existing_files(NEWS_FALLBACK_FILES_V20):
+        df = _v20_normalize_news_file(path)
+        if not df.empty:
+            print(f"[INFO] v20 news source loaded: {path} rows={len(df)}")
+            frames.append(df)
+
+    if not frames:
+        print("[WARN] v20 no news source loaded")
+        return pd.DataFrame()
+
+    news = pd.concat(frames, ignore_index=True, sort=False)
+
+    # Remove rows with no headline.
+    news = news[news["Headline"].astype(str).str.strip().ne("")].copy()
+
+    # Dedup by URL first, then headline.
+    if "URL" in news.columns:
+        news["_url_key"] = news["URL"].astype(str).str.lower().str.strip()
+        news = news.sort_values(_v20_sort_cols(news)[0], ascending=_v20_sort_cols(news)[1]) if _v20_sort_cols(news)[0] else news
+        news = news.drop_duplicates(subset=["_url_key"], keep="first").drop(columns=["_url_key"], errors="ignore")
+    news["_headline_key"] = news["Headline"].astype(str).str.lower().str.replace(r"[^0-9a-z가-힣]+", " ", regex=True).str.strip().str[:140]
+    news = news.drop_duplicates(subset=["_headline_key"], keep="first").drop(columns=["_headline_key"], errors="ignore")
+
+    cols, asc = _v20_sort_cols(news)
+    if cols:
+        news = news.sort_values(cols, ascending=asc)
+
+    target_min = int(os.getenv("GTI_NEWS_MIN_REPORT_ROWS", "30"))
+    target_max = int(os.getenv("GTI_NEWS_MAX_REPORT_ROWS", "50"))
+    if NEWS_MAX_ROWS > 0:
+        target_max = min(target_max, NEWS_MAX_ROWS)
+    target = max(target_min, min(target_max, len(news)))
+    news = news.head(target).reset_index(drop=True)
+
+    print(f"[INFO] v20 news recovered={len(news)} target={target} from_sources={len(frames)}")
+    return news
+
+def read_step4_results() -> pd.DataFrame:
+    frames = []
+
+    if REGULATION_INPUT_FILE.exists():
+        try:
+            reg = normalize_input(pd.read_excel(REGULATION_INPUT_FILE), "Regulation", REGULATION_INPUT_FILE)
+            frames.append(reg)
+            print(f"[INFO] v20 regulation loaded: {REGULATION_INPUT_FILE} rows={len(reg)}")
+        except Exception as exc:
+            print(f"[WARN] v20 regulation read failed: {REGULATION_INPUT_FILE} / {type(exc).__name__}: {exc}")
+
+    news = _v20_collect_news_rows()
+    if not news.empty:
+        frames.append(news)
+
+    if not frames:
+        raise FileNotFoundError(f"STEP4 outputs not found: {REGULATION_INPUT_FILE}, {NEWS_INPUT_FILE}")
+
+    rows = pd.concat(frames, ignore_index=True, sort=False)
+    rows["URL"] = rows.apply(lambda r: best_url_from_values([r.get("URL"), r.get("Source")]), axis=1)
+
+    rows["_dedup_key"] = rows.apply(
+        lambda r: clean(r.get("URL")).lower() or (
+            clean(r.get("Headline"))[:160] + "|" + clean(r.get("Agency")) + "|" + clean(r.get("Date"))
+        ),
+        axis=1,
+    )
+    rows = rows.drop_duplicates(subset=["_dedup_key"], keep="first").drop(columns=["_dedup_key"], errors="ignore")
+
+    rows["_integrated_score"] = rows.apply(
+        lambda r: priority_weight(r.get("Priority Group")) + risk_weight(r.get("Risk")) +
+                  (180 if clean(r.get("Content Type")) == "Regulation" else 0) +
+                  safe_num(r.get("Importance Score")) + safe_num(r.get("WeightedScore")),
+        axis=1,
+    )
+
+    print(
+        f"[INFO] v20 total input rows={len(rows)} / "
+        f"regulation={int(rows['Content Type'].eq('Regulation').sum())} / "
+        f"news={int(rows['Content Type'].eq('News').sum())}"
+    )
+    return rows.reset_index(drop=True)
+
+# ======================================================================
+# End of GTI STEP5 News Recovery Patch v20
+# ======================================================================
+
+
+# ======================================================================
+# GTI STEP5 Freshness & Executive Summary Patch v21
+# ----------------------------------------------------------------------
+# 목적:
+# 1) 오래된 Regulation/News가 Top3에 선정되는 문제 방지
+#    - 2025년 기사, 수개월 전 DGFT 공지 등 자동 Reference/제외
+# 2) 총평 문구 수정:
+#    - "금일 GTI Radar는 [Top3 핵심내용을 1문장으로] ..."
+#    - 선별결과는 회색 작은 글씨로 하단 표시
+# 3) News 30건이 STEP4에 있으면 STEP5에서 최대한 유지
+#
+# 주요 환경변수:
+# - GTI_MAX_REPORT_AGE_DAYS=45         전체 메일 본문 허용 최대 일수
+# - GTI_MAX_TOP3_AGE_DAYS=14           Top3 허용 최대 일수
+# - GTI_ALLOW_STALE_ITEMS=N            Y면 오래된 건도 유지
+# ======================================================================
+
+GTI_MAX_REPORT_AGE_DAYS = int(os.getenv("GTI_MAX_REPORT_AGE_DAYS", "45"))
+GTI_MAX_TOP3_AGE_DAYS = int(os.getenv("GTI_MAX_TOP3_AGE_DAYS", "14"))
+GTI_ALLOW_STALE_ITEMS = os.getenv("GTI_ALLOW_STALE_ITEMS", "N").strip().upper() in {"Y", "YES", "TRUE", "1"}
+
+_MONTH_MAP_V21 = {
+    "jan": 1, "january": 1, "feb": 2, "february": 2, "mar": 3, "march": 3,
+    "apr": 4, "april": 4, "may": 5, "jun": 6, "june": 6,
+    "jul": 7, "july": 7, "aug": 8, "august": 8, "sep": 9, "sept": 9, "september": 9,
+    "oct": 10, "october": 10, "nov": 11, "november": 11, "dec": 12, "december": 12,
+}
+
+def _run_date_ts_v21():
+    dt = pd.to_datetime(RUN_DATE, errors="coerce")
+    if pd.isna(dt):
+        return pd.Timestamp(datetime.now().date())
+    return pd.Timestamp(dt.date())
+
+def extract_date_from_text_v21(text: str):
+    t = clean(text)
+    if not t:
+        return pd.NaT
+
+    # 2026-06-14 / 2026.06.14 / 2026/06/14
+    m = re.search(r"(20\d{2})[.\-/](\d{1,2})[.\-/](\d{1,2})", t)
+    if m:
+        return pd.to_datetime(f"{m.group(1)}-{int(m.group(2)):02d}-{int(m.group(3)):02d}", errors="coerce")
+
+    # August 20, 2025
+    m = re.search(r"\b([A-Za-z]{3,9})\s+(\d{1,2}),?\s+(20\d{2})\b", t)
+    if m:
+        mon = _MONTH_MAP_V21.get(m.group(1).lower())
+        if mon:
+            return pd.to_datetime(f"{m.group(3)}-{mon:02d}-{int(m.group(2)):02d}", errors="coerce")
+
+    # 6March2026 / 6 March 2026
+    m = re.search(r"\b(\d{1,2})\s*([A-Za-z]{3,9})\s*(20\d{2})\b", t)
+    if m:
+        mon = _MONTH_MAP_V21.get(m.group(2).lower())
+        if mon:
+            return pd.to_datetime(f"{m.group(3)}-{mon:02d}-{int(m.group(1)):02d}", errors="coerce")
+
+    return pd.NaT
+
+def effective_publish_date_v21(row: pd.Series):
+    for col in ["Publish Date", "Date", "published", "PublishedAt", "CollectedAt"]:
+        dt = pd.to_datetime(row.get(col), errors="coerce")
+        if not pd.isna(dt):
+            return pd.Timestamp(dt.date())
+    dt = extract_date_from_text_v21(" ".join(clean(row.get(c)) for c in ["Headline", "Summary", "Major Changes", "URL"]))
+    if not pd.isna(dt):
+        return pd.Timestamp(dt.date())
+    return pd.NaT
+
+def item_age_days_v21(row: pd.Series) -> float:
+    dt = effective_publish_date_v21(row)
+    if pd.isna(dt):
+        return 9999.0
+    return float((_run_date_ts_v21() - dt).days)
+
+def is_stale_item_v21(row: pd.Series, max_days: int = None) -> bool:
+    if GTI_ALLOW_STALE_ITEMS:
+        return False
+    max_days = GTI_MAX_REPORT_AGE_DAYS if max_days is None else max_days
+    age = item_age_days_v21(row)
+    # future dates are not stale here
+    if age < 0:
+        return False
+    return age > max_days
+
+def stale_reason_v21(row: pd.Series) -> str:
+    age = item_age_days_v21(row)
+    dt = effective_publish_date_v21(row)
+    dt_txt = "확인 불가" if pd.isna(dt) else dt.strftime("%Y-%m-%d")
+    return f"게시일 {dt_txt}, 경과 {int(age) if age < 9999 else '확인불가'}일로 금일 보고/Top3 기준에서 제외"
+
+def _issue_sentence_v21(row: pd.Series) -> str:
+    title = clean(row.get("Headline"))
+    issue = clean(row.get("Issue"))
+    if issue in {"AD/CVD", "반덤핑/상계관세"}:
+        return "반덤핑·상계관세 확대에 따른 추가관세 비용과 원산지 방어 리스크 점검이 필요합니다"
+    if issue == "수출통제":
+        return "수출통제 강화에 따른 전략물자·AI/반도체 거래 스크리닝 강화가 필요합니다"
+    if issue == "CBAM":
+        return "EU CBAM 대응을 위한 배출량 자료와 인증서 비용 관리가 필요합니다"
+    if issue == "FTA/원산지":
+        return "FTA 특혜관세 활용 가능성과 CO/BOM 원산지 정합성 점검이 필요합니다"
+    if issue in {"관세정책", "통관", "통관/세관", "HS/품목분류"}:
+        return "관세율·HS·통관 절차 변경에 따른 법인별 비용 및 신고 영향 확인이 필요합니다"
+    # fallback from title
+    return f"{title[:70]} 관련 관세·통상 영향 확인이 필요합니다"
+
+def one_sentence_overall_v21(top3: pd.DataFrame) -> str:
+    if top3 is None or top3.empty:
+        return "금일 GTI Radar는 임원 보고 대상 핵심 관세·통상 뉴스가 제한적이며, 후속 모니터링 중심으로 관리가 필요합니다."
+    phrases = []
+    for _, r in top3.head(3).iterrows():
+        s = _issue_sentence_v21(r)
+        if s not in phrases:
+            phrases.append(s)
+    if len(phrases) == 1:
+        body = phrases[0]
+    elif len(phrases) == 2:
+        body = f"{phrases[0]} 또한 {phrases[1]}"
+    else:
+        body = f"{phrases[0]} 또한 {phrases[1]} 동시에 {phrases[2]}"
+    return f"금일 GTI Radar는 {body}"
+
+def prepare_rows(rows: pd.DataFrame) -> pd.DataFrame:
+    rows = rows.copy()
+    rows["Issue"] = rows.apply(issue_for, axis=1)
+    rows = dedup_report_rows(rows)
+    rows["Mail Group"] = rows["Content Type"].map({"Regulation": GROUP_REGULATION}).fillna(GROUP_NEWS)
+    rows["Major Changes"] = rows.apply(major_changes, axis=1)
+    rows["Summary"] = rows.apply(report_summary, axis=1)
+    rows["AI Analysis"] = rows.apply(report_impact, axis=1)
+    rows["Action Plan"] = rows.apply(report_action, axis=1)
+
+    # Freshness filter: do not report stale items unless explicitly allowed.
+    if not GTI_ALLOW_STALE_ITEMS:
+        before = len(rows)
+        rows["_stale"] = rows.apply(lambda r: is_stale_item_v21(r, GTI_MAX_REPORT_AGE_DAYS), axis=1)
+        stale = rows[rows["_stale"]].copy()
+        if not stale.empty:
+            print("[INFO] v21 stale items removed from report:")
+            for _, r in stale.head(10).iterrows():
+                print(f"  - {clean(r.get('Headline'))[:120]} / {stale_reason_v21(r)}")
+        rows = rows[~rows["_stale"]].drop(columns=["_stale"], errors="ignore").copy()
+        print(f"[INFO] v21 freshness filter: before={before}, after={len(rows)}, max_age_days={GTI_MAX_REPORT_AGE_DAYS}")
+
+    # Recalculate weighted fallback columns if v19 exists.
+    try:
+        for col in WEIGHTED_COLS_V19:
+            if col not in rows.columns:
+                rows[col] = ""
+        rows = rows.apply(recalc_weighted_score_v19, axis=1)
+    except Exception:
+        pass
+
+    rows["_report_score"] = rows.apply(report_score, axis=1)
+    try:
+        rows = ensure_output_columns_v19(rows)
+    except Exception:
+        for col in OUTPUT_COLUMNS:
+            if col not in rows.columns:
+                rows[col] = ""
+
+    rows = rows.sort_values(["_report_score", "_sort_date"], ascending=[False, False]).reset_index(drop=True)
+    rows["No"] = range(1, len(rows) + 1)
+    return rows
+
+def choose_top3(rows: pd.DataFrame) -> pd.DataFrame:
+    pool = rows.copy()
+    if pool.empty:
+        return pool
+
+    # Top3 freshness is stricter than full report.
+    if not GTI_ALLOW_STALE_ITEMS:
+        pool["_stale_top3"] = pool.apply(lambda r: is_stale_item_v21(r, GTI_MAX_TOP3_AGE_DAYS), axis=1)
+        stale_top = pool[pool["_stale_top3"]].copy()
+        if not stale_top.empty:
+            print("[INFO] v21 stale items excluded from Top3:")
+            for _, r in stale_top.head(10).iterrows():
+                print(f"  - {clean(r.get('Headline'))[:120]} / {stale_reason_v21(r)}")
+        pool = pool[~pool["_stale_top3"]].drop(columns=["_stale_top3"], errors="ignore").copy()
+
+    if pool.empty:
+        return pool
+
+    pool["_top3_score"] = pool.apply(top3_deep_score, axis=1)
+    pool = pool.sort_values(["_top3_score", "_sort_date"], ascending=[False, False])
+    selected = []
+    used_issues = set()
+    for _, row in pool.iterrows():
+        issue = clean(row.get("Issue"))
+        if issue in used_issues and len(selected) < 3:
+            continue
+        selected.append(row)
+        used_issues.add(issue)
+        if len(selected) == 3:
+            break
+    if len(selected) < 3:
+        for _, row in pool.iterrows():
+            if any(clean(row.get("Headline")) == clean(x.get("Headline")) for x in selected):
+                continue
+            selected.append(row)
+            if len(selected) == 3:
+                break
+    out = pd.DataFrame(selected).reset_index(drop=True)
+    if not out.empty:
+        out["No"] = range(1, len(out) + 1)
+    return out
+
+def overall_html(rows: pd.DataFrame, top3: pd.DataFrame) -> str:
+    reg = rows[rows["Content Type"].eq("Regulation")]
+    news = rows[rows["Content Type"].eq("News")]
+    direct = rows[rows["Samsung Impact"].eq("Direct")]
+    indirect = rows[rows["Samsung Impact"].eq("Indirect")]
+    watch = rows[rows["Samsung Impact"].eq("Watch")]
+    reference = rows[rows["Samsung Impact"].eq("Reference")] if "Reference" in rows["Samsung Impact"].unique() else rows.iloc[0:0]
+
+    overall = one_sentence_overall_v21(top3)
+
+    if top3 is None or top3.empty:
+        top_lines = "<li>Top3 후보 없음: 최신성 기준을 충족하는 핵심 뉴스가 없습니다.</li>"
+    else:
+        top_lines = "".join(
+            f"<li>{html.escape(clean(r.get('Headline'))[:120])}: {html.escape(_issue_sentence_v21(r))}</li>"
+            for _, r in top3.head(3).iterrows()
+        )
+
+    result_line = (
+        f"금일 선별 결과: 법규 {len(reg)}건, 주요뉴스 {len(news)}건 | "
+        f"Direct {len(direct)}건, Indirect {len(indirect)}건, Watch {len(watch)}건, Reference {len(reference)}건"
+    )
+
+    return f"""
+    <div style="padding:15px;background:#F4F6F8;border-left:6px solid #1F4E78;margin-bottom:18px;">
+      <div style="font-size:15px;font-weight:bold;line-height:1.8;margin-bottom:10px;">
+        {html.escape(overall)}
+      </div>
+      <div style="margin-top:8px;"><b>Top3 요약</b><ol style="margin-top:6px;">{top_lines}</ol></div>
+      <div style="font-size:12px;color:#888;margin-top:12px;">
+        *{html.escape(result_line)}
+      </div>
+    </div>
+    """
+
+# ======================================================================
+# End of GTI STEP5 Freshness & Executive Summary Patch v21
 # ======================================================================
 
 def main() -> None:

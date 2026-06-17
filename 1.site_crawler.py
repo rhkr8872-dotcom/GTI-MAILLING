@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 r"""
-GTI STEP1 FINAL COMPLETE v2 - rough collection / downstream selection
+GTI STEP1 REGULATION-ONLY CLEAN v3 - official regulation sensing
 
 Input:
 - C:\temp\sites.xlsx
@@ -9,14 +9,12 @@ Output:
 - C:\temp\1.site_news_raw.xlsx        : 최종 유효 게시물
 - C:\temp\1.site_news_audit.xlsx      : 전체 수집/진단 원본
 - C:\temp\1-1.regulation_raw.xlsx     : 법규 / 공식 정부문서
-- C:\temp\1-2.site_news_raw.xlsx      : 사이트 뉴스 / 보도자료 / 기관 뉴스
 
 Output columns:
 date / title / url / source / collected_at / agency / site_type / date_status
 
 Classification rule:
 - site_type = regulation → 정부/공식기관 원문 문서
-- site_type = news       → 보도자료/뉴스/기관소식/예외 포함
 
 Search period:
 - HOURS_BACK = 24
@@ -2428,7 +2426,6 @@ def save_split_files(df):
     df.to_excel(OUT_ALL_FILE, index=False)
 
     df[df["site_type"] == "regulation"].copy().to_excel(OUT_REG_FILE, index=False)
-    df[df["site_type"] == "news"].copy().to_excel(OUT_NEWS_FILE, index=False)
 
 
 def get_recent_post_col(df):
@@ -2626,11 +2623,12 @@ def main():
         # STEP1 is now regulation-only.
         # News/site bulletin collection has moved to STEP2-3.
         if normalize_site_type(site_type) != "regulation":
+            # STEP1은 법규 전용입니다. 뉴스/보도자료 사이트는 STEP2-3에서 처리하므로
+            # 콘솔 로그와 출력 파일을 만들지 않고 조용히 skip합니다.
             skipped_count += 1
             sites.at[idx, "collected_count"] = 0
             sites.at[idx, "last_checked"] = now_str()
             sites.at[idx, "status"] = "SKIP_NEWS_MOVED_TO_STEP2_3"
-            print(f"[SKIP] news moved to STEP2-3: {site_name}")
             continue
 
         if not source_url.startswith("http"):
@@ -2820,7 +2818,6 @@ def main():
     print(f"📁 법규 전체 파일: {OUT_ALL_FILE}")
     print(f"📁 감사 파일: {OUT_AUDIT_FILE}")
     print(f"📁 법규 파일: {OUT_REG_FILE}")
-    print(f"📁 뉴스 파일: {OUT_NEWS_FILE} (empty compatibility file; site/news moved to STEP2-3)")
     print(f"📁 최종 제외 파일: {FINAL_EXCLUDED_FILE}")
     print(f"🧾 제외 로그: {REJECT_FILE}")
     print(f"📊 RAW 증가: {len(results) - total_before}")
@@ -3271,8 +3268,8 @@ def save_split_files(df):
             reg = reg.sort_values(sort_cols, ascending=ascending, kind="stable")
 
     reg.to_excel(OUT_REG_FILE, index=False)
-    # Compatibility only. Site/news collection is now handled by STEP2-3.
-    news.head(0).to_excel(OUT_NEWS_FILE, index=False)
+    # STEP1은 법규 전용입니다. 1-2.site_news_raw.xlsx는 더 이상 생성하지 않습니다.
+    # 뉴스/기관소식은 STEP2-3에서 별도 수집합니다.
 
     if "protected_regulation_candidate" in enhanced.columns:
         review = enhanced[enhanced["protected_regulation_candidate"].fillna("").astype(str).eq("Y")].copy()

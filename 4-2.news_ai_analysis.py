@@ -3331,7 +3331,7 @@ def _v16_final_weighted_top30(daily, audit, excluded):
     candidates = candidates.sort_values(["_v16_score", "Publish Date"], ascending=[False, False])
     candidates = candidates.drop_duplicates(subset=["BestLinkURL"], keep="first")
     candidates = candidates.drop_duplicates(subset=["_v16_key"], keep="first")
-    top_n = min(int(os.getenv("GTI_STEP4_NEWS_TARGET_MAX", "30")), 30)
+    top_n = min(int(os.getenv("GTI_STEP4_NEWS_TARGET_MAX", "50")), 50)
     selected = candidates.head(top_n).copy()
 
     selected["selected"] = "Y"
@@ -3364,7 +3364,7 @@ def _v16_final_weighted_top30(daily, audit, excluded):
     full_audit.loc[full_audit["selected"].eq("Y"), "mail_section"] = "News"
     full_audit.loc[full_audit["selected"].ne("Y"), "mail_section"] = "Excluded"
     full_audit.loc[full_audit["selected"].ne("Y"), "RejectReason"] = full_audit.loc[full_audit["selected"].ne("Y"), "RejectReason"].fillna("").astype(str).apply(
-        lambda v: (v + "; " if v else "") + "v16_weighted_below_top30_or_noise"
+        lambda v: (v + "; " if v else "") + "v16_weighted_below_topN_or_noise"
     )
     new_excluded = full_audit[full_audit["selected"].ne("Y")].copy()
 
@@ -3378,253 +3378,594 @@ def _v16_final_weighted_top30(daily, audit, excluded):
 
 
 # ======================================================================
-# GTI STEP4-2 Weighted TOP30 Patch v17 - 2026-06-15
+# GTI STEP4-2 Weighted Score Patch v18
 # ----------------------------------------------------------------------
-# User scoring principle:
-#   Customs/Trade Law & Regulation 30%
-# + Customs/Trade Policy            20%
-# + Samsung Direct Impact           40%
-# + Samsung Indirect Impact         10%
-# = Weighted Score 100
+# Scoring basis requested by user:
+# - Customs/Trade Law       30%
+# - Customs/Trade Policy    20%
+# - Samsung Direct Impact   40%
+# - Samsung Indirect Impact 10%
 #
-# Output:
-# - select TOP 30 by weighted score as 주요뉴스
-# - preserve URL / Publish Date
-# - write score component columns for audit and Step5
+# v18 fixes v17 issue:
+# - Do NOT give all rows 100 points.
+# - Samsung mention alone is not Direct Impact unless customs/trade relevance exists.
+# - General culture, marketing, finance, stock, event, pharma, politics, lifestyle
+#   articles are downgraded even if they contain Samsung/product words.
+# - Select Top 30 by WeightedScore after hard-noise exclusion.
 # ======================================================================
 
-GTI_WEIGHT_TOP_N = int(os.getenv("GTI_STEP4_NEWS_TOP_N", "30"))
-GTI_WEIGHT_MIN_SCORE = float(os.getenv("GTI_STEP4_WEIGHT_MIN_SCORE", "0"))
+GTI_WEIGHTED_TOP_N = int(os.getenv("GTI_WEIGHTED_TOP_N", "50"))
 
-# Ensure audit columns are exported
-for _col in [
-    "Publish Date", "CustomsTradeLawScore", "CustomsTradePolicyScore",
-    "DirectImpactScore", "IndirectImpactScore", "WeightedScore", "ScoreBreakdown"
-]:
-    try:
-        if _col not in OUTPUT_COLS:
-            OUTPUT_COLS.append(_col)
-    except Exception:
-        pass
-try:
-    if "Publish Date" not in LEGACY_COLS:
-        LEGACY_COLS.insert(LEGACY_COLS.index("Date") + 1, "Publish Date")
-except Exception:
-    pass
+V18_HARD_NOISE_TERMS = [
+    "마케팅", "고객 이탈", "리더가 사는 곳", "신약", "빅파마", "예술", "시드니",
+    "비비드", "축제", "브랜드", "주가", "증시", "선거", "국민투표", "스포츠",
+    "올림픽공원", "게임", "인벤", "피날레", "여성 예술가", "칼럼", "기고",
+    "정유업계", "최고가격제", "손실 범위", "고환율", "외화유동성",
+    "marketing", "brand", "stock", "shares", "election", "festival", "pharma",
+    "sports", "opinion", "column", "culture", "art",
+]
 
+V18_LAW_STRONG_TERMS = [
+    "법령안", "고시", "공고", "규칙", "관세법", "customs law", "federal register",
+    "regulation", "rule", "notice", "anti-dumping", "antidumping", "countervailing",
+    "ad/cvd", "덤핑방지", "반덤핑", "상계관세", "cbam", "carbon border",
+    "수출통제", "export control", "entity list", "uflpa", "forced labor",
+    "fta", "cepa", "rules of origin", "원산지", "hs code", "품목분류",
+    "customs", "clearance", "declaration", "통관", "세관", "관세청",
+]
 
-def _w17_text(value) -> str:
-    try:
-        if pd.isna(value):
-            return ""
-    except Exception:
-        pass
-    return str(value).strip()
+V18_POLICY_STRONG_TERMS = [
+    "관세", "관세율", "추가관세", "상호관세", "section 301", "301조",
+    "section 232", "232조", "tariff", "tariffs", "customs duty", "import duty",
+    "quota", "쿼터", "무관세", "safeguard", "세이프가드", "trade policy",
+    "통상 정책", "무역정책", "수출통제", "export control", "entity list",
+    "제재", "sanction", "cbam", "탄소국경", "fta", "cepa", "usmca",
+    "원산지", "덤핑방지", "반덤핑", "상계관세",
+]
 
+V18_DIRECT_COMPANY_TERMS = [
+    "samsung electronics", "samsung sdi", "samsung display", "sec", "삼성전자",
+    "삼성sdi", "삼성디스플레이", "삼성전기", "삼성바이오로직스",
+]
 
-def _w17_lower(value) -> str:
-    return _w17_text(value).lower()
+V18_CORE_PRODUCT_TERMS = [
+    "semiconductor", "semiconductors", "chip", "chips", "ai chip", "ai chips",
+    "hbm", "memory", "메모리", "반도체", "칩", "ai칩", "ai 칩",
+    "battery", "batteries", "배터리", "이차전지", "ev battery",
+    "display", "oled", "디스플레이", "smartphone", "mobile", "galaxy", "스마트폰", "갤럭시",
+]
 
+V18_SUPPLYCHAIN_TERMS = [
+    "steel", "aluminum", "copper", "lithium", "nickel", "rare earth", "graphite",
+    "철강", "알루미늄", "구리", "리튬", "니켈", "희토류", "흑연", "도금강판",
+    "냉간압연", "스테인리스강", "합판", "pcb", "wafer", "웨이퍼",
+]
 
-def _w17_blob(row: pd.Series) -> str:
-    cols = [
-        "Headline", "Summary", "AI Analysis", "Action Plan", "ExecutiveMessage",
-        "KeywordMatches", "topic", "issue_type", "topic_keyword", "topic_reason",
-        "RegulationRelated", "RegulationTransferType", "Country", "Agency", "Publisher",
-        "Source", "URL", "BestLinkURL", "affected_products", "impact_products",
-        "samsung_impact", "Samsung Impact", "Risk", "priority_group", "SelectReason",
-    ]
-    return " ".join(_w17_lower(row.get(c)) for c in cols if c in row.index)
+V18_KEY_COUNTRY_TERMS = [
+    "korea", "한국", "중국", "china", "미국", "united states", "us ", "u.s.",
+    "eu", "european union", "유럽", "베트남", "vietnam", "인도", "india",
+    "멕시코", "mexico", "폴란드", "poland", "일본", "japan", "태국", "thailand",
+    "말레이시아", "malaysia", "브라질", "brazil", "헝가리", "hungary",
+]
 
+def _v18_blob(row: pd.Series) -> str:
+    return " ".join(clean(row.get(c, "")) for c in [
+        "Headline", "Summary", "AI Analysis", "Action Plan", "KeywordMatches",
+        "ClusterHeadlines", "topic", "topic_keyword", "Issue", "Publisher",
+        "Agency", "Country", "article_body"
+    ]).lower()
 
-def _w17_has(blob: str, terms: list[str]) -> bool:
+def _v18_contains(blob: str, terms: list[str]) -> bool:
     return any(t.lower() in blob for t in terms)
 
+def _v18_noise_hit(row: pd.Series) -> bool:
+    blob = _v18_blob(row)
+    if _v18_contains(blob, V18_HARD_NOISE_TERMS):
+        # Do not mark as hard noise if it also contains very strong actionable customs terms.
+        very_strong = ["반덤핑", "덤핑방지", "상계관세", "cbam", "수출통제", "entity list", "section 301", "section 232", "customs law"]
+        return not _v18_contains(blob, very_strong)
+    return False
 
-def _w17_publish_date(row: pd.Series) -> str:
-    for c in ["Publish Date", "Date", "published", "published_at", "CollectedAt", "last_checked"]:
-        v = _w17_text(row.get(c, ""))
-        if v and v.lower() not in {"nan", "nat", "none", "확인 필요"}:
-            return v
-    return "확인 필요"
-
-
-def _w17_parse_date(value):
-    v = _w17_text(value)
-    if not v or v.lower() in {"nan", "nat", "none", "확인 필요"}:
-        return pd.NaT
-    return pd.to_datetime(v, errors="coerce")
-
-
-_W17_LAW_30_TERMS = [
-    # 법규/고시/공식문서/규제
-    "law", "regulation", "rule", "rules", "notice", "public notice", "federal register",
-    "official journal", "commission implementing", "directive", "regulation (eu)",
-    "customs notice", "trade notice", "determination", "investigation", "preliminary determination",
-    "anti-dumping", "anti dumping", "antidumping", "countervailing", "ad/cvd", "safeguard",
-    "customs duty", "import duty", "tariff rate", "tariff quota", "rules of origin",
-    "certificate of origin", "cbam", "uflpa", "forced labor", "entity list",
-    "법", "법령", "규칙", "고시", "공고", "관보", "입법예고", "행정예고", "시행령", "시행규칙",
-    "덤핑방지", "반덤핑", "상계관세", "무역구제", "세이프가드", "관세율", "관세쿼터",
-    "원산지 기준", "원산지증명", "수출의무", "수입규제", "탄소국경", "강제노동",
-]
-
-_W17_POLICY_20_TERMS = [
-    # 정책/제도/협상/통제/공급망
-    "tariff", "tariffs", "customs", "customs clearance", "declaration", "import declaration",
-    "export declaration", "section 301", "section 232", "reciprocal tariff", "quota",
-    "export control", "export controls", "entity list", "restricted", "sanction", "trade security",
-    "fta", "cepa", "tepa", "usmca", "trade agreement", "rules of origin", "supply chain",
-    "cbam", "carbon border", "forced labor", "uflpa", "hs code", "classification",
-    "관세", "관세율", "통관", "수입신고", "수출신고", "수출통제", "전략물자", "제재",
-    "쿼터", "할당관세", "상호관세", "자유무역협정", "무역협정", "원산지", "공급망",
-    "무역안보", "탄소국경", "강제노동", "품목분류",
-]
-
-_W17_DIRECT_40_TERMS_EXACT = [
-    "samsung electronics", "samsung sdi", "samsung display", "samsung semiconductor",
-    "삼성전자", "삼성sdi", "삼성디스플레이", "삼성 반도체", "sec/hq",
-]
-
-_W17_DIRECT_40_PRODUCT_TERMS = [
-    # Samsung core product/material signals
-    "semiconductor", "semiconductors", "chip", "chips", "ai chip", "hbm", "memory",
-    "battery", "batteries", "ev battery", "display", "oled", "smartphone", "mobile phone",
-    "galaxy", "tv", "appliance", "home appliance", "camera module", "pcb", "wafer",
-    "rare earth", "lithium", "nickel", "cobalt", "steel", "aluminum", "copper",
-    "반도체", "칩", "ai칩", "ai 칩", "hbm", "메모리", "배터리", "이차전지", "디스플레이",
-    "oled", "스마트폰", "휴대폰", "갤럭시", "tv", "가전", "카메라모듈", "pcb", "웨이퍼",
-    "희토류", "리튬", "니켈", "코발트", "철강", "강판", "도금강판", "알루미늄", "구리",
-]
-
-_W17_WORK_IMPACT_TERMS = [
-    "tariff", "customs", "customs duty", "import duty", "anti-dumping", "antidumping",
-    "countervailing", "ad/cvd", "cbam", "export control", "entity list", "forced labor", "uflpa",
-    "origin", "rules of origin", "fta", "cepa", "hs code", "classification", "quota",
-    "관세", "통관", "반덤핑", "덤핑방지", "상계관세", "탄소국경", "수출통제", "전략물자",
-    "강제노동", "원산지", "fta", "cepa", "품목분류", "쿼터",
-]
-
-_W17_INDIRECT_COUNTRY_TERMS = [
-    "china", "chinese", "us", "usa", "united states", "eu", "europe", "vietnam", "india",
-    "mexico", "brazil", "poland", "hungary", "slovakia", "korea", "japan", "thailand",
-    "malaysia", "indonesia", "philippines", "turkiye", "morocco", "canada",
-    "중국", "미국", "유럽", "eu", "베트남", "인도", "멕시코", "브라질", "폴란드", "헝가리",
-    "슬로바키아", "한국", "일본", "태국", "말레이시아", "인도네시아", "필리핀", "튀르키예", "모로코", "캐나다",
-]
-
-_W17_INDIRECT_TERMS = [
-    "supply chain", "supplier", "vendor", "raw material", "component", "manufacturing", "production",
-    "export", "import", "trade", "logistics", "customs", "tariff", "fta", "origin",
-    "공급망", "협력사", "벤더", "원자재", "부품", "제조", "생산", "수출", "수입", "통관", "관세", "원산지",
-]
-
-_W17_HARD_NOISE_TERMS = [
-    "글자크기", "이전 기사보기", "다음 기사보기", "스크롤 이동 상태바", "본문 글씨",
-    "청년인턴", "채용", "합격자", "주가", "증시", "코스피", "코스닥", "부동산", "야구", "축구",
-    "신간", "서평", "맛집", "여행", "celebrity", "sports", "bookreview", "real estate",
-    "모닝뉴스", "페라리", "호크니", "현대미술", "염소산업", "혈통관리", "라이스페이퍼",
-]
-
-
-def _w17_customs_trade_law_score(row: pd.Series) -> int:
-    blob = _w17_blob(row)
-    score = 0
-    if _w17_has(blob, _W17_LAW_30_TERMS):
-        score = 30
-    elif _w17_text(row.get("RegulationRelated", "")).upper() == "Y":
-        score = 22
-    elif _w17_has(blob, ["notice", "공고", "고시", "regulation", "rule"]):
-        score = 15
-    return score
-
-
-def _w17_customs_trade_policy_score(row: pd.Series) -> int:
-    blob = _w17_blob(row)
-    if _w17_has(blob, _W17_POLICY_20_TERMS):
+def _v18_customs_trade_law_score(row: pd.Series) -> int:
+    blob = _v18_blob(row)
+    topic = clean(row.get("topic", "")).upper()
+    url = clean(row.get("URL", "")).lower()
+    agency = clean(row.get("Agency", "")).lower()
+    if _v18_noise_hit(row):
+        return 0
+    if topic in {"AD_CVD", "CBAM_CARBON", "ORIGIN_FTA", "HS_CLASSIFICATION"}:
+        return 30
+    if any(x in url + " " + agency for x in [".gov", "federalregister", "customs", "관세청", "law.go.kr", "europa.eu", "dgft", "cbp.gov", "ustr.gov", "bis.gov"]):
+        if _v18_contains(blob, V18_LAW_STRONG_TERMS):
+            return 30
+    if _v18_contains(blob, ["법령안", "고시", "규칙", "federal register", "regulation", "customs law"]):
+        return 30
+    if _v18_contains(blob, V18_LAW_STRONG_TERMS):
         return 20
-    if _w17_has(blob, ["trade", "import", "export", "무역", "수입", "수출", "통상"]):
-        return 8
+    if topic in {"CUSTOMS", "TARIFF", "EXPORT_CONTROL"}:
+        return 15
     return 0
 
-
-def _w17_direct_impact_score(row: pd.Series) -> int:
-    blob = _w17_blob(row)
-    impact = _w17_text(row.get("samsung_impact", row.get("Samsung Impact", ""))).lower()
-    if impact == "direct":
-        return 40
-    if _w17_has(blob, _W17_DIRECT_40_TERMS_EXACT) and _w17_has(blob, _W17_WORK_IMPACT_TERMS):
-        return 40
-    if _w17_has(blob, _W17_DIRECT_40_PRODUCT_TERMS) and _w17_has(blob, _W17_WORK_IMPACT_TERMS):
-        # 핵심 제품/원자재 + 관세업무 이슈면 실무 직접영향 후보로 높은 점수
-        return 35
-    if _w17_has(blob, _W17_DIRECT_40_PRODUCT_TERMS):
-        return 24
-    return 0
-
-
-def _w17_indirect_impact_score(row: pd.Series) -> int:
-    blob = _w17_blob(row)
-    impact = _w17_text(row.get("samsung_impact", row.get("Samsung Impact", ""))).lower()
-    if impact in {"indirect", "watch"}:
-        return 10
-    if _w17_has(blob, _W17_INDIRECT_COUNTRY_TERMS) and _w17_has(blob, _W17_INDIRECT_TERMS):
-        return 10
-    if _w17_has(blob, _W17_INDIRECT_COUNTRY_TERMS) or _w17_has(blob, _W17_INDIRECT_TERMS):
+def _v18_customs_trade_policy_score(row: pd.Series) -> int:
+    blob = _v18_blob(row)
+    topic = clean(row.get("topic", "")).upper()
+    if _v18_noise_hit(row):
+        return 0
+    if topic in {"EXPORT_CONTROL", "TARIFF", "AD_CVD", "CBAM_CARBON"}:
+        return 20
+    if _v18_contains(blob, ["section 301", "301조", "section 232", "232조", "수출통제", "export control", "entity list", "cbam", "반덤핑", "상계관세"]):
+        return 20
+    if _v18_contains(blob, ["fta", "cepa", "usmca", "통상협정", "무역협상", "trade agreement"]):
+        return 15
+    if _v18_contains(blob, V18_POLICY_STRONG_TERMS):
+        return 12
+    if _v18_contains(blob, ["경제협력", "정상회담", "협의", "consultation"]):
         return 5
     return 0
 
+def _v18_direct_impact_score(row: pd.Series) -> int:
+    blob = _v18_blob(row)
+    law_policy = _v18_customs_trade_law_score(row) + _v18_customs_trade_policy_score(row)
+    if _v18_noise_hit(row):
+        return 0
+    if law_policy == 0:
+        return 0
+    # Direct means Samsung/company or core Samsung product affected by concrete customs/trade issue.
+    if _v18_contains(blob, V18_DIRECT_COMPANY_TERMS):
+        return 40
+    if _v18_contains(blob, V18_CORE_PRODUCT_TERMS) and _v18_contains(blob, V18_POLICY_STRONG_TERMS):
+        return 35
+    if _v18_contains(blob, V18_CORE_PRODUCT_TERMS):
+        return 28
+    if _v18_contains(blob, V18_SUPPLYCHAIN_TERMS) and _v18_contains(blob, ["관세", "tariff", "반덤핑", "anti-dumping", "cbam", "원산지", "fta"]):
+        return 20
+    return 0
 
-def _w17_hard_noise(row: pd.Series) -> bool:
-    blob = _w17_blob(row)
-    url = _w17_text(row.get("BestLinkURL", row.get("URL", ""))).lower()
-    if any(k in blob for k in _W17_HARD_NOISE_TERMS):
-        if not _w17_has(blob, _W17_POLICY_20_TERMS + _W17_LAW_30_TERMS):
-            return True
-    if not url or url in {"https://news.google.com", "https://news.google.com/", "https://www.google.com"}:
-        return True
-    if "fonts.googleapis" in url or "google-analytics" in url or "doubleclick" in url:
-        return True
-    return False
+def _v18_indirect_impact_score(row: pd.Series) -> int:
+    blob = _v18_blob(row)
+    law_policy = _v18_customs_trade_law_score(row) + _v18_customs_trade_policy_score(row)
+    if _v18_noise_hit(row):
+        return 0
+    if law_policy == 0:
+        return 0
+    score = 0
+    if _v18_contains(blob, V18_KEY_COUNTRY_TERMS):
+        score += 4
+    if _v18_contains(blob, V18_SUPPLYCHAIN_TERMS):
+        score += 4
+    if _v18_contains(blob, ["supply chain", "공급망", "cost", "원가", "조달", "수입가격", "수출", "수입"]):
+        score += 2
+    return min(score, 10)
 
-
-def _w17_issue_key(row: pd.Series) -> str:
-    title = _w17_lower(row.get("Headline"))
-    url = _w17_lower(row.get("BestLinkURL", row.get("URL", "")))
-    # preserve different AD/CVD cases by material/country words, only remove exact duplicate titles
-    title = re.sub(r"https?://\S+", " ", title)
-    title = re.sub(r"[-–—|].*$", " ", title)
-    title = re.sub(r"[^0-9a-z가-힣]+", " ", title)
-    words = [w for w in title.split() if len(w) >= 2]
-    return " ".join(words[:12]) or url[:120]
-
-
-def _w17_weighted_score(row: pd.Series) -> float:
+def _v18_weighted_score(row: pd.Series) -> int:
     return (
-        _w17_customs_trade_law_score(row)
-        + _w17_customs_trade_policy_score(row)
-        + _w17_direct_impact_score(row)
-        + _w17_indirect_impact_score(row)
+        _v18_customs_trade_law_score(row)
+        + _v18_customs_trade_policy_score(row)
+        + _v18_direct_impact_score(row)
+        + _v18_indirect_impact_score(row)
     )
 
+def _v18_is_reportable(row: pd.Series) -> bool:
+    if _v18_noise_hit(row):
+        return False
+    if _v18_weighted_score(row) < int(os.getenv("GTI_WEIGHTED_MIN_SCORE", "30")):
+        return False
+    # Need at least one customs/trade law or policy score.
+    if (_v18_customs_trade_law_score(row) + _v18_customs_trade_policy_score(row)) <= 0:
+        return False
+    return True
 
-def _w17_priority(score: float) -> str:
-    if score >= 80:
-        return "CORE"
-    if score >= 60:
-        return "POLICY_WATCH"
-    return "USABLE"
-
-
-def _w17_impact(row: pd.Series) -> str:
-    if row.get("CustomsTradeDirect40", 0) >= 35:
+def _v18_reclassify_impact(row: pd.Series) -> str:
+    direct = _v18_direct_impact_score(row)
+    indirect = _v18_indirect_impact_score(row)
+    if direct >= 35:
         return "Direct"
-    if row.get("CustomsTradeIndirect10", 0) >= 10:
+    if direct >= 20 or indirect >= 6:
         return "Indirect"
-    return "Watch"
+    if _v18_customs_trade_law_score(row) + _v18_customs_trade_policy_score(row) > 0:
+        return "Watch"
+    return "Reference"
+
+def _v18_apply_weighted_top30(audit: pd.DataFrame) -> pd.DataFrame:
+    if audit is None or audit.empty:
+        return audit
+    audit = audit.copy()
+
+    audit["CustomsTradeLawScore"] = audit.apply(_v18_customs_trade_law_score, axis=1)
+    audit["CustomsTradePolicyScore"] = audit.apply(_v18_customs_trade_policy_score, axis=1)
+    audit["DirectImpactScore"] = audit.apply(_v18_direct_impact_score, axis=1)
+    audit["IndirectImpactScore"] = audit.apply(_v18_indirect_impact_score, axis=1)
+    audit["WeightedScore"] = audit.apply(_v18_weighted_score, axis=1)
+    audit["ScoreBreakdown"] = audit.apply(
+        lambda r: f"법규30={int(r['CustomsTradeLawScore'])}; 정책20={int(r['CustomsTradePolicyScore'])}; 직접40={int(r['DirectImpactScore'])}; 간접10={int(r['IndirectImpactScore'])}",
+        axis=1,
+    )
+    audit["samsung_impact"] = audit.apply(_v18_reclassify_impact, axis=1)
+
+    candidates = audit[audit.apply(_v18_is_reportable, axis=1)].copy()
+    candidates = candidates.sort_values(["WeightedScore", "final_score", "Date"], ascending=[False, False, False])
+    top_n = min(GTI_WEIGHTED_TOP_N, len(candidates))
+
+    selected_keys = set(candidates.head(top_n).index)
+    audit["selected"] = "N"
+    audit.loc[list(selected_keys), "selected"] = "Y"
+    audit.loc[audit["selected"].eq("Y"), "priority_group"] = "CORE"
+    audit.loc[audit["selected"].eq("Y"), "mail_section"] = "News Core"
+    audit.loc[audit["selected"].ne("Y"), "priority_group"] = "EXCLUDED"
+    audit.loc[audit["selected"].ne("Y"), "mail_section"] = "Excluded"
+    audit.loc[audit["selected"].ne("Y"), "RejectReason"] = audit.loc[audit["selected"].ne("Y"), "RejectReason"].apply(
+        lambda v: append_reason(v, "weighted_v18_not_topN_or_noise")
+    )
+
+    audit["final_score"] = audit["WeightedScore"]
+    audit["Risk"] = audit["WeightedScore"].apply(lambda s: "상" if s >= 70 else "중" if s >= 45 else "하")
+    log(f"Weighted v18 TOPN selected={int(audit['selected'].eq('Y').sum())} / candidates={len(candidates)} / basis=law30+policy20+direct40+indirect10")
+    return audit
+
+try:
+    _ORIGINAL_BUILD_WEIGHTED_V18 = build
+    def build(df: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
+        daily, audit, excluded = _ORIGINAL_BUILD_WEIGHTED_V18(df)
+        # Rebuild selection from audit so v17/v12 previous selection cannot dominate.
+        audit = _v18_apply_weighted_top30(audit)
+        daily = audit[audit["selected"].eq("Y")].copy()
+        daily = daily.sort_values(["WeightedScore", "final_score", "Date"], ascending=[False, False, False]).reset_index(drop=True)
+        daily["rank"] = range(1, len(daily) + 1)
+        audit = audit.sort_values(["selected", "WeightedScore", "final_score"], ascending=[False, False, False]).reset_index(drop=True)
+        audit["rank"] = range(1, len(audit) + 1)
+        excluded = audit[audit["selected"].ne("Y")].copy()
+
+        for frame in [daily, audit, excluded]:
+            for col in ["CustomsTradeLawScore", "CustomsTradePolicyScore", "DirectImpactScore", "IndirectImpactScore", "WeightedScore", "ScoreBreakdown"]:
+                if col not in frame.columns:
+                    frame[col] = ""
+            for col in OUTPUT_COLS:
+                if col not in frame.columns:
+                    frame[col] = ""
+
+        extra_cols = ["Publish Date", "CustomsTradeLawScore", "CustomsTradePolicyScore", "DirectImpactScore", "IndirectImpactScore", "WeightedScore", "ScoreBreakdown"]
+        out_cols = list(dict.fromkeys(OUTPUT_COLS + extra_cols))
+        return daily[out_cols], audit[out_cols], excluded[out_cols]
+except Exception:
+    pass
+
+# ======================================================================
+# End of GTI STEP4-2 Weighted Score Patch v18
+# ======================================================================
 
 
-def _w17_final_weighted_top30(daily, audit, excluded):
+# ======================================================================
+# GTI STEP4-2 Final-50 Gemini Patch v19 - 2026-06-17
+# ----------------------------------------------------------------------
+# Goal
+# - Do fast rule/weighted scoring for all news rows first.
+# - Do NOT fetch original article or call Gemini during row scoring.
+# - After final selection, enrich only final selected rows, max 50, with
+#   original URL body + Gemini analysis.
+# - Avoid long hangs by using a single Gemini model and short timeout.
+# ======================================================================
+
+GTI_FINAL_GEMINI_MAX = int(os.getenv("GTI_FINAL_GEMINI_MAX", "50"))
+GTI_GEMINI_TIMEOUT = int(os.getenv("GTI_GEMINI_TIMEOUT", "20"))
+GTI_FAST_SCORING_ONLY = os.getenv("GTI_FAST_SCORING_ONLY", "1").strip().upper() not in {"0", "N", "NO", "FALSE"}
+
+# Keep the last rich analyzer before replacing it with a fast analyzer.
+_ORIGINAL_FINAL50_BUILD_GTI_AI_ANALYSIS = build_gti_ai_analysis
+_FINAL50_GEMINI_PHASE = False
+
+# Normalize candidate list so Gemini does not try 7 models x 2 API versions x 2 payloads.
+_GTI_SINGLE_MODEL = (os.getenv("GTI_GEMINI_MODEL", "").strip() or "gemini-2.5-flash-lite")
+GEMINI_MODEL_CANDIDATES = [_GTI_SINGLE_MODEL]
+GEMINI_API_VERSIONS = [os.getenv("GTI_GEMINI_API_VERSION", "v1beta").strip() or "v1beta"]
+
+def call_gemini_json(prompt: str) -> dict:
+    """v19 override: single model, single API version, short timeout."""
+    global _LAST_GEMINI_ERROR
+    _LAST_GEMINI_ERROR = ""
+
+    if not USE_GEMINI:
+        _LAST_GEMINI_ERROR = "DISABLED"
+        return {"_error": _LAST_GEMINI_ERROR}
+    if not GEMINI_API_KEY:
+        _LAST_GEMINI_ERROR = "NO_API_KEY"
+        return {"_error": _LAST_GEMINI_ERROR}
+
+    api_ver = GEMINI_API_VERSIONS[0]
+    model = GEMINI_MODEL_CANDIDATES[0]
+    endpoint = f"https://generativelanguage.googleapis.com/{api_ver}/models/{model}:generateContent?key={GEMINI_API_KEY}"
+    payload = {
+        "contents": [{"parts": [{"text": prompt}]}],
+        "generationConfig": {
+            "temperature": 0.1,
+            "topP": 0.8,
+            "maxOutputTokens": 1400,
+            "responseMimeType": "application/json",
+        },
+    }
+    try:
+        data = json.dumps(payload).encode("utf-8")
+        req = urllib.request.Request(endpoint, data=data, headers={"Content-Type": "application/json"}, method="POST")
+        with urllib.request.urlopen(req, timeout=GTI_GEMINI_TIMEOUT) as resp:
+            raw = resp.read().decode("utf-8", "ignore")
+        out = json.loads(raw)
+        if "error" in out:
+            msg = out.get("error", {}).get("message", str(out.get("error")))
+            _LAST_GEMINI_ERROR = f"{api_ver}/{model}:API_ERROR:{msg[:200]}"
+            return {"_error": _LAST_GEMINI_ERROR}
+        candidates = out.get("candidates") or []
+        if not candidates:
+            _LAST_GEMINI_ERROR = f"{api_ver}/{model}:NO_CANDIDATE"
+            return {"_error": _LAST_GEMINI_ERROR}
+        parts = candidates[0].get("content", {}).get("parts", [])
+        text = "\n".join(clean(part.get("text", "")) for part in parts if isinstance(part, dict))
+        parsed = _extract_json_object(text)
+        if parsed:
+            parsed["_gemini_model"] = model
+            parsed["_gemini_api_version"] = api_ver
+            parsed["_gemini_finish"] = candidates[0].get("finishReason", "")
+            return parsed
+        _LAST_GEMINI_ERROR = f"{api_ver}/{model}:NO_JSON text={text[:160]}"
+        return {"_error": _LAST_GEMINI_ERROR}
+    except urllib.error.HTTPError as exc:
+        try:
+            err_body = exc.read().decode("utf-8", "ignore")[:220]
+        except Exception:
+            err_body = ""
+        _LAST_GEMINI_ERROR = f"{api_ver}/{model}:HTTP{exc.code}:{err_body}"
+        return {"_error": _LAST_GEMINI_ERROR}
+    except Exception as exc:
+        _LAST_GEMINI_ERROR = f"{api_ver}/{model}:{type(exc).__name__}:{str(exc)[:220]}"
+        return {"_error": _LAST_GEMINI_ERROR}
+
+
+def _v19_fast_summary_from_row(row: pd.Series, headline: str) -> str:
+    for col in ["Summary", "description", "Description", "ClusterHeadlines", "AI Analysis"]:
+        val = clean(row.get(col, ""))
+        if val and not _looks_like_title_only(val, headline):
+            return val[:900]
+    return headline[:500]
+
+
+def build_gti_ai_analysis(row: pd.Series, *, headline: str, url: str, issue: str, impact: str, products_text: str, default_action: str, content_type: str) -> dict:
+    """v19 fast analyzer during scoring; rich analyzer only in final Gemini phase."""
+    if _FINAL50_GEMINI_PHASE:
+        return _ORIGINAL_FINAL50_BUILD_GTI_AI_ANALYSIS(
+            row,
+            headline=headline,
+            url=url,
+            issue=issue,
+            impact=impact,
+            products_text=products_text,
+            default_action=default_action,
+            content_type=content_type,
+        )
+
+    summary = _v19_fast_summary_from_row(row, headline)
+    ai = (
+        f"{issue} 이슈입니다. 현재 단계는 전체 후보 빠른 선별 단계이므로 원문/Gemini 분석은 최종 선정 후 수행합니다. "
+        f"삼성 영향도는 {impact}, 관련 제품/키워드는 {products_text or '본문에서 확인 불가'}입니다."
+    )
+    action = default_action or "대상 국가·품목·HS·세율·시행일을 확인하십시오."
+    return {
+        "Summary": summary,
+        "AI Analysis": ai[:1200],
+        "Action Plan": action[:1200],
+        "ExecutiveMessage": summary[:700],
+        "article_extract_status": "FAST_SCORING_NO_GEMINI",
+    }
+
+
+def _v19_selected_match_key(row: pd.Series) -> str:
+    url = safe_url(row.get("BestLinkURL", "") or row.get("URL", "") or row.get("original_url", ""))
+    if url:
+        return "url:" + url.lower().strip()
+    return "title:" + normalize_title(clean(row.get("Headline", "")))
+
+
+def _v19_enrich_selected_with_gemini(daily: pd.DataFrame, audit: pd.DataFrame, excluded: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
+    """Enrich only final selected rows with original URL/Gemini analysis."""
+    global _FINAL50_GEMINI_PHASE
+    if daily is None or daily.empty:
+        log("Final Gemini enrichment skipped: no selected news")
+        return daily, audit, excluded
+    if not USE_GEMINI:
+        log("Final Gemini enrichment skipped: GTI_STEP4_USE_GEMINI=N")
+        return daily, audit, excluded
+
+    daily = daily.copy()
+    audit = audit.copy() if isinstance(audit, pd.DataFrame) else pd.DataFrame()
+    excluded = excluded.copy() if isinstance(excluded, pd.DataFrame) else pd.DataFrame()
+
+    limit = min(GTI_FINAL_GEMINI_MAX, len(daily))
+    log(f"Final Gemini enrichment start: selected={len(daily)}, enrich_limit={limit}, model={GEMINI_MODEL_CANDIDATES[0]}, timeout={GTI_GEMINI_TIMEOUT}s")
+
+    _FINAL50_GEMINI_PHASE = True
+    try:
+        for pos, idx in enumerate(daily.index[:limit], start=1):
+            row = daily.loc[idx]
+            headline = clean(row.get("Headline", ""))
+            url, _status = choose_best_link(row, resolve_google=False)
+            issue = clean(row.get("topic_keyword", "")) or clean(row.get("topic", "")) or clean(row.get("Issue", "")) or "무역/통관"
+            impact = clean(row.get("samsung_impact", "")) or clean(row.get("Samsung Impact", "")) or "Watch"
+            products_text = clean(row.get("affected_products", "")) or clean(row.get("impact_products", "")) or "본문에서 확인 불가"
+            default_action = clean(row.get("RequiredAction", "")) or clean(row.get("Action Plan", "")) or "대상 국가·품목·HS·세율·시행일을 확인하십시오."
+
+            log(f"Final Gemini {pos}/{limit}: {headline[:90]}")
+            analysis = _ORIGINAL_FINAL50_BUILD_GTI_AI_ANALYSIS(
+                row,
+                headline=headline,
+                url=url,
+                issue=issue,
+                impact=impact,
+                products_text=products_text,
+                default_action=default_action,
+                content_type="News",
+            )
+            for col, key in [
+                ("Summary", "Summary"),
+                ("AI Analysis", "AI Analysis"),
+                ("Action Plan", "Action Plan"),
+                ("ExecutiveMessage", "ExecutiveMessage"),
+                ("article_extract_status", "article_extract_status"),
+            ]:
+                if col not in daily.columns:
+                    daily[col] = ""
+                daily.at[idx, col] = analysis.get(key, daily.at[idx, col] if col in daily.columns else "")
+            if "URL" in daily.columns and url:
+                daily.at[idx, "URL"] = url
+            if "BestLinkURL" in daily.columns and url:
+                daily.at[idx, "BestLinkURL"] = url
+
+            match_key = _v19_selected_match_key(daily.loc[idx])
+            if not audit.empty:
+                if "_v19_match_key" not in audit.columns:
+                    audit["_v19_match_key"] = audit.apply(_v19_selected_match_key, axis=1)
+                mask = audit["_v19_match_key"].eq(match_key)
+                for col in ["Summary", "AI Analysis", "Action Plan", "ExecutiveMessage", "article_extract_status", "URL", "BestLinkURL"]:
+                    if col not in audit.columns:
+                        audit[col] = ""
+                    if col in daily.columns:
+                        audit.loc[mask, col] = daily.at[idx, col]
+    finally:
+        _FINAL50_GEMINI_PHASE = False
+        try:
+            _save_gemini_cache()
+            log("Final Gemini cache saved")
+        except Exception as exc:
+            log(f"Final Gemini cache save failed: {type(exc).__name__}: {exc}")
+
+    if not audit.empty:
+        audit = audit.drop(columns=["_v19_match_key"], errors="ignore")
+    log("Final Gemini enrichment done")
+    return daily, audit, excluded
+
+# ======================================================================
+# End of GTI STEP4-2 Final-50 Gemini Patch v19
+# ======================================================================
+
+
+
+# ======================================================================
+# GTI STEP4-2 Major-News Title Keyword Patch v20 - 2026-06-17
+# ----------------------------------------------------------------------
+# Goal
+# - Separate articles whose HEADLINE contains high-value customs/trade
+#   keywords into Major News before normal weighted Top50 fill.
+# - Major News still respects hard noise/date/url gates, but does not get
+#   lost only because Samsung relevance score is weak.
+# - Gemini enrichment remains limited to final selected rows, max 50.
+# ======================================================================
+
+GTI_MAJOR_TITLE_ENABLED = os.getenv("GTI_MAJOR_TITLE_ENABLED", "1").strip().upper() not in {"0", "N", "NO", "FALSE"}
+GTI_MAJOR_TITLE_MAX = int(os.getenv("GTI_MAJOR_TITLE_MAX", "20"))
+GTI_MAJOR_TITLE_BONUS = int(os.getenv("GTI_MAJOR_TITLE_BONUS", "35"))
+
+MAJOR_TITLE_KEYWORD_GROUPS = {
+    "AD_CVD": [
+        "anti-dumping", "anti dumping", "antidumping", "countervailing", "countervailing duty",
+        "ad/cvd", "cvd", "dumping margin", "덤핑방지", "반덤핑", "상계관세", "무역구제",
+    ],
+    "TARIFF_QUOTA": [
+        "tariff", "tariffs", "customs duty", "import duty", "reciprocal tariff",
+        "section 301", "301조", "section 232", "232조", "tariff quota", "tariff-rate quota",
+        "quota", "duty-free quota", "safeguard", "관세", "관세율", "추가관세", "상호관세",
+        "쿼터", "할당관세", "무관세", "세이프가드",
+    ],
+    "EXPORT_CONTROL": [
+        "export control", "export controls", "entity list", "denied persons", "bis rule",
+        "forced labor", "uflpa", "sanction", "sanctions", "수출통제", "수출 통제",
+        "전략물자", "제재", "강제노동", "거래제한",
+    ],
+    "FTA_ORIGIN": [
+        "fta", "cepa", "tepa", "usmca", "rules of origin", "rule of origin",
+        "certificate of origin", "origin certificate", "country of origin",
+        "origin verification", "origin determination", "원산지", "원산지증명", "원산지 증명",
+        "원산지검증", "원산지 검증", "자유무역협정", "통상협정",
+    ],
+    "CUSTOMS_HS": [
+        "customs clearance", "customs declaration", "import declaration", "export declaration",
+        "hs code", "tariff classification", "classification ruling", "customs valuation",
+        "valuation", "bonded", "deferment", "통관", "수입신고", "수출신고", "세관",
+        "품목분류", "hs코드", "과세가격", "관세평가", "보세", "납부유예",
+    ],
+    "CBAM_CARBON": [
+        "cbam", "carbon border", "carbon border adjustment", "탄소국경", "탄소국경조정",
+    ],
+    "NOTICE_POLICY": [
+        "public notice", "notice", "notification", "regulation", "final rule", "interim rule",
+        "effective date", "implementation", "시행", "발효", "고시", "공고", "입법예고", "행정예고",
+    ],
+}
+
+# Optional user extension: powershell example
+# $env:GTI_MAJOR_TITLE_EXTRA_KEYWORDS="PN 51|export obligation|advance authorization|EPCG"
+def _v20_extra_major_keywords() -> list[str]:
+    raw = os.getenv("GTI_MAJOR_TITLE_EXTRA_KEYWORDS", "")
+    return [x.strip().lower() for x in re.split(r"[|,;]", raw) if x.strip()]
+
+
+def _v20_title_blob(row: pd.Series) -> str:
+    title = clean(row.get("Headline", ""))
+    title = _html_unescape(title)
+    return re.sub(r"\s+", " ", title.lower()).strip()
+
+
+def _v20_major_title_hit(row: pd.Series) -> tuple[bool, str, str]:
+    """Return (hit, group, keyword) based on headline only."""
+    title = _v20_title_blob(row)
+    if not title:
+        return False, "", ""
+
+    # Avoid broad false positives: notice/regulation alone is not enough unless
+    # the headline also contains a trade/customs/policy action term.
+    action_terms = [
+        "tariff", "customs", "duty", "quota", "origin", "fta", "cepa", "usmca",
+        "export control", "entity list", "anti-dumping", "antidumping", "countervailing",
+        "safeguard", "cbam", "hs code", "classification", "valuation", "관세", "통관",
+        "쿼터", "원산지", "수출통제", "반덤핑", "상계관세", "품목분류", "탄소국경",
+    ]
+
+    for group, keywords in MAJOR_TITLE_KEYWORD_GROUPS.items():
+        for kw in keywords:
+            k = kw.lower()
+            if k and k in title:
+                if group == "NOTICE_POLICY" and not contains_any(title, action_terms):
+                    continue
+                return True, group, kw
+
+    for kw in _v20_extra_major_keywords():
+        if kw and kw in title:
+            return True, "USER_EXTRA", kw
+    return False, "", ""
+
+
+def _v20_major_candidate_gate(row: pd.Series) -> bool:
+    """Major News still needs basic quality gates."""
+    hit, _group, _kw = _v20_major_title_hit(row)
+    if not hit:
+        return False
+    if _v16_hard_noise(row):
+        return False
+    url = safe_url(row.get("BestLinkURL", "") or row.get("URL", ""))
+    if not is_valid_link(url):
+        return False
+    max_age = int(os.getenv("GTI_STEP4_NEWS_MAX_AGE_DAYS", "3"))
+    pub = _v16_parse_date(row.get("Publish Date", row.get("Date", "")))
+    if pd.isna(pub):
+        return False
+    cutoff = pd.Timestamp.now().normalize() - pd.Timedelta(days=max_age)
+    if pub.normalize() < cutoff:
+        return False
+    return True
+
+
+_ORIGINAL_V20_FINAL_WEIGHTED_TOP30 = _v16_final_weighted_top30
+
+def _v16_final_weighted_top30(daily, audit, excluded):
+    """v20 override: Major title keyword bucket first, then weighted Top50 fill."""
+    if not GTI_MAJOR_TITLE_ENABLED:
+        return _ORIGINAL_V20_FINAL_WEIGHTED_TOP30(daily, audit, excluded)
+
     frames = []
     for part in [daily, audit, excluded]:
         if isinstance(part, pd.DataFrame) and not part.empty:
@@ -3633,91 +3974,391 @@ def _w17_final_weighted_top30(daily, audit, excluded):
         return daily, audit, excluded
 
     pool = pd.concat(frames, ignore_index=True, sort=False)
-    for col in ["BestLinkURL", "URL", "Headline"]:
-        if col not in pool.columns:
-            pool[col] = ""
-    pool["BestLinkURL"] = pool["BestLinkURL"].where(pool["BestLinkURL"].astype(str).str.strip().ne(""), pool["URL"])
-    pool["Publish Date"] = pool.apply(lambda r: _w17_publish_date(r), axis=1)
+    if "BestLinkURL" not in pool.columns:
+        pool["BestLinkURL"] = pool.get("URL", "")
+    pool["BestLinkURL"] = pool["BestLinkURL"].where(pool["BestLinkURL"].astype(str).str.strip().ne(""), pool.get("URL", ""))
+    pool["Publish Date"] = pool.apply(lambda r: _v16_text(r.get("Publish Date")) or _v16_text(r.get("Date")), axis=1)
     pool["Date"] = pool["Publish Date"]
 
-    pool["CustomsTradeLawScore"] = pool.apply(_w17_customs_trade_law_score, axis=1)
-    pool["CustomsTradePolicyScore"] = pool.apply(_w17_customs_trade_policy_score, axis=1)
-    pool["DirectImpactScore"] = pool.apply(_w17_direct_impact_score, axis=1)
-    pool["IndirectImpactScore"] = pool.apply(_w17_indirect_impact_score, axis=1)
-    # aliases for impact helper
-    pool["CustomsTradeDirect40"] = pool["DirectImpactScore"]
-    pool["CustomsTradeIndirect10"] = pool["IndirectImpactScore"]
-    pool["WeightedScore"] = pool.apply(_w17_weighted_score, axis=1)
-    pool["ScoreBreakdown"] = pool.apply(
-        lambda r: f"법규30={int(r['CustomsTradeLawScore'])}; 정책20={int(r['CustomsTradePolicyScore'])}; 직접40={int(r['DirectImpactScore'])}; 간접10={int(r['IndirectImpactScore'])}",
+    pool["_v16_law30"] = pool.apply(_v16_customs_trade_law_score, axis=1)
+    pool["_v16_policy20"] = pool.apply(_v16_customs_trade_policy_score, axis=1)
+    pool["_v16_direct40"] = pool.apply(_v16_direct_impact_score, axis=1)
+    pool["_v16_indirect10"] = pool.apply(_v16_indirect_impact_score, axis=1)
+    pool["_v16_score"] = pool.apply(_v16_weighted_score, axis=1)
+    pool["_v16_key"] = pool.apply(_v16_issue_key, axis=1)
+    pool["_v16_noise"] = pool.apply(_v16_hard_noise, axis=1)
+    pool[["MajorNewsFlag", "MajorNewsGroup", "MajorNewsKeyword"]] = pool.apply(
+        lambda r: pd.Series(("Y", _v20_major_title_hit(r)[1], _v20_major_title_hit(r)[2])) if _v20_major_candidate_gate(r) else pd.Series(("N", "", "")),
         axis=1,
     )
-    pool["_w17_key"] = pool.apply(_w17_issue_key, axis=1)
-    pool["_w17_noise"] = pool.apply(_w17_hard_noise, axis=1)
+    pool["_v20_major_bonus_score"] = pool["MajorNewsFlag"].apply(lambda v: GTI_MAJOR_TITLE_BONUS if v == "Y" else 0)
+    pool["_v20_select_score"] = pool["_v16_score"] + pool["_v20_major_bonus_score"]
 
-    # Date filter remains configurable, but if date is missing keep the item instead of losing potential official news.
     max_age = int(os.getenv("GTI_STEP4_NEWS_MAX_AGE_DAYS", "3"))
     cutoff = pd.Timestamp.now().normalize() - pd.Timedelta(days=max_age)
-    pub = pool["Publish Date"].apply(_w17_parse_date)
-    pool["_w17_pub"] = pub
-    candidates = pool[
-        (~pool["_w17_noise"])
-        & (pool["WeightedScore"] >= GTI_WEIGHT_MIN_SCORE)
-        & (pub.isna() | (pub.dt.normalize() >= cutoff))
+    pub = pool["Publish Date"].apply(_v16_parse_date)
+    base_candidates = pool[
+        (~pool["_v16_noise"])
+        & (pool["_v16_score"] > 0)
+        & pub.notna()
+        & (pub.dt.normalize() >= cutoff)
     ].copy()
 
-    # Prefer relevant weighted score, then recency, then previous score as tie-breaker only.
-    if "final_score" not in candidates.columns:
-        candidates["final_score"] = 0
-    candidates = candidates.sort_values(["WeightedScore", "_w17_pub", "final_score"], ascending=[False, False, False])
-    candidates = candidates.drop_duplicates(subset=["BestLinkURL"], keep="first")
-    candidates = candidates.drop_duplicates(subset=["_w17_key"], keep="first")
+    major = pool[pool["MajorNewsFlag"].eq("Y")].copy()
+    major = major.sort_values(["_v20_select_score", "_v16_score", "Publish Date"], ascending=[False, False, False])
+    major = major.drop_duplicates(subset=["BestLinkURL"], keep="first")
+    major = major.drop_duplicates(subset=["_v16_key"], keep="first")
+    major = major.head(max(0, GTI_MAJOR_TITLE_MAX))
 
-    top_n = min(GTI_WEIGHT_TOP_N, 30)
-    selected = candidates.head(top_n).copy()
+    top_n = min(int(os.getenv("GTI_STEP4_NEWS_TARGET_MAX", "50")), 50)
+    major_urls = set(major["BestLinkURL"].fillna("").astype(str).str.lower().str.strip())
+    fill = base_candidates[~base_candidates["BestLinkURL"].fillna("").astype(str).str.lower().str.strip().isin(major_urls)].copy()
+    fill = fill.sort_values(["_v16_score", "Publish Date"], ascending=[False, False])
+    fill = fill.drop_duplicates(subset=["BestLinkURL"], keep="first")
+    fill = fill.drop_duplicates(subset=["_v16_key"], keep="first")
+    selected = pd.concat([major, fill], ignore_index=True, sort=False).head(top_n).copy()
+    selected = selected.sort_values(["MajorNewsFlag", "_v20_select_score", "_v16_score", "Publish Date"], ascending=[False, False, False, False]).reset_index(drop=True)
+
     selected["selected"] = "Y"
-    selected["mail_section"] = "News"
-    selected["final_score"] = selected["WeightedScore"].round().astype(int)
-    selected["Importance Score"] = selected["final_score"]
-    selected["priority_group"] = selected["final_score"].apply(_w17_priority)
-    selected["samsung_impact"] = selected.apply(_w17_impact, axis=1)
-    selected["Samsung Impact"] = selected["samsung_impact"]
+    selected["mail_section"] = selected["MajorNewsFlag"].apply(lambda v: "Major News" if v == "Y" else "News")
+    selected["final_score"] = selected["_v20_select_score"].round().astype(int)
+    selected["priority_group"] = selected.apply(
+        lambda r: "MAJOR_NEWS" if r.get("MajorNewsFlag") == "Y" else ("CORE" if int(r.get("final_score", 0) or 0) >= 70 else "USABLE"),
+        axis=1,
+    )
+    selected["Risk"] = selected["final_score"].apply(lambda v: "상" if int(v or 0) >= 70 else "중" if int(v or 0) >= 45 else "하")
+    if "samsung_impact" in selected.columns:
+        selected["samsung_impact"] = selected.apply(
+            lambda r: "Watch" if r.get("MajorNewsFlag") == "Y" and _v16_text(r.get("samsung_impact")) in {"", "Reference"}
+            else ("Direct" if r["_v16_direct40"] >= 40 else ("Indirect" if r["_v16_indirect10"] >= 10 else _v16_text(r.get("samsung_impact")) or "Watch")),
+            axis=1,
+        )
+    if "Samsung Impact" in selected.columns:
+        selected["Samsung Impact"] = selected.get("samsung_impact", "Watch")
     selected["rank"] = range(1, len(selected) + 1)
+    selected["ScoreBreakdown"] = selected.apply(
+        lambda r: f"major={r.get('MajorNewsFlag','N')}:{r.get('MajorNewsKeyword','')}; law30={int(r['_v16_law30'])}; policy20={int(r['_v16_policy20'])}; direct40={int(r['_v16_direct40'])}; indirect10={int(r['_v16_indirect10'])}; title_bonus={int(r['_v20_major_bonus_score'])}",
+        axis=1,
+    )
+    selected.loc[selected["MajorNewsFlag"].eq("Y"), "SelectReason"] = selected.loc[selected["MajorNewsFlag"].eq("Y")].apply(
+        lambda r: append_reason(r.get("SelectReason", ""), f"major_title_keyword:{r.get('MajorNewsGroup','')}:{r.get('MajorNewsKeyword','')}"),
+        axis=1,
+    )
 
     selected_urls = set(selected["BestLinkURL"].fillna("").astype(str).str.lower().str.strip())
     full_audit = pool.drop_duplicates(subset=[c for c in ["Headline", "BestLinkURL", "URL"] if c in pool.columns], keep="first").copy()
+    full_audit["ScoreBreakdown"] = full_audit.apply(
+        lambda r: f"major={r.get('MajorNewsFlag','N')}:{r.get('MajorNewsKeyword','')}; law30={int(r['_v16_law30'])}; policy20={int(r['_v16_policy20'])}; direct40={int(r['_v16_direct40'])}; indirect10={int(r['_v16_indirect10'])}; title_bonus={int(r['_v20_major_bonus_score'])}",
+        axis=1,
+    )
     full_audit["selected"] = full_audit["BestLinkURL"].fillna("").astype(str).str.lower().str.strip().apply(lambda u: "Y" if u in selected_urls else "N")
-    full_audit.loc[full_audit["selected"].eq("Y"), "mail_section"] = "News"
+    full_audit.loc[full_audit["selected"].eq("Y") & full_audit["MajorNewsFlag"].eq("Y"), "mail_section"] = "Major News"
+    full_audit.loc[full_audit["selected"].eq("Y") & full_audit["MajorNewsFlag"].ne("Y"), "mail_section"] = "News"
     full_audit.loc[full_audit["selected"].ne("Y"), "mail_section"] = "Excluded"
-    full_audit["final_score"] = full_audit["WeightedScore"].round().astype(int)
-    full_audit["Importance Score"] = full_audit["final_score"]
-    full_audit["priority_group"] = full_audit.apply(lambda r: _w17_priority(r["WeightedScore"]) if r["selected"] == "Y" else "EXCLUDED", axis=1)
-    full_audit["samsung_impact"] = full_audit.apply(_w17_impact, axis=1)
-    full_audit["Samsung Impact"] = full_audit["samsung_impact"]
     full_audit.loc[full_audit["selected"].ne("Y"), "RejectReason"] = full_audit.loc[full_audit["selected"].ne("Y"), "RejectReason"].fillna("").astype(str).apply(
-        lambda v: (v + "; " if v else "") + "weighted_top30_not_selected_or_noise"
+        lambda v: append_reason(v, "v20_major_title_or_weighted_below_topN_or_noise")
     )
     new_excluded = full_audit[full_audit["selected"].ne("Y")].copy()
 
-    # Ensure exported columns exist
-    for frame in [selected, full_audit, new_excluded]:
-        for col in OUTPUT_COLS:
-            if col not in frame.columns:
-                frame[col] = ""
-    drop_cols = ["_w17_key", "_w17_noise", "_w17_pub", "CustomsTradeDirect40", "CustomsTradeIndirect10"]
-    log(f"Weighted TOP30 selected={len(selected)} / candidates={len(candidates)} / basis=law30+policy20+direct40+indirect10")
+    major_count = int(selected["MajorNewsFlag"].eq("Y").sum()) if "MajorNewsFlag" in selected.columns else 0
+    log(f"Major-title v20 selected={len(selected)} / major={major_count} / fill={len(selected)-major_count} / target={top_n}")
+
+    drop_cols = ["_v16_law30", "_v16_policy20", "_v16_direct40", "_v16_indirect10", "_v16_score", "_v16_key", "_v16_noise", "_v20_major_bonus_score", "_v20_select_score"]
     return (
-        selected.drop(columns=drop_cols, errors="ignore").reset_index(drop=True)[OUTPUT_COLS],
-        full_audit.drop(columns=drop_cols, errors="ignore").reset_index(drop=True)[OUTPUT_COLS],
-        new_excluded.drop(columns=drop_cols, errors="ignore").reset_index(drop=True)[OUTPUT_COLS],
+        selected.drop(columns=drop_cols, errors="ignore").reset_index(drop=True),
+        full_audit.drop(columns=drop_cols, errors="ignore").reset_index(drop=True),
+        new_excluded.drop(columns=drop_cols, errors="ignore").reset_index(drop=True),
     )
 
-# Override previous weighted selector with v17 scoring
-_v16_final_weighted_top30 = _w17_final_weighted_top30
+# ======================================================================
+# End of GTI STEP4-2 Major-News Title Keyword Patch v20
+# ======================================================================
+
 
 # ======================================================================
-# End of GTI STEP4-2 Weighted TOP30 Patch v17
+# GTI STEP4-2 Original URL Fallback Search Patch v21 - 2026-06-17
+# ----------------------------------------------------------------------
+# Goal
+# - Check whether upstream raw files already provide original URLs.
+# - If Step4 selected row still has only Google News home/redirect or no
+#   usable original URL, search by Headline + Source/Publisher/Agency to
+#   recover the original article URL.
+# - Search fallback is used only for final selected rows, so 180-row scoring
+#   remains fast.
 # ======================================================================
+
+GTI_ORIGINAL_URL_SEARCH_ENABLED = os.getenv("GTI_ORIGINAL_URL_SEARCH", "1").strip().upper() not in {"0", "N", "NO", "FALSE"}
+GTI_ORIGINAL_URL_SEARCH_TIMEOUT = int(os.getenv("GTI_ORIGINAL_URL_SEARCH_TIMEOUT", "10"))
+GTI_ORIGINAL_URL_SEARCH_MAX_CANDIDATES = int(os.getenv("GTI_ORIGINAL_URL_SEARCH_MAX_CANDIDATES", "8"))
+GTI_ORIGINAL_URL_SEARCH_ENGINE = os.getenv("GTI_ORIGINAL_URL_SEARCH_ENGINE", "bing").strip().lower()
+
+_BAD_SEARCH_RESULT_DOMAINS = [
+    "google.com", "news.google.com", "bing.com", "microsoft.com", "duckduckgo.com",
+    "facebook.com", "twitter.com", "x.com", "linkedin.com", "youtube.com",
+    "instagram.com", "tiktok.com", "pinterest.com",
+]
+
+def _v21_domain_from_text(text: str) -> str:
+    blob = clean(text)
+    if not blob:
+        return ""
+    if not blob.lower().startswith(("http://", "https://")):
+        blob = "https://" + blob
+    try:
+        p = urlparse(blob)
+        host = (p.netloc or "").lower().strip()
+        host = host[4:] if host.startswith("www.") else host
+        if "." in host and not any(x in host for x in ["google", "bing", "duckduckgo"]):
+            return host
+    except Exception:
+        return ""
+    return ""
+
+def _v21_domain_of_url(url: str) -> str:
+    try:
+        host = urlparse(safe_url(url)).netloc.lower().strip()
+        return host[4:] if host.startswith("www.") else host
+    except Exception:
+        return ""
+
+def _v21_is_search_bad_url(url: str) -> bool:
+    u = safe_url(url)
+    if not is_valid_link(u):
+        return True
+    if is_google_article_redirect(u) or is_generic_google_main(u):
+        return True
+    host = _v21_domain_of_url(u)
+    if not host:
+        return True
+    return any(bad == host or host.endswith("." + bad) for bad in _BAD_SEARCH_RESULT_DOMAINS)
+
+def _v21_title_tokens(title: str) -> set[str]:
+    t = normalize_title(title)
+    toks = [x for x in re.split(r"\s+", t) if len(x) >= 3]
+    return set(toks[:18])
+
+def _v21_score_search_candidate(candidate_url: str, title: str, preferred_domain: str = "") -> int:
+    if _v21_is_search_bad_url(candidate_url):
+        return -999
+    score = 10
+    host = _v21_domain_of_url(candidate_url)
+    if preferred_domain and (host == preferred_domain or host.endswith("." + preferred_domain) or preferred_domain.endswith("." + host)):
+        score += 70
+    url_norm = normalize_title(unquote(candidate_url))
+    title_tokens = _v21_title_tokens(title)
+    if title_tokens:
+        hit = sum(1 for tok in title_tokens if tok in url_norm)
+        score += min(30, hit * 5)
+    if any(x in candidate_url.lower() for x in ["/article", "articleview", "news", "view", "html"]):
+        score += 5
+    return score
+
+def _v21_extract_links_from_search_html(html_text: str) -> list[str]:
+    links = []
+    for m in re.finditer(r'<a[^>]+href=["\']([^"\']+)["\']', html_text or "", re.I):
+        href = _html_unescape(m.group(1))
+        if not href:
+            continue
+        if href.startswith("/url?") or "://www.google." in href and "/url?" in href:
+            try:
+                qs = urlparse(href).query
+                for part in qs.split("&"):
+                    if part.startswith("q=") or part.startswith("url="):
+                        href = unquote(part.split("=", 1)[1])
+                        break
+            except Exception:
+                pass
+        if href.startswith("http://") or href.startswith("https://"):
+            links.append(safe_url(href))
+    # de-duplicate preserving order
+    out = []
+    seen = set()
+    for u in links:
+        key = u.lower().strip()
+        if key not in seen:
+            seen.add(key)
+            out.append(u)
+    return out
+
+def _v21_search_web_for_original_url(title: str, source_hint: str = "", publisher_hint: str = "", agency_hint: str = "") -> tuple[str, str]:
+    if not GTI_ORIGINAL_URL_SEARCH_ENABLED:
+        return "", "SEARCH_DISABLED"
+    title = clean(title)
+    if not title:
+        return "", "NO_TITLE_FOR_SEARCH"
+
+    preferred_domain = ""
+    for hint in [source_hint, publisher_hint, agency_hint]:
+        preferred_domain = _v21_domain_from_text(hint)
+        if preferred_domain:
+            break
+
+    query_parts = [title]
+    if preferred_domain:
+        query_parts.append(f"site:{preferred_domain}")
+    else:
+        for hint in [publisher_hint, agency_hint, source_hint]:
+            h = clean(hint)
+            if h and not h.lower().startswith(("http://", "https://")) and len(h) <= 60:
+                query_parts.append(h)
+                break
+    query = " ".join(query_parts)
+
+    try:
+        if GTI_ORIGINAL_URL_SEARCH_ENGINE == "duckduckgo":
+            search_url = "https://duckduckgo.com/html/?q=" + quote(query)
+        else:
+            search_url = "https://www.bing.com/search?q=" + quote(query)
+
+        req = urllib.request.Request(
+            search_url,
+            headers={
+                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/129 Safari/537.36",
+                "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+                "Accept-Language": "ko-KR,ko;q=0.9,en-US;q=0.8,en;q=0.7",
+            },
+        )
+        ctx = ssl.create_default_context()
+        with urllib.request.urlopen(req, timeout=GTI_ORIGINAL_URL_SEARCH_TIMEOUT, context=ctx) as resp:
+            raw = resp.read(800_000)
+        html_text = raw.decode("utf-8", "ignore")
+        candidates = _v21_extract_links_from_search_html(html_text)[: max(1, GTI_ORIGINAL_URL_SEARCH_MAX_CANDIDATES * 3)]
+        scored = []
+        for u in candidates:
+            score = _v21_score_search_candidate(u, title, preferred_domain)
+            if score > 0:
+                scored.append((score, u))
+        scored.sort(reverse=True, key=lambda x: x[0])
+        if scored:
+            best = scored[0][1]
+            return best, f"TITLE_SOURCE_WEB_SEARCH:{GTI_ORIGINAL_URL_SEARCH_ENGINE}:score={scored[0][0]}"
+        return "", "SEARCH_NO_GOOD_RESULT"
+    except Exception as exc:
+        return "", f"SEARCH_FAILED:{type(exc).__name__}"
+
+def _v21_best_original_url_from_row(row: pd.Series, allow_search: bool = True) -> tuple[str, str]:
+    """Return original URL if available; otherwise optionally recover using title+source search."""
+    # 1) Direct original/canonical URL columns first.
+    for col, status in [
+        ("BestLinkURL", "BEST_LINK"),
+        ("canonical_url", "CANONICAL_URL"),
+        ("original_url", "ORIGINAL_URL"),
+        ("OriginalURLCandidate", "ORIGINAL_CANDIDATE"),
+        ("original_url_candidate", "ORIGINAL_CANDIDATE"),
+        ("URL", "URL"),
+        ("url", "URL"),
+    ]:
+        v = safe_url(row.get(col, ""))
+        if is_real_original_url(v):
+            return v, status
+
+    # 2) Try Google News redirect decode.
+    for col in ["GoogleURL", "google_url", "URL", "url", "BestLinkURL"]:
+        v = safe_url(row.get(col, ""))
+        if is_google_article_redirect(v):
+            resolved = resolve_google_news_url(v)
+            if is_real_original_url(resolved):
+                return resolved, "GOOGLE_NEWS_RESOLVED"
+
+    # 3) Title + source/publisher/agency web search, only for final selected rows.
+    if allow_search:
+        title = clean(row.get("Headline", "")) or clean(row.get("title", ""))
+        source_hint = clean(row.get("Source", "")) or clean(row.get("source", "")) or clean(row.get("rss_url", ""))
+        publisher_hint = clean(row.get("Publisher", "")) or clean(row.get("publisher", ""))
+        agency_hint = clean(row.get("Agency", "")) or clean(row.get("agency", ""))
+        found, status = _v21_search_web_for_original_url(title, source_hint, publisher_hint, agency_hint)
+        if is_real_original_url(found):
+            return found, status
+        return "", status
+
+    return "", "NO_ORIGINAL_URL"
+
+def _v21_log_input_url_coverage(df: pd.DataFrame) -> None:
+    try:
+        if df is None or df.empty:
+            return
+        cols = [c for c in ["URL", "url", "BestLinkURL", "canonical_url", "original_url", "OriginalURLCandidate", "original_url_candidate", "GoogleURL", "google_url"] if c in df.columns]
+        if not cols:
+            log("URL coverage: no URL-like columns found")
+            return
+        total = len(df)
+        any_http = 0
+        any_original = 0
+        google_redirect = 0
+        google_home = 0
+        for _, r in df.iterrows():
+            vals = [safe_url(r.get(c, "")) for c in cols]
+            if any(is_valid_link(v) for v in vals):
+                any_http += 1
+            if any(is_real_original_url(v) for v in vals):
+                any_original += 1
+            if any(is_google_article_redirect(v) for v in vals):
+                google_redirect += 1
+            if any(is_generic_google_main(v) for v in vals):
+                google_home += 1
+        log(f"URL coverage: rows={total}, url_cols={cols}, any_valid_url={any_http}, original_url_ready={any_original}, google_redirect_rows={google_redirect}, google_home_rows={google_home}")
+    except Exception as exc:
+        log(f"URL coverage check failed: {type(exc).__name__}: {exc}")
+
+# Wrap read_input only to log URL coverage without changing input data.
+_ORIGINAL_V21_READ_INPUT = read_input
+def read_input() -> pd.DataFrame:
+    df = _ORIGINAL_V21_READ_INPUT()
+    _v21_log_input_url_coverage(df)
+    return df
+
+# Wrap final Gemini enrichment so selected rows recover original URLs before body fetch/Gemini.
+_ORIGINAL_V21_ENRICH_SELECTED_WITH_GEMINI = _v19_enrich_selected_with_gemini
+def _v19_enrich_selected_with_gemini(daily: pd.DataFrame, audit: pd.DataFrame, excluded: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
+    if isinstance(daily, pd.DataFrame) and not daily.empty:
+        daily = daily.copy()
+        limit = min(GTI_FINAL_GEMINI_MAX, len(daily))
+        log(f"Original URL recovery start: selected={len(daily)}, check_limit={limit}, search_enabled={GTI_ORIGINAL_URL_SEARCH_ENABLED}")
+        recovered = 0
+        unresolved = 0
+        for pos, idx in enumerate(daily.index[:limit], start=1):
+            row = daily.loc[idx]
+            url, status = _v21_best_original_url_from_row(row, allow_search=True)
+            if url:
+                recovered += 1
+                for col in ["URL", "BestLinkURL", "original_url"]:
+                    if col not in daily.columns:
+                        daily[col] = ""
+                    daily.at[idx, col] = url
+                if "URL_Quality" not in daily.columns:
+                    daily["URL_Quality"] = ""
+                daily.at[idx, "URL_Quality"] = status
+            else:
+                unresolved += 1
+                if "URL_Quality" not in daily.columns:
+                    daily["URL_Quality"] = ""
+                daily.at[idx, "URL_Quality"] = status
+            if pos == 1 or pos % 10 == 0 or pos == limit:
+                log(f"Original URL recovery {pos}/{limit}: recovered={recovered}, unresolved={unresolved}")
+        if isinstance(audit, pd.DataFrame) and not audit.empty:
+            audit = audit.copy()
+            # Push recovered URLs back to audit by title key or existing URL key.
+            if "_v21_title_key" not in daily.columns:
+                daily["_v21_title_key"] = daily["Headline"].apply(normalize_title) if "Headline" in daily.columns else ""
+            audit["_v21_title_key"] = audit["Headline"].apply(normalize_title) if "Headline" in audit.columns else ""
+            map_url = daily.set_index("_v21_title_key")["BestLinkURL"].to_dict() if "BestLinkURL" in daily.columns else {}
+            map_quality = daily.set_index("_v21_title_key")["URL_Quality"].to_dict() if "URL_Quality" in daily.columns else {}
+            for col in ["URL", "BestLinkURL", "original_url", "URL_Quality"]:
+                if col not in audit.columns:
+                    audit[col] = ""
+            audit["BestLinkURL"] = audit.apply(lambda r: map_url.get(r.get("_v21_title_key", ""), r.get("BestLinkURL", "")), axis=1)
+            audit["URL"] = audit.apply(lambda r: map_url.get(r.get("_v21_title_key", ""), r.get("URL", "")), axis=1)
+            audit["original_url"] = audit.apply(lambda r: map_url.get(r.get("_v21_title_key", ""), r.get("original_url", "")), axis=1)
+            audit["URL_Quality"] = audit.apply(lambda r: map_quality.get(r.get("_v21_title_key", ""), r.get("URL_Quality", "")), axis=1)
+            audit = audit.drop(columns=["_v21_title_key"], errors="ignore")
+        daily = daily.drop(columns=["_v21_title_key"], errors="ignore")
+        log(f"Original URL recovery done: recovered={recovered}, unresolved={unresolved}")
+    return _ORIGINAL_V21_ENRICH_SELECTED_WITH_GEMINI(daily, audit, excluded)
+
+# ======================================================================
+# End of GTI STEP4-2 Original URL Fallback Search Patch v21
+# ======================================================================
+
 
 def main() -> None:
     print("[STEP4-2] News analysis start - GUARDRAIL v4.1")
@@ -3728,6 +4369,7 @@ def main() -> None:
     df = read_input()
     daily, audit, excluded = build(df)
     daily, audit, excluded = _v16_final_weighted_top30(daily, audit, excluded)
+    daily, audit, excluded = _v19_enrich_selected_with_gemini(daily, audit, excluded)
     cumulative = merge_cumulative(daily)
     legacy = to_legacy(daily)
     write_excel(daily, OUT_SUMMARY)
