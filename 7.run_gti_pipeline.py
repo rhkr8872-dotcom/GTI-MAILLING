@@ -8,7 +8,9 @@ Flow:
 1. Site crawler creates regulation/news site raw files.
 2. Naver, Google, RSS collectors create external news raw files.
 3. Separate merge jobs build regulation and news summaries.
-4. Separate AI analysis jobs build regulation and news analysis files.
+4. Separate AI analysis job
+
+s build regulation and news analysis files.
 5. A combined mail input is generated and passed to the mail engine.
 """
 
