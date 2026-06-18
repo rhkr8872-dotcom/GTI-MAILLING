@@ -4975,6 +4975,193 @@ def choose_top3(rows: pd.DataFrame) -> pd.DataFrame:
 # End of GTI STEP5 STRICT FINAL GUARD v23
 # ======================================================================
 
+
+# ======================================================================
+# GTI STEP5 STRICT FINAL GUARD v24
+# ----------------------------------------------------------------------
+# Added on top of v23:
+# 1) Remove news rows where article body was not actually available.
+# 2) Remove Google Alert/feed URLs when original URL recovery failed.
+# 3) Compress remaining same-issue duplicates: steel-law regulations and India-UK FTA.
+# 4) Sanitize hs_hint values that are actually years/dates, e.g. 2026.0.
+# ======================================================================
+
+V24_MAX_INDIA_UK_FTA = int(os.getenv("GTI_MAIL_MAX_INDIA_UK_FTA", "1"))
+V24_MAX_STEEL_LAW_REG = int(os.getenv("GTI_MAIL_MAX_STEEL_LAW_REG", "1"))
+
+V24_BODY_UNAVAILABLE_TERMS = [
+    "본문 확인 불가", "본문 내용이 없어", "본문을 가져오지 못했습니다", "원문 확인이 불가능",
+    "제목만으로 요약하지 않았습니다", "body unavailable", "no article body", "could not fetch",
+]
+
+V24_GOOGLE_ALERT_URL_TERMS = [
+    "google.co.kr/alerts/feeds", "google.com/alerts/feeds", "google.co.kr/alerts", "google.com/alerts",
+    "alerts/feeds/",
+]
+
+
+def _v24_low(text: str) -> str:
+    return clean(text).lower()
+
+
+def _v24_is_bad_hs_hint(value) -> bool:
+    txt = clean(value)
+    if not txt:
+        return False
+    low = txt.lower()
+    if low in {"nan", "none", "null", "본문에서 확인 불가"}:
+        return True
+    # Only a year or year-like float: 2026, 2026.0
+    if re.fullmatch(r"20\d{2}(\.0+)?", txt):
+        return True
+    # Date-like values accidentally mapped into HS field.
+    if re.fullmatch(r"20\d{2}[.\-/]\d{1,2}([.\-/]\d{1,2})?", txt):
+        return True
+    # Excel serial/date-shaped junk is not an HS unless it contains a plausible HS delimiter/length.
+    digits = re.sub(r"\D", "", txt)
+    if len(digits) == 4 and digits.startswith("20"):
+        return True
+    return False
+
+
+def _v24_sanitize_rows(rows: pd.DataFrame) -> pd.DataFrame:
+    rows = rows.copy()
+    for col in ["hs_hint", "tariff_rate_hint", "effective_date_hint", "change_detail_hint"]:
+        if col not in rows.columns:
+            rows[col] = ""
+    rows["hs_hint"] = rows["hs_hint"].apply(lambda v: "" if _v24_is_bad_hs_hint(v) else v)
+    return rows
+
+
+def _v24_has_unavailable_body(row: pd.Series) -> bool:
+    if clean(row.get("Content Type")) != "News":
+        return False
+    text = " ".join(clean(row.get(c)) for c in [
+        "Headline", "Summary", "Major Changes", "AI Analysis", "Action Plan", "Original Body Text", "Original Post Summary"
+    ])
+    return _v22_has_any(text, V24_BODY_UNAVAILABLE_TERMS)
+
+
+def _v24_google_alert_unresolved(row: pd.Series) -> bool:
+    if clean(row.get("Content Type")) != "News":
+        return False
+    url = clean(row.get("URL")) or clean(row.get("Source"))
+    low = url.lower()
+    if not _v22_has_any(low, V24_GOOGLE_ALERT_URL_TERMS):
+        return False
+    # If the URL is still a Google Alert/feed link at Step5, original URL recovery failed.
+    return True
+
+
+def _v24_special_issue_key(row: pd.Series) -> str:
+    t = _v22_text(row, ["Headline", "Summary", "Major Changes", "AI Analysis", "Action Plan", "Issue", "URL", "Agency"])
+    content_type = clean(row.get("Content Type"))
+    if content_type == "Regulation" and "철강산업" in t and ("특별법" in t or "시행규칙" in t or "탄소중립" in t):
+        return "reg_korea_steel_special_act"
+    if "india" in t and ("uk" in t or "britain" in t or "united kingdom" in t) and ("fta" in t or "ceta" in t or "trade pact" in t or "trade agreement" in t):
+        return "news_india_uk_fta"
+    return ""
+
+
+def _v24_dedup_rank(row: pd.Series) -> float:
+    score = safe_num(row.get("_report_score")) + safe_num(row.get("Importance Score")) + risk_weight(row.get("Risk"))
+    title = _v24_low(row.get("Headline"))
+    url = _v24_low(row.get("URL"))
+    # Prefer official law/current detailed row over truncated duplicate.
+    if "law.go.kr" in url or "federalregister.gov" in url or "customs" in url:
+        score += 80
+    if "시행규칙" in title and "제16호" in title:
+        score += 40
+    if title.endswith("...") or title.endswith("…"):
+        score -= 80
+    # For India-UK cluster, prefer articles with article body and clearer trade-policy signal.
+    if _v24_has_unavailable_body(row):
+        score -= 500
+    if "steel" in title and ("safeguard" in title or "british" in title):
+        score += 50
+    return score
+
+
+def _v24_final_report_filter(rows: pd.DataFrame) -> pd.DataFrame:
+    if rows.empty:
+        return rows
+    before = len(rows)
+    rows = _v24_sanitize_rows(rows).copy()
+
+    drop_reasons = []
+    keep = []
+    for _, row in rows.iterrows():
+        r = []
+        if _v24_has_unavailable_body(row):
+            r.append("v24_body_unavailable_news")
+        if _v24_google_alert_unresolved(row):
+            r.append("v24_google_alert_url_unresolved")
+        drop_reasons.append("; ".join(r))
+        keep.append(not r)
+
+    dropped = rows.loc[[not x for x in keep]].copy()
+    kept = rows.loc[keep].copy()
+    if len(dropped) > 0:
+        print("[INFO] v24 final mail guard removed:")
+        for pos, (_, r) in enumerate(dropped.head(20).iterrows()):
+            idx = r.name if isinstance(r.name, int) and r.name < len(drop_reasons) else pos
+            reason = drop_reasons[idx] if isinstance(idx, int) and idx < len(drop_reasons) else ""
+            print(f"  - {clean(r.get('Headline'))[:110]} / reason={reason}")
+
+    if not kept.empty:
+        kept["_v24_special_issue_key"] = kept.apply(_v24_special_issue_key, axis=1)
+        kept["_v24_dedup_rank"] = kept.apply(_v24_dedup_rank, axis=1)
+        kept = kept.sort_values(["_v24_dedup_rank", "_sort_date"], ascending=[False, False])
+        selected_parts = []
+        regular = kept[kept["_v24_special_issue_key"].eq("")].copy()
+        selected_parts.append(regular)
+        for key, frame in kept[kept["_v24_special_issue_key"].ne("")].groupby("_v24_special_issue_key", sort=False):
+            limit = V24_MAX_INDIA_UK_FTA if key == "news_india_uk_fta" else V24_MAX_STEEL_LAW_REG
+            selected_parts.append(frame.head(max(1, limit)))
+        kept2 = pd.concat(selected_parts, ignore_index=True, sort=False) if selected_parts else kept
+        duplicate_removed = len(kept) - len(kept2)
+        kept = kept2.drop(columns=["_v24_special_issue_key", "_v24_dedup_rank"], errors="ignore")
+    else:
+        duplicate_removed = 0
+
+    # Restore executive order after filtering/compression.
+    if "_report_score" in kept.columns and "_sort_date" in kept.columns:
+        kept = kept.sort_values(["_report_score", "_sort_date"], ascending=[False, False]).reset_index(drop=True)
+    else:
+        kept = kept.reset_index(drop=True)
+    if "No" in kept.columns:
+        kept["No"] = range(1, len(kept) + 1)
+    print(f"[INFO] v24 final mail guard: before={before}, after={len(kept)}, removed={before-len(kept)}, duplicates_removed={duplicate_removed}")
+    return kept
+
+
+_v24_prepare_rows_base = prepare_rows
+
+
+def prepare_rows(rows: pd.DataFrame) -> pd.DataFrame:
+    rows = _v24_prepare_rows_base(rows)
+    rows = _v24_final_report_filter(rows)
+    if "No" in rows.columns:
+        rows["No"] = range(1, len(rows) + 1)
+    return rows
+
+
+_v24_choose_top3_base = choose_top3
+
+
+def choose_top3(rows: pd.DataFrame) -> pd.DataFrame:
+    pool = _v24_final_report_filter(rows)
+    if pool.empty:
+        pool = rows.copy()
+    out = _v24_choose_top3_base(pool)
+    if not out.empty:
+        out["No"] = range(1, len(out) + 1)
+    return out
+
+# ======================================================================
+# End of GTI STEP5 STRICT FINAL GUARD v24
+# ======================================================================
+
 def main() -> None:
     paths = output_paths()
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
