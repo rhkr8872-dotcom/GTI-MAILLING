@@ -4804,6 +4804,177 @@ def choose_top3(rows: pd.DataFrame) -> pd.DataFrame:
 # End of GTI STEP5 STRICT FINAL GUARD v22
 # ======================================================================
 
+
+# ======================================================================
+# GTI STEP5 STRICT FINAL GUARD v23
+# ----------------------------------------------------------------------
+# Added on top of v22:
+# 1) Final freshness filter by Date / URL / title-embedded date
+# 2) Remove event/seminar/webinar/forum/training type news from mail report
+# 3) Re-number after final filtering, before Top3 selection
+# ======================================================================
+
+V23_MAIL_MAX_AGE_DAYS = int(os.getenv("GTI_MAIL_MAX_AGE_DAYS", "45"))
+V23_MAIL_MAX_AGE_DAYS_REG = int(os.getenv("GTI_MAIL_MAX_AGE_DAYS_REG", str(V23_MAIL_MAX_AGE_DAYS)))
+V23_MAIL_MAX_AGE_DAYS_NEWS = int(os.getenv("GTI_MAIL_MAX_AGE_DAYS_NEWS", str(V23_MAIL_MAX_AGE_DAYS)))
+
+V23_EVENT_SEMINAR_NOISE_TERMS = [
+    "seminar", "webinar", "conference", "forum", "symposium", "workshop", "training",
+    "세미나", "웨비나", "컨퍼런스", "콘퍼런스", "포럼", "심포지엄", "워크숍", "교육", "설명회",
+    "esg 온", "on 세미나", "제39회 esg", "발제", "패널토론", "기조연설",
+]
+
+V23_MONTHS = {
+    "jan": 1, "january": 1, "feb": 2, "february": 2, "mar": 3, "march": 3,
+    "apr": 4, "april": 4, "may": 5, "jun": 6, "june": 6,
+    "jul": 7, "july": 7, "aug": 8, "august": 8, "sep": 9, "sept": 9, "september": 9,
+    "oct": 10, "october": 10, "nov": 11, "november": 11, "dec": 12, "december": 12,
+}
+
+def _v23_text(row: pd.Series, cols: list[str] | None = None) -> str:
+    if cols is None:
+        cols = [
+            "Headline", "Summary", "AI Analysis", "Action Plan", "Major Changes", "Issue",
+            "Country", "Agency", "URL", "Original Body Text", "Original Post Summary",
+        ]
+    return " ".join(clean(row.get(c)) for c in cols).lower()
+
+def _v23_has_any(text: str, terms: list[str]) -> bool:
+    return any(str(t).lower() in text for t in terms if str(t).strip())
+
+def _v23_run_date_ts() -> pd.Timestamp:
+    dt = pd.to_datetime(RUN_DATE, errors="coerce")
+    return pd.Timestamp(datetime.now().date()) if pd.isna(dt) else pd.Timestamp(dt).normalize()
+
+def _v23_parse_embedded_date(text_value: str):
+    text_value = clean(text_value)
+    if not text_value:
+        return pd.NaT
+
+    # 2026-06-17, 2026/06/17, 2026.06.17, or URL /2026/06/17/
+    m = re.search(r"(20\d{2})[.\-/](\d{1,2})[.\-/](\d{1,2})", text_value)
+    if m:
+        return pd.to_datetime(f"{m.group(1)}-{int(m.group(2)):02d}-{int(m.group(3)):02d}", errors="coerce")
+
+    # August 20, 2025
+    m = re.search(r"\b([A-Za-z]{3,9})\s+(\d{1,2}),?\s+(20\d{2})\b", text_value)
+    if m:
+        mon = V23_MONTHS.get(m.group(1).lower())
+        if mon:
+            return pd.to_datetime(f"{m.group(3)}-{mon:02d}-{int(m.group(2)):02d}", errors="coerce")
+
+    # 6March2026 or 6 March 2026
+    m = re.search(r"\b(\d{1,2})\s*([A-Za-z]{3,9})\s*(20\d{2})\b", text_value)
+    if m:
+        mon = V23_MONTHS.get(m.group(2).lower())
+        if mon:
+            return pd.to_datetime(f"{m.group(3)}-{mon:02d}-{int(m.group(1)):02d}", errors="coerce")
+
+    return pd.NaT
+
+def _v23_best_row_date(row: pd.Series):
+    # Prefer normalized Date, then Publish Date if present, then URL/title embedded dates.
+    for c in ["Date", "Publish Date", "date", "published_at"]:
+        if c in row.index:
+            dt = pd.to_datetime(clean(row.get(c)), errors="coerce")
+            if not pd.isna(dt):
+                return pd.Timestamp(dt).normalize()
+    embedded = _v23_parse_embedded_date(" ".join(clean(row.get(c)) for c in ["URL", "Headline", "Summary", "Major Changes"]))
+    if not pd.isna(embedded):
+        return pd.Timestamp(embedded).normalize()
+    return pd.NaT
+
+def _v23_is_stale(row: pd.Series) -> bool:
+    dt = _v23_best_row_date(row)
+    if pd.isna(dt):
+        return False
+    max_days = V23_MAIL_MAX_AGE_DAYS_REG if clean(row.get("Content Type")) == "Regulation" else V23_MAIL_MAX_AGE_DAYS_NEWS
+    age_days = (_v23_run_date_ts() - pd.Timestamp(dt).normalize()).days
+    return age_days > max_days
+
+def _v23_is_future_abnormal(row: pd.Series) -> bool:
+    dt = _v23_best_row_date(row)
+    if pd.isna(dt):
+        return False
+    return (_v23_run_date_ts() - pd.Timestamp(dt).normalize()).days < -2
+
+def _v23_is_event_seminar_noise(row: pd.Series) -> bool:
+    if clean(row.get("Content Type")) != "News":
+        return False
+    text = _v23_text(row)
+    if not _v23_has_any(text, V23_EVENT_SEMINAR_NOISE_TERMS):
+        return False
+    # Keep official customs/trade notices even if they include "comment request";
+    # remove secondary event/seminar articles.
+    official_source = _v23_has_any(clean(row.get("Agency")).lower() + " " + clean(row.get("URL")).lower(), [
+        "federalregister.gov", "customs", "gov", "europa.eu", "wto.org", "ustr.gov", "cbp.gov"
+    ])
+    return not official_source
+
+def _v23_final_report_filter(rows: pd.DataFrame) -> pd.DataFrame:
+    if rows.empty:
+        return rows
+    before = len(rows)
+    rows = rows.copy()
+    reasons = []
+    keep_mask = []
+    for _, row in rows.iterrows():
+        r = []
+        if _v23_is_stale(row):
+            r.append("v23_stale_over_max_age")
+        if _v23_is_future_abnormal(row):
+            r.append("v23_future_date_abnormal")
+        if _v23_is_event_seminar_noise(row):
+            r.append("v23_event_seminar_noise")
+        reasons.append("; ".join(r))
+        keep_mask.append(not r)
+
+    dropped = rows.loc[[not x for x in keep_mask]].copy()
+    kept = rows.loc[keep_mask].copy()
+
+    if len(dropped) > 0:
+        try:
+            print("[INFO] v23 final mail guard removed:")
+            for _, r in dropped.head(20).iterrows():
+                print(f"  - {clean(r.get('Headline'))[:110]} / date={clean(r.get('Date')) or clean(_v23_best_row_date(r))} / reason={reasons[int(r.name)] if isinstance(r.name, int) and r.name < len(reasons) else ''}")
+        except Exception:
+            pass
+
+    kept = kept.reset_index(drop=True)
+    if "No" in kept.columns:
+        kept["No"] = range(1, len(kept) + 1)
+    print(f"[INFO] v23 final mail guard: before={before}, after={len(kept)}, removed={before-len(kept)}, max_age_days={V23_MAIL_MAX_AGE_DAYS}")
+    return kept
+
+_v23_prepare_rows_base = prepare_rows
+
+def prepare_rows(rows: pd.DataFrame) -> pd.DataFrame:
+    rows = _v23_prepare_rows_base(rows)
+    rows = _v23_final_report_filter(rows)
+    # Re-sort after final filtering to avoid gaps and stale Top3 candidates.
+    if "_report_score" in rows.columns and "_sort_date" in rows.columns:
+        rows = rows.sort_values(["_report_score", "_sort_date"], ascending=[False, False]).reset_index(drop=True)
+    elif "_integrated_score" in rows.columns and "_sort_date" in rows.columns:
+        rows = rows.sort_values(["_integrated_score", "_sort_date"], ascending=[False, False]).reset_index(drop=True)
+    if "No" in rows.columns:
+        rows["No"] = range(1, len(rows) + 1)
+    return rows
+
+_v23_choose_top3_base = choose_top3
+
+def choose_top3(rows: pd.DataFrame) -> pd.DataFrame:
+    pool = _v23_final_report_filter(rows)
+    if pool.empty:
+        pool = rows.copy()
+    out = _v23_choose_top3_base(pool)
+    if not out.empty:
+        out["No"] = range(1, len(out) + 1)
+    return out
+
+# ======================================================================
+# End of GTI STEP5 STRICT FINAL GUARD v23
+# ======================================================================
+
 def main() -> None:
     paths = output_paths()
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
