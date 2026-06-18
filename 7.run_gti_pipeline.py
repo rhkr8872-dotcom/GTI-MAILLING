@@ -188,7 +188,24 @@ def file_has_rows(path: Path) -> bool:
         return False
 
 
+def mail_run_date() -> str:
+    return os.getenv("GTI_RUN_DATE", datetime.now().strftime("%Y-%m-%d"))
+
+
+def validate_mail_outputs() -> tuple[bool, list[str]]:
+    run_date = mail_run_date()
+    expected = [
+        MAIL_OUTPUT_DIR / f"[GTI Radar] Global Trade Intelligence({run_date}).html",
+        MAIL_OUTPUT_DIR / f"[GTI Radar] Global Trade Intelligence({run_date}).xlsx",
+    ]
+    missing_or_empty = [str(path) for path in expected if not file_has_rows(path)]
+    return not missing_or_empty, missing_or_empty
+
+
 def validate_outputs(step: Step) -> tuple[bool, list[str]]:
+    if step.name == "STEP5_MAIL_ENGINE":
+        return validate_mail_outputs()
+
     missing_or_empty: list[str] = []
     for filename in step.expected_outputs:
         path = BASE_DIR / filename
@@ -487,4 +504,5 @@ def main() -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
+
 
