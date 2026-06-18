@@ -1,4 +1,4 @@
-
+﻿
 # 7.run_gti_pipeline.py
 # -*- coding: utf-8 -*-
 """
@@ -59,7 +59,7 @@ STAGE_1 = [
 ]
 
 STAGE_2 = [
-    Step("STEP2_NAVER", "2-1.naver_news_collector.py", required=False, expected_outputs=("2-1.naver_news_raw.xlsx",)),
+    Step("STEP2_NAVER", "2-1.NAVER_news_collector.py", required=False, expected_outputs=("2-1.naver_news_raw.xlsx",)),
     Step("STEP2_GOOGLE", "2-2.google_news_collector.py", required=False, expected_outputs=("2-2.google_news_raw.xlsx",)),
     Step("STEP2_RSS", "2-3.rss_news_raw.py", required=False, expected_outputs=("2-3.rss_news_raw.xlsx",)),
 ]
@@ -487,3 +487,4 @@ def main() -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
+

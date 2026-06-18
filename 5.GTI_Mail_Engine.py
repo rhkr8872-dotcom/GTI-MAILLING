@@ -4503,6 +4503,307 @@ def overall_html(rows: pd.DataFrame, top3: pd.DataFrame) -> str:
 # End of GTI STEP5 Freshness & Executive Summary Patch v21
 # ======================================================================
 
+
+# ======================================================================
+# GTI STEP5 STRICT FINAL GUARD v22 - integrated into Mail Engine
+# ----------------------------------------------------------------------
+# Purpose
+# - Do NOT read legacy/audit news fallback files at Step5.
+# - Use only 4-1.regulation_ai_summary.xlsx and 4-2.news_ai_summary.xlsx.
+# - Apply final mail-grade hard reject after Step4.
+# - Recalibrate Samsung Impact before Top3 and mail table generation.
+# ======================================================================
+
+MAIL_REG_TARGET_MAX_V22 = int(os.getenv("GTI_MAIL_REG_TARGET_MAX", "25"))
+MAIL_NEWS_TARGET_MAX_V22 = int(os.getenv("GTI_MAIL_NEWS_TARGET_MAX", "30"))
+MAIL_MAX_PER_NEWS_ISSUE_V22 = int(os.getenv("GTI_MAIL_MAX_PER_NEWS_ISSUE", "2"))
+
+V22_TRADE_REG_TERMS = [
+    "관세", "통관", "수입", "수출", "수출입", "fta", "원산지", "환급", "보세", "외환",
+    "덤핑", "상계관세", "세이프가드", "수출통제", "전략물자", "hs", "품목분류", "관세율",
+    "무역구제", "세관", "할당관세", "쿼터", "cbam", "탄소국경", "철강", "알루미늄",
+    "customs", "tariff", "duty", "import", "export", "origin", "rules of origin", "drawback",
+    "anti-dumping", "antidumping", "countervailing", "safeguard", "export control", "entity list",
+    "hs code", "classification", "carbon border", "melt and pour", "section 301", "section 232",
+]
+
+V22_REG_NOISE_TERMS = [
+    "제대군인", "특수의료장비", "소방시설", "고용보험", "청년고용", "장애인복지", "농촌융복합",
+    "농어촌정비", "인민군", "측량 및 지도", "상표법", "디자인보호법", "직제", "복지", "군 사관",
+    "청년 실업", "병원선", "소방", "의료장비", "농로", "장애", "고용", "국가보훈", "과학기술정보통신부와 그 소속기관",
+    "기초연금", "농어업", "평생 직업능력", "전통시장", "생태", "우체국보험", "보험료", "환급금",
+    "국립수목원", "반부패", "청렴", "식품", "농심", "식약", "중기부", "문체", "총리령", "조세특례제한법",
+]
+
+V22_STRONG_POLICY_TERMS = [
+    "section 301", "301조", "section 232", "232조", "anti-dumping", "anti dumping", "antidumping",
+    "countervailing", "ad/cvd", "safeguard", "cbam", "carbon border", "tariff-rate quota",
+    "tariff quota", "duty-free quota", "export control", "entity list", "uflpa", "forced labor",
+    "rules of origin", "hs code", "classification", "customs duty", "import duty", "melt and pour",
+    "반덤핑", "상계관세", "무역구제", "세이프가드", "탄소국경", "수출통제", "강제노동",
+    "원산지", "품목분류", "할당관세", "관세율", "무관세", "쿼터", "통관", "보세", "환급", "관세",
+]
+
+V22_SAMSUNG_EXACT_TERMS = ["samsung", "samsung electronics", "samsung sdi", "samsung display", "삼성", "삼성전자", "삼성sdi", "삼성디스플레이"]
+V22_PRODUCT_TERMS = [
+    "semiconductor", "chip", "chips", "memory", "hbm", "battery", "display", "oled", "smartphone", "mobile", "appliance",
+    "steel", "aluminum", "abs", "resin", "pcb", "wafer", "copper", "zinc", "rare earth",
+    "반도체", "칩", "메모리", "배터리", "디스플레이", "스마트폰", "모바일", "가전", "철강", "알루미늄",
+    "합성수지", "수지", "웨이퍼", "구리", "아연", "희토류",
+]
+
+V22_NEWS_NOISE_TERMS = [
+    "손바닥뉴스", "시장동향", "경제 아카데미", "포항상의", "염전 노예", "교황", "대통령", "순방",
+    "호르무즈", "사설", "칼럼", "opinion", "editorial", "youtube", "뉴스) - youtube", "운임 인상",
+    "기자회견", "정상회담", "외교", "business trip", "g7 정상", "기업 해결사", "한반도 구상",
+    "로펌 경쟁", "주가", "증시", "시장 전망", "market outlook", "자동차 시장", "수소배관 국산화",
+    "돼지고기", "고등어", "오징어", "농산물", "쇠고기", "쌀", "설탕", "cheese", "홍콩",
+    "타이어 생산거점", "車산업", "자동차 산업", "포항시", "아카데미", "지역경제", "대장간",
+]
+
+V22_HARD_REJECT_REASONS = [
+    "event_training_tender_noise", "financial_industry_noise_without_trade_policy", "samsung_general_business_noise",
+    "general_economy_without_samsung_policy", "low_value_general_news", "bilateral_industry_news_without_trade_policy",
+    "ai_chip_industry_without_control_signal", "export_control_industry_without_control_signal", "google_news_original_url_unresolved",
+    "future_date_abnormal", "no_valid_url", "v12_hard_reference_or_noise", "v12_no_customs_trade_action_signal",
+    "strict_bad_or_unresolved_url", "strict_digest_politics_market_noise", "strict_no_concrete_customs_trade_signal",
+    "mail_guard_bad_or_unresolved_url", "mail_guard_existing_hard_reject", "mail_guard_digest_politics_market_noise",
+    "mail_guard_no_concrete_customs_trade_signal", "mail_guard_reference_not_reportable",
+]
+
+V22_BAD_URL_STATUSES = ["SEARCH_NO_GOOD_RESULT", "NO_ORIGINAL_URL", "GOOGLE_UNRESOLVED", "GOOGLE_HOME", "EMPTY_OR_BAD_LINK"]
+
+
+def _v22_has_any(text: str, terms: list[str]) -> bool:
+    low = str(text or "").lower()
+    return any(str(t).lower() in low for t in terms if str(t).strip())
+
+
+def _v22_text(row: pd.Series, cols: list[str]) -> str:
+    return " ".join(clean(row.get(c, "")) for c in cols).lower()
+
+
+def _v22_good_url(row: pd.Series) -> bool:
+    u = best_url_from_values([row.get("URL", ""), row.get("Source", "")])
+    q = clean(row.get("URL_Quality", "")).upper()
+    ul = u.lower()
+    if not ul.startswith(("http://", "https://")):
+        return False
+    if "youtube.com" in ul or "youtu.be" in ul:
+        return False
+    if "news.google.com" in ul and not ("/rss/articles/" in ul or "/articles/" in ul):
+        return False
+    return not any(x in q for x in V22_BAD_URL_STATUSES)
+
+
+def _v22_recalibrate_impact(row: pd.Series) -> str:
+    original = _v22_text(row, [
+        "Headline", "Major Changes", "Original Post Summary", "Original Body Text", "Cluster", "Agency", "Source", "URL",
+        "Issue", "KeywordMatches",
+    ])
+    strong = _v22_has_any(original, V22_STRONG_POLICY_TERMS)
+    samsung = _v22_has_any(original, V22_SAMSUNG_EXACT_TERMS)
+    product = _v22_has_any(original, V22_PRODUCT_TERMS)
+    if samsung and strong:
+        return "Direct"
+    if product and strong:
+        return "Indirect"
+    if strong:
+        return "Watch"
+    return "Reference"
+
+
+def _v22_reg_keep(row: pd.Series) -> bool:
+    primary = _v22_text(row, ["Headline", "URL", "Source", "Agency"])
+    title = clean(row.get("Headline", "")).lower()
+    has_trade = _v22_has_any(primary, V22_TRADE_REG_TERMS)
+    is_noise = _v22_has_any(title, V22_REG_NOISE_TERMS)
+    if "환급" in title and not _v22_has_any(title, ["관세", "수출용", "원재료", "drawback", "customs"]):
+        is_noise = True
+    return has_trade and not is_noise
+
+
+def _v22_news_keep(row: pd.Series) -> bool:
+    text = _v22_text(row, ["Headline", "Major Changes", "Summary", "AI Analysis", "Action Plan", "Issue", "Impact Reason", "RejectReason", "URL_Quality"])
+    rr = clean(row.get("RejectReason", ""))
+    rr_set = {x.strip() for x in rr.split(";") if x.strip()}
+    broad_reasons = {"weighted_v18_not_topN_or_noise", "weak_samsung_relevance", "report_issue_duplicate_compressed"}
+    if not _v22_good_url(row):
+        return False
+    if any(x in rr for x in V22_HARD_REJECT_REASONS):
+        if not (rr_set <= broad_reasons and _v22_has_any(text, V22_STRONG_POLICY_TERMS)):
+            return False
+    if _v22_has_any(text, V22_NEWS_NOISE_TERMS):
+        return False
+    if not _v22_has_any(text, V22_STRONG_POLICY_TERMS):
+        return False
+    return _v22_recalibrate_impact(row) != "Reference"
+
+
+def _v22_issue_key(row: pd.Series) -> str:
+    t = _v22_text(row, ["Headline", "Major Changes", "Summary", "AI Analysis", "Issue", "Cluster"])
+    if "india" in t and ("uk" in t or "britain" in t) and ("fta" in t or "ceta" in t or "trade agreement" in t):
+        return "india_uk_fta"
+    if "eu" in t and ("steel" in t or "철강" in t) and ("safeguard" in t or "세이프가드" in t or "quota" in t or "쿼터" in t):
+        return "eu_steel_safeguard"
+    if "section 301" in t or "301조" in t:
+        return "section_301"
+    if "section 232" in t or "232조" in t:
+        return "section_232"
+    if "cbam" in t or "탄소국경" in t:
+        return "cbam"
+    if "korea" in t and ("mongol" in t or "몽골" in t) and "cepa" in t:
+        return "korea_mongolia_cepa"
+    return re.sub(r"[^0-9a-z가-힣]+", " ", clean(row.get("Headline", "")).lower()).strip()[:90]
+
+
+def _v22_filter_mail_rows(rows: pd.DataFrame) -> pd.DataFrame:
+    if rows.empty:
+        return rows
+    rows = rows.copy()
+    reg = rows[rows["Content Type"].eq("Regulation")].copy()
+    news = rows[rows["Content Type"].eq("News")].copy()
+
+    before_reg, before_news = len(reg), len(news)
+    if not reg.empty:
+        reg = reg[reg.apply(_v22_reg_keep, axis=1)].copy()
+        if "_integrated_score" in reg.columns:
+            reg = reg.sort_values(["_integrated_score", "_sort_date"], ascending=[False, False])
+        reg = reg.head(MAIL_REG_TARGET_MAX_V22)
+
+    if not news.empty:
+        news["Samsung Impact"] = news.apply(_v22_recalibrate_impact, axis=1)
+        news = news[news.apply(_v22_news_keep, axis=1)].copy()
+        if not news.empty:
+            news["_v22_issue_key"] = news.apply(_v22_issue_key, axis=1)
+            sort_cols = [c for c in ["WeightedScore", "Importance Score", "_integrated_score", "_sort_date"] if c in news.columns]
+            if sort_cols:
+                news = news.sort_values(sort_cols, ascending=[False] * len(sort_cols))
+            dup_mask = news.groupby("_v22_issue_key").cumcount() >= MAIL_MAX_PER_NEWS_ISSUE_V22
+            news = news[~dup_mask].copy()
+            news = news.head(MAIL_NEWS_TARGET_MAX_V22).drop(columns=["_v22_issue_key"], errors="ignore")
+
+    out = pd.concat([reg, news], ignore_index=True, sort=False)
+    print(
+        f"[INFO] v22 strict mail guard: regulation {before_reg}->{len(reg)}, "
+        f"news {before_news}->{len(news)}, total={len(out)}"
+    )
+    return out.reset_index(drop=True)
+
+
+def read_step4_results() -> pd.DataFrame:
+    """v22 override: read only official Step4 selected outputs, not legacy/audit fallback files."""
+    frames = []
+    if REGULATION_INPUT_FILE.exists():
+        reg = normalize_input(pd.read_excel(REGULATION_INPUT_FILE), "Regulation", REGULATION_INPUT_FILE)
+        frames.append(reg)
+        print(f"[INFO] v22 regulation loaded: {REGULATION_INPUT_FILE} rows={len(reg)}")
+    else:
+        print(f"[WARN] v22 regulation missing: {REGULATION_INPUT_FILE}")
+
+    if NEWS_INPUT_FILE.exists():
+        news = normalize_input(pd.read_excel(NEWS_INPUT_FILE), "News", NEWS_INPUT_FILE)
+        if NEWS_MAX_ROWS > 0:
+            news = news.head(NEWS_MAX_ROWS)
+        frames.append(news)
+        print(f"[INFO] v22 news loaded: {NEWS_INPUT_FILE} rows={len(news)}")
+    else:
+        print(f"[WARN] v22 news missing: {NEWS_INPUT_FILE}")
+
+    if not frames:
+        raise FileNotFoundError(f"STEP4 outputs not found: {REGULATION_INPUT_FILE}, {NEWS_INPUT_FILE}")
+
+    rows = pd.concat(frames, ignore_index=True, sort=False)
+    rows["URL"] = rows.apply(lambda r: best_url_from_values([r.get("URL"), r.get("Source")]), axis=1)
+    rows["_dedup_key"] = rows.apply(
+        lambda r: clean(r.get("URL")).lower() or (
+            clean(r.get("Headline"))[:160] + "|" + clean(r.get("Agency")) + "|" + clean(r.get("Date"))
+        ),
+        axis=1,
+    )
+    rows = rows.drop_duplicates(subset=["_dedup_key"], keep="first").drop(columns=["_dedup_key"], errors="ignore")
+    rows["_integrated_score"] = rows.apply(
+        lambda r: priority_weight(r.get("Priority Group")) + risk_weight(r.get("Risk")) +
+                  (180 if clean(r.get("Content Type")) == "Regulation" else 0) +
+                  safe_num(r.get("Importance Score")) + safe_num(r.get("WeightedScore")),
+        axis=1,
+    )
+    rows = _v22_filter_mail_rows(rows)
+    print(
+        f"[INFO] v22 total input rows={len(rows)} / "
+        f"regulation={int(rows['Content Type'].eq('Regulation').sum())} / "
+        f"news={int(rows['Content Type'].eq('News').sum())}"
+    )
+    return rows.reset_index(drop=True)
+
+
+def prepare_rows(rows: pd.DataFrame) -> pd.DataFrame:
+    """v22 override: prepare after final mail-grade filtering and impact recalibration."""
+    rows = rows.copy()
+    if rows.empty:
+        return rows
+    news_mask = rows["Content Type"].eq("News")
+    rows.loc[news_mask, "Samsung Impact"] = rows[news_mask].apply(_v22_recalibrate_impact, axis=1)
+    rows["Issue"] = rows.apply(issue_for, axis=1)
+    rows = dedup_report_rows(rows)
+    rows["Mail Group"] = rows["Content Type"].map({"Regulation": GROUP_REGULATION}).fillna(GROUP_NEWS)
+    rows["Major Changes"] = rows.apply(major_changes, axis=1)
+    rows["Summary"] = rows.apply(report_summary, axis=1)
+    rows["AI Analysis"] = rows.apply(report_impact, axis=1)
+    rows["Action Plan"] = rows.apply(report_action, axis=1)
+    for col in WEIGHTED_COLS_V19:
+        if col not in rows.columns:
+            rows[col] = ""
+    rows = rows.apply(recalc_weighted_score_v19, axis=1)
+    rows["_report_score"] = rows.apply(report_score, axis=1)
+    rows = ensure_output_columns_v19(rows)
+    rows = rows.sort_values(["_report_score", "_sort_date"], ascending=[False, False]).reset_index(drop=True)
+    rows["No"] = range(1, len(rows) + 1)
+    return rows
+
+
+def choose_top3(rows: pd.DataFrame) -> pd.DataFrame:
+    """v22 override: choose Top3 only from non-Reference, actionable customs/trade rows."""
+    if rows.empty:
+        return rows
+    pool = rows.copy()
+    pool = pool[pool["Samsung Impact"].ne("Reference")].copy()
+    if pool.empty:
+        pool = rows.copy()
+    pool["_v22_top3_actionable"] = pool.apply(
+        lambda r: _v22_has_any(_v22_text(r, ["Headline", "Major Changes", "Summary", "AI Analysis", "Action Plan", "Issue"]), V22_STRONG_POLICY_TERMS),
+        axis=1,
+    )
+    cand = pool[pool["_v22_top3_actionable"]].copy()
+    if cand.empty:
+        cand = pool.copy()
+    cand["_top3_score"] = cand.apply(top3_deep_score, axis=1)
+    cand = cand.sort_values(["_top3_score", "_sort_date"], ascending=[False, False])
+    selected, used = [], set()
+    for _, row in cand.iterrows():
+        key = clean(row.get("Issue")) or _v22_issue_key(row)
+        if key in used:
+            continue
+        selected.append(row)
+        used.add(key)
+        if len(selected) == 3:
+            break
+    if len(selected) < 3:
+        for _, row in cand.iterrows():
+            if any(clean(row.get("Headline")) == clean(x.get("Headline")) for x in selected):
+                continue
+            selected.append(row)
+            if len(selected) == 3:
+                break
+    out = pd.DataFrame(selected).drop(columns=["_v22_top3_actionable"], errors="ignore").reset_index(drop=True)
+    if not out.empty:
+        out["No"] = range(1, len(out) + 1)
+    return out
+
+# ======================================================================
+# End of GTI STEP5 STRICT FINAL GUARD v22
+# ======================================================================
+
 def main() -> None:
     paths = output_paths()
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)

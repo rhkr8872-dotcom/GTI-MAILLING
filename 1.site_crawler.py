@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 r"""
-GTI STEP1 REGULATION-ONLY CLEAN v3 - official regulation sensing
+GTI STEP1 REGULATION-ONLY CLEAN v3.4 - official regulation sensing
 
 Input:
 - C:\temp\sites.xlsx
@@ -17,7 +17,7 @@ Classification rule:
 - site_type = regulation → 정부/공식기관 원문 문서
 
 Search period:
-- HOURS_BACK = 24
+- HOURS_BACK = 72
 
 Step design:
 - STEP1 collects broadly and removes only obvious noise/menu/old/cumulative URL duplicates.
@@ -28,6 +28,7 @@ Step design:
 import re
 import time
 import warnings
+import os
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta
 from html import unescape
@@ -63,11 +64,12 @@ CUMULATIVE_FILE = BASE_DIR / "1.site_news_cumulative.xlsx"
 OUT_ALL_FILE = BASE_DIR / "1.site_news_raw.xlsx"
 OUT_AUDIT_FILE = BASE_DIR / "1.site_news_audit.xlsx"
 OUT_REG_FILE = BASE_DIR / "1-1.regulation_raw.xlsx"
+OUT_REG_NEW_FILE = BASE_DIR / "1-1.regulation_new_raw.xlsx"
 OUT_NEWS_FILE = BASE_DIR / "1-2.site_news_raw.xlsx"
 REJECT_FILE = BASE_DIR / "1.site_news_reject_debug.xlsx"
 FINAL_EXCLUDED_FILE = BASE_DIR / "1.site_news_final_excluded.xlsx"
 
-HOURS_BACK = 24
+HOURS_BACK = int(os.getenv("GTI_STEP1_HOURS_BACK", "72"))
 MAX_PER_SITE = 30
 MAX_GWANBO_ITEMS = 250
 SLEEP_SEC = 0.5
@@ -2766,8 +2768,8 @@ def main():
     audit_df = df.copy()
     final_df, excluded_df = split_final_rows(df, keyword_terms)
 
-    # GTI 운영 원칙 변경(2026-06-07):
-    # 1.site 단계의 raw 파일은 "최근 24시간 수집분"을 보존해야 한다.
+    # GTI 운영 원칙 변경(2026-06-18):
+    # 1.site 단계의 raw 파일은 "최근 72시간 후보"를 보존해야 한다.
     # cumulative 중복은 메일/누적 관리용 참고정보일 뿐, raw 저장 제외 사유가 아니다.
     # 따라서 기존 split_cumulative_new_rows()로 final_df에서 제거하지 않고
     # is_cumulative_duplicate 컬럼만 부여한다.
@@ -2814,10 +2816,16 @@ def main():
     print(f"🧹 중복 제거: {dup_removed}")
     print(f"🧹 최종 필터 제외(누적 제외 미포함): {final_filter_removed}")
     print(f"🧾 누적 중복 표시만(Y): {cumulative_dedup_removed}")
-    print(f"✅ 최근 24시간 최종 저장: {final_count}")
+    print(f"✅ STEP1 법규 후보 저장(최근 {HOURS_BACK}시간 기준+보호 후보 포함): {final_count}")
+    try:
+        new_count = int((final_df.get("is_cumulative_duplicate", pd.Series(dtype=str)).fillna("").astype(str).str.upper().ne("Y")).sum())
+    except Exception:
+        new_count = final_count
+    print(f"🆕 신규 법규 후보 저장: {new_count}")
     print(f"📁 법규 전체 파일: {OUT_ALL_FILE}")
     print(f"📁 감사 파일: {OUT_AUDIT_FILE}")
     print(f"📁 법규 파일: {OUT_REG_FILE}")
+    print(f"📁 신규 법규 파일: {OUT_REG_NEW_FILE}")
     print(f"📁 최종 제외 파일: {FINAL_EXCLUDED_FILE}")
     print(f"🧾 제외 로그: {REJECT_FILE}")
     print(f"📊 RAW 증가: {len(results) - total_before}")
@@ -3436,6 +3444,189 @@ def split_final_rows(df, keyword_terms=None):
 
     return final, excluded
 
+
+
+# =========================================================
+# GTI v3.4 operational override
+# - 72h collection controlled by GTI_STEP1_HOURS_BACK
+# - Split cumulative display/raw and new-only file
+# - Harden Gwanbo parser: click "전체보기" and preserve warning row if parsing fails
+# =========================================================
+
+def _gwanbo_daily_url(base_url=None):
+    today = datetime.now().strftime("%Y%m%d")
+    base = str(base_url or "https://www.gwanbo.go.kr/user/search/searchDaily.do")
+    return base
+
+def _gwanbo_add_warning_row(source_url, agency, site_type, page_date, detail=""):
+    """When gwanbo parser returns 0 despite the daily page being reachable, keep a visible review row."""
+    title = f"관보 게재현황 확인 필요 - 자동 목차 파싱 실패 ({page_date:%Y-%m-%d})"
+    if detail:
+        title = f"{title} / {clean_text(detail, 80)}"
+    item_url = f"{source_url}?gwanboDate={page_date:%Y%m%d}&parserStatus=NEED_REVIEW"
+    add_result(page_date, title, item_url, source_url, agency, site_type)
+    if results:
+        results[-1]["gwanbo_parser_status"] = "NEED_REVIEW_ZERO_PARSED"
+    return 1
+
+def _parse_gwanbo_visible_text(text, source_url, agency, site_type, page_date):
+    """Parse visible gazette daily text, including compact rows like 고용노동부고시제2026-44호(...)."""
+    before = len(results)
+    text = clean_text(text)
+    if not text:
+        return 0
+
+    # Remove common UI/menu blocks but keep official item lines.
+    lines = [clean_text(x) for x in re.split(r"[\n\r]+|(?=ㆍ)|(?=·)|(?=국가)|(?=[가-힣A-Za-z]+(?:부|청|처|위원회|부처|총리령|대통령령|고시|공고))", text) if clean_text(x)]
+    expanded = "\n".join(lines) if lines else text
+
+    patterns = [
+        # 부처명고시제2026-44호(제목)
+        r"([가-힣A-Za-z0-9ㆍ·\.\-\s]{0,90}(?:법률|대통령령|총리령|부령|고시|공고|훈령|예규)\s*제?\s*\d{1,4}[-–]?\d{0,6}\s*호\s*\([^)]{2,220}\))",
+        # 국가보훈부령제68호(제목)
+        r"([가-힣A-Za-z0-9ㆍ·\.\-\s]{0,90}(?:법률|대통령령|총리령|부령|고시|공고|훈령|예규)\s*제?\s*\d{1,6}\s*호\s*\([^)]{2,220}\))",
+        # If parentheses are missing, keep up to 160 chars.
+        r"([가-힣A-Za-z0-9ㆍ·\.\-\s]{0,90}(?:법률|대통령령|총리령|부령|고시|공고|훈령|예규)\s*제?\s*\d{1,4}[-–]?\d{0,6}\s*호\s*[가-힣A-Za-z0-9ㆍ·\.\-\s]{5,160})",
+    ]
+
+    bad_terms = [
+        "최초 사용자", "관보보기", "목차 다운로드", "전체 다운로드", "마이페이지",
+        "관심 관보", "타임스탬프", "전체보기", "검색", "누리집",
+    ]
+    seen = set()
+    for pattern in patterns:
+        for match in re.finditer(pattern, expanded):
+            title = clean_text(match.group(1))
+            title = re.sub(r"\s+", " ", title).strip(" -ㆍ·")
+            if len(title) < 10 or len(title) > 220:
+                continue
+            if any(b in title for b in bad_terms):
+                continue
+            # Cut off trailing UI text if it leaks into the match.
+            title = re.split(r"(?:전체보기|목차다운로드|처음|이전|다음|마지막)", title)[0].strip()
+            if len(title) < 10:
+                continue
+            key = title.lower()
+            if key in seen:
+                continue
+            seen.add(key)
+            item_url = f"{source_url}?gwanboDate={page_date:%Y%m%d}&gwanboTitle={quote(title[:160])}"
+            add_result(page_date, title, item_url, source_url, agency, site_type)
+            if len(seen) >= MAX_GWANBO_ITEMS:
+                break
+    return len(results) - before
+
+def crawl_gwanbo_requests(source_url, agency, site_type):
+    before = len(results)
+    res = fetch_html(source_url)
+    if not res:
+        print("   [GWANBO WARN] request failed")
+        return _gwanbo_add_warning_row(source_url, agency, site_type, datetime.now(), "REQUEST_FAILED")
+
+    soup = BeautifulSoup(res.text, "html.parser")
+    text = soup.get_text("\n", strip=True)
+    page_date = extract_date_from_text(text) or datetime.now()
+    count = _parse_gwanbo_visible_text(text, source_url, agency, site_type, page_date)
+    if count == 0:
+        print("   [GWANBO WARN] request parsed 0; review row added")
+        return _gwanbo_add_warning_row(source_url, agency, site_type, page_date, "REQUEST_ZERO")
+    return len(results) - before
+
+def crawl_gwanbo_selenium(source_url, agency, site_type):
+    before = len(results)
+    page_date = datetime.now()
+
+    if not SELENIUM_AVAILABLE:
+        print("   [GWANBO WARN] selenium unavailable; using requests fallback")
+        return crawl_gwanbo_requests(source_url, agency, site_type)
+
+    driver = None
+    try:
+        options = Options()
+        options.add_argument("--headless=new")
+        options.add_argument("--disable-gpu")
+        options.add_argument("--window-size=1800,1600")
+        options.add_argument("--no-sandbox")
+        options.add_argument("--disable-dev-shm-usage")
+        driver = webdriver.Chrome(options=options)
+        driver.get(source_url)
+        time.sleep(4)
+
+        # Try clicking "전체보기" because daily gazette table is often lazy-rendered.
+        for xpath in [
+            "//*[contains(text(),'전체보기')]",
+            "//button[contains(.,'전체보기')]",
+            "//a[contains(.,'전체보기')]",
+        ]:
+            try:
+                elems = driver.find_elements("xpath", xpath)
+                for elem in elems[:3]:
+                    if elem.is_displayed():
+                        driver.execute_script("arguments[0].click();", elem)
+                        time.sleep(2)
+                        break
+            except Exception:
+                pass
+
+        html = driver.page_source or ""
+        soup = BeautifulSoup(html, "html.parser")
+        text = soup.get_text("\n", strip=True)
+        page_date = extract_date_from_text(text) or datetime.now()
+        count = _parse_gwanbo_visible_text(text, source_url, agency, site_type, page_date)
+        if count > 0:
+            return len(results) - before
+
+        print("   [GWANBO WARN] selenium parsed 0; trying requests fallback")
+        req_count = crawl_gwanbo_requests(source_url, agency, site_type)
+        if req_count > 0:
+            return len(results) - before
+
+        return _gwanbo_add_warning_row(source_url, agency, site_type, page_date, "SELENIUM_ZERO")
+
+    except Exception as e:
+        print(f"   [GWANBO SELENIUM ERROR] {e}")
+        return crawl_gwanbo_requests(source_url, agency, site_type)
+
+    finally:
+        if driver:
+            try:
+                driver.quit()
+            except Exception:
+                pass
+
+def crawl_gwanbo(source_url, agency, site_type):
+    return crawl_gwanbo_selenium(source_url, agency, site_type)
+
+# Override split-save once more so cumulative display/raw and new-only output are separated.
+def save_split_files(df):
+    enhanced = enhance_regulation_rows(df)
+    enhanced = enhanced[enhanced["site_type"] == "regulation"].copy()
+    enhanced.to_excel(OUT_ALL_FILE, index=False)
+
+    reg = enhanced.copy()
+    if not reg.empty and "official_regulation_score" in reg.columns:
+        sort_cols = [c for c in ["protected_regulation_candidate", "official_regulation_score", "date"] if c in reg.columns]
+        if sort_cols:
+            reg = reg.sort_values(sort_cols, ascending=[False] * len(sort_cols), kind="stable")
+
+    reg.to_excel(OUT_REG_FILE, index=False)
+
+    # New-only file for downstream optional use: cumulative duplicate = N.
+    reg_new = reg.copy()
+    if "is_cumulative_duplicate" in reg_new.columns:
+        reg_new = reg_new[reg_new["is_cumulative_duplicate"].fillna("").astype(str).str.upper().ne("Y")].copy()
+    try:
+        reg_new.to_excel(OUT_REG_NEW_FILE, index=False)
+    except Exception as e:
+        print(f"⚠ 신규 법규 파일 저장 실패: {OUT_REG_NEW_FILE} / {e}")
+
+    if "protected_regulation_candidate" in reg.columns:
+        review = reg[reg["protected_regulation_candidate"].fillna("").astype(str).eq("Y")].copy()
+        if not review.empty:
+            try:
+                review.to_excel(OUT_REG_REVIEW_FILE, index=False)
+            except Exception as e:
+                print(f"[REG REVIEW SAVE WARN] skipped: {OUT_REG_REVIEW_FILE} / {e}")
 
 if __name__ == "__main__":
     main()

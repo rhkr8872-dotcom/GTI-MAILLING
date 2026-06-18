@@ -1,5 +1,5 @@
 ﻿# =========================================================
-# GTI STEP2-3 - RSS NEWS RAW MASTER VERSION v3.3
+# GTI STEP2-3 - RSS NEWS RAW MASTER VERSION v3.4
 # Purpose
 # - Read RSS feeds from C:/Temp/gti_master.xlsx first, then sites.xlsx fallback
 # - Scan all sheets, not only Sheet1/site_rss
@@ -21,7 +21,7 @@ import feedparser
 from bs4 import BeautifulSoup
 from dateutil import parser
 
-print("?? GTI STEP2-3 RSS START v3.3 MASTER")
+print("GTI STEP2-3 RSS/SITE NEWS START v3.4 MASTER")
 
 # ===================== CONFIG =====================
 BASE_DIR = os.getenv("GTI_BASE_DIR", r"C:/Temp")
@@ -31,7 +31,7 @@ SITES_FILE_FALLBACK = os.getenv("GTI_SITES_FILE", os.path.join(BASE_DIR, "sites.
 SITE_CRAWLER_FILE = os.getenv("GTI_SITE_CRAWLER_FILE", os.path.join(BASE_DIR, "1.site_crawler.py"))
 os.makedirs(BASE_DIR, exist_ok=True)
 
-LOOKBACK_HOURS = int(os.getenv("GTI_LOOKBACK_HOURS", "24"))
+LOOKBACK_HOURS = int(os.getenv("GTI_LOOKBACK_HOURS", "72"))
 CUT_OFF = datetime.now() - timedelta(hours=LOOKBACK_HOURS)
 MAX_FEEDS_TO_READ = int(os.getenv("GTI_RSS_MAX_FEEDS", "500"))
 MAX_ITEMS_PER_FEED = int(os.getenv("GTI_RSS_MAX_ITEMS_PER_FEED", "300"))
@@ -753,6 +753,7 @@ def dedup(df):
 # ===================== MAIN =====================
 
 def main():
+    print(f"LOOKBACK_HOURS={LOOKBACK_HOURS}")
     site_df = collect_site_news()
     rss_df = collect()
     df = pd.concat([site_df, rss_df], ignore_index=True, sort=False)
