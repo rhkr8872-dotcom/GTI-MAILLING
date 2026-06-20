@@ -1,9 +1,10 @@
 # -*- coding: utf-8 -*-
+# GTI FINAL CORE v5 - News merge, URL candidates preserved
 """
 STEP3-2 : news_merge.py
 
 Input:
-- C:\\Temp\\1-2.site_news_raw.xlsx
+- C:\\Temp\\1-2.site_news_raw.xlsx   # STEP1 non-LAW1 rows only; treated as news
 - C:\\Temp\\2-1.naver_news_raw.xlsx
 - C:\\Temp\\2-2.google_news_raw.xlsx
 - C:\\Temp\\2-3.rss_news_raw.xlsx
@@ -58,7 +59,7 @@ KEYWORD_FILES = [
     BASE_DIR / "keyword_master_trade_policy_150.xlsx",
 ]
 
-RECENT_HOURS = 48
+RECENT_HOURS = int(os.getenv("GTI_STEP3_RECENT_HOURS", "72"))
 MAX_OUTPUT = 300
 MIN_SCORE = 20
 MAX_PER_ISSUE_CLUSTER = 1
@@ -152,6 +153,7 @@ FINAL_COLS = [
     "Importance",
     "Category",
     "URLRestoreStatus",
+    "URLDecodeStatus",
     "Step4Hint",
     "SourceScoreReason",
 ]

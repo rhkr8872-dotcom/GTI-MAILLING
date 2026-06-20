@@ -1,6 +1,7 @@
 # -*- coding: utf-8 -*-
+# GTI FINAL CORE v5 - Article body extraction with Selenium URL recovery
 """
-GTI STEP3 - Regulation / News Article Body Extract + Representative Clustering
+GTI STEP3 - LAW1 Regulation / News Article Body Extract + Representative Clustering
 ----------------------------------------------------------------------------
 목적
 1) STEP3에서 법규/뉴스 본문을 확보한다.
@@ -43,8 +44,9 @@ warnings.filterwarnings("ignore")
 # -----------------------------------------------------------------------------
 BASE_DIR = r"C:/Temp"
 
+# LAW1 rule: only 1-1.regulation_raw.xlsx is accepted as Regulation input.
+# All other official notices / site outputs are News candidates via 1-2 / 2-x / 3-2.
 REG_INPUT_CANDIDATES = [
-    os.path.join(BASE_DIR, "3-1.regulation_summary.xlsx"),
     os.path.join(BASE_DIR, "1-1.regulation_raw.xlsx"),
 ]
 NEWS_INPUT_CANDIDATES = [
@@ -253,6 +255,78 @@ GOOGLE_RESOLVE_TIMEOUT = int(os.getenv("GTI_STEP3_GOOGLE_NEWS_RESOLVE_TIMEOUT", 
 _GOOGLE_RESOLVE_CACHE = {}
 
 
+
+# ======================================================================
+# GTI FINAL CORE v5 - Selenium Google URL recovery
+# 브라우저에서 Google News/Alert 링크를 누르면 원문이 열리는 케이스를
+# headless Chrome으로 실제 열어 driver.current_url을 확보한다.
+# ======================================================================
+SELENIUM_GOOGLE_RESOLVE_ENABLED = os.getenv("GTI_SELENIUM_GOOGLE_RESOLVE", "1").strip().upper() not in {"0", "N", "NO", "FALSE"}
+SELENIUM_GOOGLE_TIMEOUT = int(os.getenv("GTI_SELENIUM_GOOGLE_TIMEOUT", "20"))
+
+
+def is_google_intermediate_url(value):
+    u = str(value or "").lower().strip()
+    return (
+        "news.google.com" in u
+        or "google.co.kr/alerts/feeds" in u
+        or "google.com/alerts/feeds" in u
+        or "google.co.kr/url?" in u
+        or "google.com/url?" in u
+    )
+
+
+def resolve_google_url_by_selenium(url, timeout=None):
+    """Return (resolved_url, status). Uses headless Chrome as final fallback."""
+    u = str(url or "").strip()
+    if not u:
+        return "", "EMPTY_URL"
+    if not is_google_intermediate_url(u):
+        return u, "NOT_GOOGLE_URL"
+    if not SELENIUM_GOOGLE_RESOLVE_ENABLED:
+        return u, "SELENIUM_DISABLED"
+    timeout = int(timeout or SELENIUM_GOOGLE_TIMEOUT)
+    try:
+        from selenium import webdriver
+        from selenium.webdriver.chrome.options import Options
+        from selenium.webdriver.support.ui import WebDriverWait
+
+        options = Options()
+        options.add_argument("--headless=new")
+        options.add_argument("--disable-gpu")
+        options.add_argument("--no-sandbox")
+        options.add_argument("--disable-dev-shm-usage")
+        options.add_argument("--window-size=1365,900")
+        options.add_argument("--lang=ko-KR")
+        options.add_argument(
+            "--user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36"
+        )
+
+        driver = webdriver.Chrome(options=options)
+        try:
+            driver.set_page_load_timeout(timeout)
+            driver.get(u)
+
+            def moved_away_from_google(d):
+                cur = (d.current_url or "").lower()
+                return bool(cur) and not is_google_intermediate_url(cur)
+
+            try:
+                WebDriverWait(driver, timeout).until(moved_away_from_google)
+            except Exception:
+                pass
+            final_url = (driver.current_url or "").strip()
+        finally:
+            driver.quit()
+
+        if final_url and not is_google_intermediate_url(final_url):
+            return final_url, "RESOLVED_SELENIUM"
+        return final_url or u, "GOOGLE_REMAINED"
+    except Exception as exc:
+        return u, f"SELENIUM_FAILED:{type(exc).__name__}"
+
+
 def is_google_article_redirect_url(url):
     raw = s(url).lower()
     if not raw.startswith(("http://", "https://")):
@@ -356,14 +430,18 @@ def choose_source_url_for_body(row):
         if is_real_original_url(norm):
             return norm, "ORIGINAL_URL_SELECTED"
 
-    # 2) Google News article redirect decode
+    # 2) Google News / Google Alert redirect decode, then Selenium browser fallback
     for cand in candidates:
         norm = normalize_url(cand)
         if is_google_article_redirect_url(norm):
             resolved = resolve_google_news_url(norm)
             if resolved:
                 return resolved, "GOOGLE_NEWS_RESOLVED_STEP3"
-            return norm, "GOOGLE_NEWS_REDIRECT_UNRESOLVED"
+        if is_google_intermediate_url(norm):
+            resolved, status = resolve_google_url_by_selenium(norm, timeout=GOOGLE_RESOLVE_TIMEOUT)
+            if resolved and is_real_original_url(resolved):
+                return normalize_url(resolved), status or "RESOLVED_SELENIUM"
+            return norm, status or "GOOGLE_REMAINED"
 
     # 3) last fallback
     for cand in candidates:

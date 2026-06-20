@@ -1,6 +1,7 @@
 # -*- coding: utf-8 -*-
+# GTI FINAL CORE v5 - Mail engine, final quality guard
 """
-GTI STEP5 Mail Engine - report quality form v2
+GTI STEP5 Mail Engine - LAW1/NEWSREST report quality form v25
 
 Report form
 -----------
@@ -8,6 +9,8 @@ Report form
 2. Top3 Deep Analysis
 3. Regulation
 4. 주요뉴스
+
+LAW1 rule: Regulation table uses only STEP4-1 output derived from 1-1.regulation_raw.xlsx; all other materials are News.
 
 This step does not reselect STEP4 results. It keeps all selected regulation/news
 items, then rewrites weak STEP4 text into an executive report style.
@@ -4977,7 +4980,7 @@ def choose_top3(rows: pd.DataFrame) -> pd.DataFrame:
 
 
 # ======================================================================
-# GTI STEP5 STRICT FINAL GUARD v24
+# GTI STEP5 STRICT FINAL GUARD v25
 # ----------------------------------------------------------------------
 # Added on top of v23:
 # 1) Remove news rows where article body was not actually available.
@@ -5158,8 +5161,116 @@ def choose_top3(rows: pd.DataFrame) -> pd.DataFrame:
         out["No"] = range(1, len(out) + 1)
     return out
 
+
+
 # ======================================================================
-# End of GTI STEP5 STRICT FINAL GUARD v24
+# GTI STEP5 TITLE KEYWORD STRICT GUARD v26
+# - Top3: title must contain customs/trade keyword.
+# - News table: title must contain customs/trade keyword; otherwise excluded.
+# - This guard is intentionally title-based to avoid Gemini/summary-driven over-selection.
+# ======================================================================
+
+GTI_TITLE_KEYWORD_STRICT = os.getenv("GTI_TITLE_KEYWORD_STRICT", "Y").strip().upper() not in {"N", "NO", "0", "FALSE"}
+GTI_NEWS_TITLE_KEYWORD_REQUIRED = os.getenv("GTI_NEWS_TITLE_KEYWORD_REQUIRED", "Y").strip().upper() not in {"N", "NO", "0", "FALSE"}
+GTI_TOP3_TITLE_KEYWORD_REQUIRED = os.getenv("GTI_TOP3_TITLE_KEYWORD_REQUIRED", "Y").strip().upper() not in {"N", "NO", "0", "FALSE"}
+
+_V26_BASE_TITLE_KEYWORDS = [
+    # Korean customs / trade / law
+    "관세", "통관", "세관", "수입", "수출", "수출입", "무역", "통상", "관세율", "추가관세",
+    "반덤핑", "덤핑", "상계관세", "무역구제", "세이프가드", "쿼터", "무관세",
+    "원산지", "품목분류", "hs", "hs코드", "fta", "cepa", "협정", "특혜관세", "관세환급", "환급",
+    "보세", "수입신고", "수출신고", "전략물자", "수출통제", "제재", "강제노동", "cbam", "탄소국경",
+    "고시", "공고", "입법예고", "행정예고", "관보", "시행규칙", "시행령",
+    # English customs / trade / law
+    "customs", "tariff", "tariffs", "duty", "duties", "import", "export", "trade", "section 301", "section 232",
+    "anti-dumping", "anti dumping", "antidumping", "countervailing", "ad/cvd", "safeguard", "quota", "duty-free",
+    "rules of origin", "origin", "hs code", "classification", "fta", "cepa", "usmca", "cbam", "carbon border",
+    "export control", "entity list", "forced labor", "uflpa", "federal register", "notice", "regulation",
+]
+
+
+def _v26_title_keywords() -> list[str]:
+    extra = os.getenv("GTI_TITLE_KEYWORDS", "").strip()
+    terms = list(_V26_BASE_TITLE_KEYWORDS)
+    if extra:
+        terms.extend([x.strip() for x in re.split(r"[;,|]", extra) if x.strip()])
+    # unique, longer terms first to improve diagnostics if needed
+    out = []
+    seen = set()
+    for t in terms:
+        k = clean(t).lower()
+        if k and k not in seen:
+            out.append(k)
+            seen.add(k)
+    return sorted(out, key=len, reverse=True)
+
+
+def _v26_title_keyword_matches(row: pd.Series) -> list[str]:
+    title = clean(row.get("Headline")).lower()
+    if not title:
+        return []
+    return [kw for kw in _v26_title_keywords() if kw in title]
+
+
+def _v26_title_has_keyword(row: pd.Series) -> bool:
+    return bool(_v26_title_keyword_matches(row))
+
+
+def _v26_filter_news_by_title_keyword(rows: pd.DataFrame) -> pd.DataFrame:
+    if rows.empty or not GTI_TITLE_KEYWORD_STRICT or not GTI_NEWS_TITLE_KEYWORD_REQUIRED:
+        return rows
+    rows = rows.copy()
+    is_news = rows.get("Content Type", "").astype(str).str.lower().eq("news") if "Content Type" in rows.columns else pd.Series(False, index=rows.index)
+    no_kw = rows.apply(lambda r: not _v26_title_has_keyword(r), axis=1)
+    drop_mask = is_news & no_kw
+    dropped = rows.loc[drop_mask].copy()
+    if not dropped.empty:
+        print("[INFO] v26 title keyword guard removed from news:")
+        for _, r in dropped.head(30).iterrows():
+            print(f"  - {clean(r.get('Headline'))[:120]} / reason=v26_no_title_keyword")
+    kept = rows.loc[~drop_mask].copy().reset_index(drop=True)
+    if "No" in kept.columns:
+        kept["No"] = range(1, len(kept) + 1)
+    print(f"[INFO] v26 title keyword news guard: before={len(rows)}, after={len(kept)}, removed={len(dropped)}")
+    return kept
+
+
+_v26_prepare_rows_base = prepare_rows
+
+
+def prepare_rows(rows: pd.DataFrame) -> pd.DataFrame:
+    rows = _v26_prepare_rows_base(rows)
+    rows = _v26_filter_news_by_title_keyword(rows)
+    if "No" in rows.columns:
+        rows["No"] = range(1, len(rows) + 1)
+    return rows
+
+
+_v26_choose_top3_base = choose_top3
+
+
+def choose_top3(rows: pd.DataFrame) -> pd.DataFrame:
+    if rows.empty or not GTI_TITLE_KEYWORD_STRICT or not GTI_TOP3_TITLE_KEYWORD_REQUIRED:
+        return _v26_choose_top3_base(rows)
+    pool = rows[rows.apply(_v26_title_has_keyword, axis=1)].copy()
+    removed = len(rows) - len(pool)
+    if removed:
+        print(f"[INFO] v26 Top3 title keyword guard: candidates={len(rows)}, keyword_candidates={len(pool)}, removed={removed}")
+    if pool.empty:
+        return pool
+    out = _v26_choose_top3_base(pool)
+    # Base chooser can still fill with non-keyword rows only if pool was not used; enforce again.
+    out = out[out.apply(_v26_title_has_keyword, axis=1)].copy().reset_index(drop=True)
+    if not out.empty:
+        out["No"] = range(1, len(out) + 1)
+    return out
+
+# ======================================================================
+# End of GTI STEP5 TITLE KEYWORD STRICT GUARD v26
+# ======================================================================
+
+# ======================================================================
+# End of GTI STEP5 STRICT FINAL GUARD v25
 # ======================================================================
 
 def main() -> None:

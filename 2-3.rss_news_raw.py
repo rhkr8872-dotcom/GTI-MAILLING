@@ -1,4 +1,5 @@
-﻿# =========================================================
+# GTI FINAL CORE v5 - RSS/Site News with Selenium Google URL recovery
+# =========================================================
 # GTI STEP2-3 - RSS NEWS RAW MASTER VERSION v3.4
 # Purpose
 # - Read RSS feeds from C:/Temp/gti_master.xlsx first, then sites.xlsx fallback
@@ -21,7 +22,7 @@ import feedparser
 from bs4 import BeautifulSoup
 from dateutil import parser
 
-print("GTI STEP2-3 RSS/SITE NEWS START v3.4 MASTER")
+print("GTI STEP2-3 RSS/SITE NEWS-ONLY START v3.4 MASTER")
 
 # ===================== CONFIG =====================
 BASE_DIR = os.getenv("GTI_BASE_DIR", r"C:/Temp")
@@ -44,7 +45,7 @@ FINAL_COLS = [
     "date", "title", "url", "source", "feed_name",
     "summary", "collected_at",
     "keyword", "category", "importance", "importance_score",
-    "score_reason", "url_type", "canonical_url",
+    "score_reason", "url_type", "canonical_url", "url_decode_status",
     "source_channel", "agency", "site_type"
 ]
 
@@ -572,6 +573,78 @@ def decode_google_redirect(url):
     return normalize_url(url)
 
 
+
+# ======================================================================
+# GTI FINAL CORE v5 - Selenium Google URL recovery
+# 브라우저에서 Google News/Alert 링크를 누르면 원문이 열리는 케이스를
+# headless Chrome으로 실제 열어 driver.current_url을 확보한다.
+# ======================================================================
+SELENIUM_GOOGLE_RESOLVE_ENABLED = os.getenv("GTI_SELENIUM_GOOGLE_RESOLVE", "1").strip().upper() not in {"0", "N", "NO", "FALSE"}
+SELENIUM_GOOGLE_TIMEOUT = int(os.getenv("GTI_SELENIUM_GOOGLE_TIMEOUT", "20"))
+
+
+def is_google_intermediate_url(value):
+    u = str(value or "").lower().strip()
+    return (
+        "news.google.com" in u
+        or "google.co.kr/alerts/feeds" in u
+        or "google.com/alerts/feeds" in u
+        or "google.co.kr/url?" in u
+        or "google.com/url?" in u
+    )
+
+
+def resolve_google_url_by_selenium(url, timeout=None):
+    """Return (resolved_url, status). Uses headless Chrome as final fallback."""
+    u = str(url or "").strip()
+    if not u:
+        return "", "EMPTY_URL"
+    if not is_google_intermediate_url(u):
+        return u, "NOT_GOOGLE_URL"
+    if not SELENIUM_GOOGLE_RESOLVE_ENABLED:
+        return u, "SELENIUM_DISABLED"
+    timeout = int(timeout or SELENIUM_GOOGLE_TIMEOUT)
+    try:
+        from selenium import webdriver
+        from selenium.webdriver.chrome.options import Options
+        from selenium.webdriver.support.ui import WebDriverWait
+
+        options = Options()
+        options.add_argument("--headless=new")
+        options.add_argument("--disable-gpu")
+        options.add_argument("--no-sandbox")
+        options.add_argument("--disable-dev-shm-usage")
+        options.add_argument("--window-size=1365,900")
+        options.add_argument("--lang=ko-KR")
+        options.add_argument(
+            "--user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36"
+        )
+
+        driver = webdriver.Chrome(options=options)
+        try:
+            driver.set_page_load_timeout(timeout)
+            driver.get(u)
+
+            def moved_away_from_google(d):
+                cur = (d.current_url or "").lower()
+                return bool(cur) and not is_google_intermediate_url(cur)
+
+            try:
+                WebDriverWait(driver, timeout).until(moved_away_from_google)
+            except Exception:
+                pass
+            final_url = (driver.current_url or "").strip()
+        finally:
+            driver.quit()
+
+        if final_url and not is_google_intermediate_url(final_url):
+            return final_url, "RESOLVED_SELENIUM"
+        return final_url or u, "GOOGLE_REMAINED"
+    except Exception as exc:
+        return u, f"SELENIUM_FAILED:{type(exc).__name__}"
+
+
 def extract_title(entry):
     return clean_html(entry.get("title", ""))
 
@@ -604,6 +677,19 @@ def extract_url(entry):
         except Exception:
             pass
     return decode_google_redirect(link)
+
+
+
+def extract_url_with_status(entry):
+    raw = extract_url(entry)
+    if not raw:
+        return "", "EMPTY_URL"
+    if is_google_intermediate_url(raw):
+        resolved, status = resolve_google_url_by_selenium(raw, timeout=SELENIUM_GOOGLE_TIMEOUT)
+        if resolved and not is_google_intermediate_url(resolved):
+            return normalize_url(resolved), status
+        return normalize_url(raw), status or "GOOGLE_REMAINED"
+    return normalize_url(raw), "RESOLVED_DIRECT"
 
 # ===================== SCORE CONTROL =====================
 
@@ -698,7 +784,7 @@ def collect():
             if exclude_keywords and contains_any(f"{title} {summary}", exclude_keywords):
                 continue
 
-            url = extract_url(e)
+            url, url_decode_status = extract_url_with_status(e)
             base_score = feed_info.get("importance_score", 50)
             importance_score, score_reason, url_type = adjust_importance_score(
                 feed_info.get("keyword", ""), title, summary, url, base_score
@@ -720,6 +806,7 @@ def collect():
                 "score_reason": score_reason,
                 "url_type": url_type,
                 "canonical_url": canonical_url,
+                "url_decode_status": url_decode_status,
                 "source_channel": "rss",
                 "agency": feed_name,
                 "site_type": "news",

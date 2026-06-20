@@ -1,4 +1,5 @@
-﻿# =========================================================
+# GTI FINAL CORE v5 - Google News with Selenium original URL recovery
+# =========================================================
 # GTI STEP2-2 - GOOGLE NEWS RAW + ORIGINAL URL PARALLEL FINAL v3.4
 # 紐⑹쟻: 鍮좊Ⅸ ?섏쭛 + Google News ?먮Ц URL 蹂묐젹 蹂듦뎄 + ?ㅽ뻾?쒓컙 濡쒓렇
 # ?먯튃: url 而щ읆? ?먮Ц URL ?곗꽑, google_url 而щ읆? Google News ?먮낯 URL 蹂댁〈
@@ -15,7 +16,7 @@ from datetime import datetime, timedelta
 from urllib.parse import quote, unquote, urlparse, parse_qs
 from bs4 import BeautifulSoup
 
-print("?? GTI STEP2-2 GOOGLE NEWS + ORIGINAL URL PARALLEL START v3.4")
+print("GTI STEP2-2 GOOGLE NEWS-ONLY + ORIGINAL URL PARALLEL START v3.4")
 
 # =============================
 # PATH / CONFIG
@@ -27,7 +28,7 @@ KEYWORD_FILE = os.path.join(BASE_PATH, "keyword.xlsx")
 RAW_FILE = os.path.join(BASE_PATH, "2-2.google_news_raw.xlsx")
 URL_CACHE_FILE = os.path.join(BASE_PATH, "google_news_url_cache.csv")
 
-LOOKBACK_HOURS = 24
+LOOKBACK_HOURS = int(os.getenv("GTI_LOOKBACK_HOURS", "72"))
 SLEEP_SEC = 0.05
 
 # Original URL resolve option.
@@ -311,6 +312,78 @@ def is_google_news_url(value):
     return "news.google.com/rss/articles/" in u or "news.google.com/articles/" in u
 
 
+
+# ======================================================================
+# GTI FINAL CORE v5 - Selenium Google URL recovery
+# 브라우저에서 Google News/Alert 링크를 누르면 원문이 열리는 케이스를
+# headless Chrome으로 실제 열어 driver.current_url을 확보한다.
+# ======================================================================
+SELENIUM_GOOGLE_RESOLVE_ENABLED = os.getenv("GTI_SELENIUM_GOOGLE_RESOLVE", "1").strip().upper() not in {"0", "N", "NO", "FALSE"}
+SELENIUM_GOOGLE_TIMEOUT = int(os.getenv("GTI_SELENIUM_GOOGLE_TIMEOUT", "20"))
+
+
+def is_google_intermediate_url(value):
+    u = str(value or "").lower().strip()
+    return (
+        "news.google.com" in u
+        or "google.co.kr/alerts/feeds" in u
+        or "google.com/alerts/feeds" in u
+        or "google.co.kr/url?" in u
+        or "google.com/url?" in u
+    )
+
+
+def resolve_google_url_by_selenium(url, timeout=None):
+    """Return (resolved_url, status). Uses headless Chrome as final fallback."""
+    u = str(url or "").strip()
+    if not u:
+        return "", "EMPTY_URL"
+    if not is_google_intermediate_url(u):
+        return u, "NOT_GOOGLE_URL"
+    if not SELENIUM_GOOGLE_RESOLVE_ENABLED:
+        return u, "SELENIUM_DISABLED"
+    timeout = int(timeout or SELENIUM_GOOGLE_TIMEOUT)
+    try:
+        from selenium import webdriver
+        from selenium.webdriver.chrome.options import Options
+        from selenium.webdriver.support.ui import WebDriverWait
+
+        options = Options()
+        options.add_argument("--headless=new")
+        options.add_argument("--disable-gpu")
+        options.add_argument("--no-sandbox")
+        options.add_argument("--disable-dev-shm-usage")
+        options.add_argument("--window-size=1365,900")
+        options.add_argument("--lang=ko-KR")
+        options.add_argument(
+            "--user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36"
+        )
+
+        driver = webdriver.Chrome(options=options)
+        try:
+            driver.set_page_load_timeout(timeout)
+            driver.get(u)
+
+            def moved_away_from_google(d):
+                cur = (d.current_url or "").lower()
+                return bool(cur) and not is_google_intermediate_url(cur)
+
+            try:
+                WebDriverWait(driver, timeout).until(moved_away_from_google)
+            except Exception:
+                pass
+            final_url = (driver.current_url or "").strip()
+        finally:
+            driver.quit()
+
+        if final_url and not is_google_intermediate_url(final_url):
+            return final_url, "RESOLVED_SELENIUM"
+        return final_url or u, "GOOGLE_REMAINED"
+    except Exception as exc:
+        return u, f"SELENIUM_FAILED:{type(exc).__name__}"
+
+
 def is_bad_original_url(value):
     u = str(value or "").lower().strip()
     if not u or u in {"nan", "none", "null", "-"}:
@@ -519,7 +592,15 @@ def resolve_google_news_original_url(google_url):
             last_error = f"ERROR_{type(e).__name__}"
             time.sleep(URL_RESOLVE_INTERVAL)
 
-    return "", last_error or "FAILED"
+    # Final browser-grade fallback: if a human click opens the publisher URL, Selenium should recover it.
+    selenium_url, selenium_status = resolve_google_url_by_selenium(u, timeout=URL_RESOLVE_TIMEOUT)
+    if selenium_url and not is_bad_original_url(selenium_url):
+        selenium_url = safe_url(selenium_url)
+        URL_CACHE[u] = selenium_url
+        save_url_cache()
+        return selenium_url, selenium_status
+
+    return "", selenium_status if selenium_status not in {"GOOGLE_REMAINED", "NOT_GOOGLE_URL"} else (last_error or "FAILED")
 
 
 def resolve_original_urls_parallel(df):

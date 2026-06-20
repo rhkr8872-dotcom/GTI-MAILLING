@@ -1,3 +1,4 @@
+# GTI FINAL CORE v5 - NAVER news candidate collector
 # =========================================================
 # GTI STEP2 - NAVER NEWS COLLECTOR
 # Priority Balanced Collection Version
@@ -26,7 +27,7 @@ from urllib.parse import urlparse
 import pandas as pd
 import requests
 
-print("🚀 GTI STEP2 NAVER PRIORITY BALANCED VERSION START")
+print("🚀 GTI STEP2 NAVER NEWS-ONLY PRIORITY BALANCED VERSION START")
 
 # =============================
 # PATH
@@ -55,7 +56,7 @@ HEADERS = {
 # =============================
 # PARAMETER
 # =============================
-LOOKBACK_HOURS = int(os.getenv("GTI_LOOKBACK_HOURS", "24"))
+LOOKBACK_HOURS = int(os.getenv("GTI_LOOKBACK_HOURS", "72"))
 NAVER_DISPLAY = int(os.getenv("NAVER_DISPLAY", "100"))
 MIN_SAVE_PRIORITY = int(os.getenv("GTI_MIN_SAVE_PRIORITY", "50"))
 REQUEST_SLEEP_SEC = float(os.getenv("GTI_NAVER_SLEEP_SEC", "0.1"))

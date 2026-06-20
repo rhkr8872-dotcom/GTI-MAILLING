@@ -1,6 +1,7 @@
 # -*- coding: utf-8 -*-
+# GTI FINAL CORE v5 - Gemini regulation analysis, LAW1 only
 """
-GTI STEP4-1 REGULATION AI ANALYSIS - GUARDRAIL v4.1
+GTI STEP4-1 LAW1-ONLY REGULATION AI ANALYSIS - GUARDRAIL v4.1
 
 Fixes
 - Exclude stale regulations/notices older than GTI_STEP4_REG_MAX_AGE_DAYS (default 90).
@@ -24,7 +25,7 @@ from urllib.parse import quote, unquote, urlparse
 import pandas as pd
 
 BASE_DIR = Path(os.getenv("GTI_BASE_DIR", r"C:\Temp"))
-INPUT_FILE = BASE_DIR / "3-1.regulation_article_summary.xlsx"
+INPUT_FILE = BASE_DIR / "3-1.regulation_article_summary.xlsx"  # generated only from 1-1.regulation_raw.xlsx
 KEYWORD_FILE = BASE_DIR / "keyword.xlsx"
 OUT_SUMMARY = BASE_DIR / "4-1.regulation_ai_summary.xlsx"
 OUT_CUMULATIVE = BASE_DIR / "4-1.regulation_ai_cumulative.xlsx"

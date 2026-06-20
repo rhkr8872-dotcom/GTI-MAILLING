@@ -1,11 +1,12 @@
-﻿
+
 # 7.run_gti_pipeline.py
 # -*- coding: utf-8 -*-
+# GTI FINAL CORE v5 - Full pipeline
 """
-GTI law/news split pipeline.
+GTI LAW1/NEWSREST split pipeline.
 
 Flow:
-1. Site crawler creates regulation/news site raw files.
+1. Site crawler creates 1-1 official regulation only; non-LAW1 rows become news/reference candidates.
 2. Naver, Google, RSS collectors create external news raw files.
 3. Separate merge jobs build regulation and news summaries.
 4. Separate AI analysis job
@@ -39,6 +40,19 @@ LOG_FILE = LOG_DIR / "gti_pipeline_run.log"
 MAIL_INPUT_FILE = BASE_DIR / "4.gti_mail_input.xlsx"
 MAIL_OUTPUT_DIR = BASE_DIR / "12345" / "c_type_outputs"
 
+# Pipeline-level defaults. Individual scripts still allow explicit environment overrides.
+PIPELINE_ENV_DEFAULTS = {
+    "GTI_STEP1_HOURS_BACK": "72",
+    "GTI_LOOKBACK_HOURS": "72",
+    "GTI_STEP3_RECENT_HOURS": "72",
+    "GTI_STEP4_NEWS_MAX_AGE_HOURS": "72",
+    "GTI_MAIL_MAX_AGE_DAYS": "45",
+    "GTI_MAIL_MAX_AGE_DAYS_REG": "45",
+    "GTI_MAIL_MAX_AGE_DAYS_NEWS": "45",
+    "GTI_GEMINI_MODEL": "gemini-2.5-flash-lite",
+    "GTI_GEMINI_TIMEOUT": "20",
+}
+
 
 @dataclass(frozen=True)
 class Step:
@@ -54,7 +68,7 @@ STAGE_1 = [
         "STEP1_SITE_CRAWLER",
         "1.site_crawler.py",
         required=True,
-        expected_outputs=("1-1.regulation_raw.xlsx", "1-2.site_news_raw.xlsx"),
+        expected_outputs=("1-1.regulation_raw.xlsx",),
     ),
 ]
 
@@ -137,6 +151,13 @@ ARCHIVE_TARGETS = [
     "4-2.news_ai_summary.xlsx",
     "4-2.news_ai_cumulative.xlsx",
     "4-2.news_ai_audit_candidates.xlsx",
+    "4-2.news_ai_excluded.xlsx",
+    "4-1.regulation_ai_excluded.xlsx",
+    "3-2.news_article_before_cluster.xlsx",
+    "1.site_news_reject_debug.xlsx",
+    "1.site_news_final_excluded.xlsx",
+    "1-1.regulation_review_raw.xlsx",
+    "1-1.regulation_new_raw.xlsx",
     "4.gti_mail_input.xlsx",
     "GTI_Radar.xlsx",
     "mail_cumulative.xlsx",
@@ -151,6 +172,11 @@ def ensure_dirs() -> None:
     LOG_DIR.mkdir(parents=True, exist_ok=True)
     ARCHIVE_DIR.mkdir(parents=True, exist_ok=True)
     MAIL_OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+
+
+def apply_pipeline_env_defaults() -> None:
+    for key, value in PIPELINE_ENV_DEFAULTS.items():
+        os.environ.setdefault(key, value)
 
 
 def log(message: str = "") -> None:
@@ -232,29 +258,27 @@ def run_script(step: Step, python_exe: str, dry_run: bool = False) -> str:
         return "DRY_RUN"
 
     start = time.time()
-    result = subprocess.run(
+    env = os.environ.copy()
+    env.setdefault("PYTHONIOENCODING", "utf-8")
+    env.setdefault("PYTHONUTF8", "1")
+    proc = subprocess.Popen(
         command,
         cwd=str(BASE_DIR),
         text=True,
         encoding="utf-8",
         errors="replace",
-        capture_output=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        env=env,
     )
+    assert proc.stdout is not None
+    for line in proc.stdout:
+        log(f"  {line.rstrip()}")
+    return_code = proc.wait()
     elapsed = round(time.time() - start, 2)
 
-    if result.stdout:
-        log(f"{step.name} STDOUT BEGIN")
-        for line in result.stdout.splitlines():
-            log(f"  {line}")
-        log(f"{step.name} STDOUT END")
-    if result.stderr:
-        log(f"{step.name} STDERR BEGIN")
-        for line in result.stderr.splitlines():
-            log(f"  {line}")
-        log(f"{step.name} STDERR END")
-
-    if result.returncode != 0:
-        log(f"{step.name} FAILED : return_code={result.returncode} / {elapsed} sec")
+    if return_code != 0:
+        log(f"{step.name} FAILED : return_code={return_code} / {elapsed} sec")
         return "FAILED" if step.required else "WARNING"
 
     ok, bad_outputs = validate_outputs(step)
@@ -451,6 +475,7 @@ def parse_args() -> argparse.Namespace:
 def main() -> int:
     args = parse_args()
     ensure_dirs()
+    apply_pipeline_env_defaults()
 
     log("#" * 80)
     log("GTI LAW/NEWS SPLIT PIPELINE START")
@@ -466,11 +491,11 @@ def main() -> int:
     results: list[tuple[str, str, str]] = []
 
     stages = [
-        ("STAGE 1 - SITE LAW/NEWS CRAWL", STAGE_1),
+        ("STAGE 1 - LAW1 OFFICIAL REGULATION CRAWL", STAGE_1),
         ("STAGE 2 - NEWS COLLECTORS", STAGE_2),
         ("STAGE 3 - NEWS MERGE", STAGE_3),
-        ("STAGE 3-1 - LAW/NEWS ARTICLE SUMMARY", STAGE_3_ARTICLE),
-        ("STAGE 4 - LAW/NEWS AI ANALYSIS", STAGE_4),
+        ("STAGE 3-1 - LAW1/NEWS ARTICLE SUMMARY", STAGE_3_ARTICLE),
+        ("STAGE 4 - LAW1/NEWS AI ANALYSIS", STAGE_4),
     ]
 
     pipeline_ok = True
@@ -481,12 +506,10 @@ def main() -> int:
             break
 
     if pipeline_ok and not args.skip_mail and not args.dry_run:
-        if build_mail_input():
-            stage_ok = run_stage("STAGE 5 - MAIL", STAGE_5, python_exe, args.dry_run, args.keep_going, results)
-            pipeline_ok = pipeline_ok and stage_ok
-        else:
-            results.append(("BUILD_MAIL_INPUT", str(MAIL_INPUT_FILE), "FAILED"))
-            pipeline_ok = False
+        # Step5 v24+ reads 4-1/4-2 directly. 4.gti_mail_input.xlsx is built only as an optional audit file.
+        build_mail_input()
+        stage_ok = run_stage("STAGE 5 - MAIL", STAGE_5, python_exe, args.dry_run, args.keep_going, results)
+        pipeline_ok = pipeline_ok and stage_ok
     elif args.skip_mail:
         log("STAGE 5 SKIPPED BY OPTION")
     elif args.dry_run:

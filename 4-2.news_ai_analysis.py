@@ -1,6 +1,7 @@
 # -*- coding: utf-8 -*-
+# GTI FINAL CORE v5 - Gemini news analysis, title keyword strict
 """
-GTI STEP4-2 NEWS AI ANALYSIS - GUARDRAIL v4.1
+GTI STEP4-2 NEWS-ONLY AI ANALYSIS - GUARDRAIL v4.1
 
 Purpose
 - Read ONLY C:\\Temp\\3-2.news_summary.xlsx.
@@ -4584,6 +4585,86 @@ def _strict_apply_final_guard(daily: pd.DataFrame, audit: pd.DataFrame, excluded
     extra_cols = [c for c in ["CustomsTradeLawScore", "CustomsTradePolicyScore", "DirectImpactScore", "IndirectImpactScore", "WeightedScore", "ScoreBreakdown"] if c in audit.columns]
     out_cols = list(dict.fromkeys(OUTPUT_COLS + extra_cols))
     return daily[out_cols], audit[out_cols], excluded[out_cols]
+
+
+
+# ======================================================================
+# GTI STEP4-2 TITLE KEYWORD STRICT GUARD v23
+# - Selected news must have a customs/trade keyword in the original title.
+# - This prevents summary/Gemini-only relevance from pushing weak items into Top news.
+# ======================================================================
+
+GTI_NEWS_TITLE_KEYWORD_REQUIRED = os.getenv("GTI_NEWS_TITLE_KEYWORD_REQUIRED", "Y").strip().upper() not in {"N", "NO", "0", "FALSE"}
+
+_V23_NEWS_TITLE_KEYWORDS = [
+    "관세", "통관", "세관", "수입", "수출", "수출입", "무역", "통상", "관세율", "추가관세",
+    "반덤핑", "덤핑", "상계관세", "무역구제", "세이프가드", "쿼터", "무관세",
+    "원산지", "품목분류", "hs", "hs코드", "fta", "cepa", "usmca", "협정", "특혜관세", "관세환급", "환급",
+    "보세", "수입신고", "수출신고", "전략물자", "수출통제", "제재", "강제노동", "cbam", "탄소국경",
+    "customs", "tariff", "tariffs", "duty", "duties", "import", "export", "trade", "section 301", "section 232",
+    "anti-dumping", "anti dumping", "antidumping", "countervailing", "ad/cvd", "safeguard", "quota", "duty-free",
+    "rules of origin", "origin", "hs code", "classification", "fta", "cepa", "usmca", "cbam", "carbon border",
+    "export control", "entity list", "forced labor", "uflpa", "federal register", "notice", "regulation",
+]
+
+
+def _v23_news_title_keywords() -> list[str]:
+    extra = os.getenv("GTI_TITLE_KEYWORDS", "").strip()
+    terms = list(_V23_NEWS_TITLE_KEYWORDS)
+    if extra:
+        terms.extend([x.strip() for x in re.split(r"[;,|]", extra) if x.strip()])
+    out = []
+    seen = set()
+    for t in terms:
+        k = clean(t).lower()
+        if k and k not in seen:
+            out.append(k)
+            seen.add(k)
+    return sorted(out, key=len, reverse=True)
+
+
+def _v23_title_has_keyword(row: pd.Series) -> bool:
+    title = clean(row.get("Headline")).lower()
+    if not title:
+        return False
+    return any(kw in title for kw in _v23_news_title_keywords())
+
+
+_v23_strict_apply_final_guard_base = _strict_apply_final_guard
+
+
+def _strict_apply_final_guard(daily: pd.DataFrame, audit: pd.DataFrame, excluded: pd.DataFrame):
+    daily, audit, excluded = _v23_strict_apply_final_guard_base(daily, audit, excluded)
+    if not GTI_NEWS_TITLE_KEYWORD_REQUIRED or audit.empty:
+        return daily, audit, excluded
+
+    audit = audit.copy()
+    selected_mask = audit.get("selected", "").astype(str).str.upper().eq("Y") if "selected" in audit.columns else pd.Series(False, index=audit.index)
+    no_title_kw = audit.apply(lambda r: not _v23_title_has_keyword(r), axis=1)
+    drop_idx = audit[selected_mask & no_title_kw].index
+    if len(drop_idx):
+        audit.loc[drop_idx, "selected"] = "N"
+        audit.loc[drop_idx, "priority_group"] = "EXCLUDED"
+        audit.loc[drop_idx, "mail_section"] = "Excluded"
+        audit.loc[drop_idx, "RejectReason"] = audit.loc[drop_idx, "RejectReason"].apply(lambda v: append_reason(v, "v23_no_title_keyword"))
+        log(f"Title keyword strict guard v23 removed selected news without title keyword: {len(drop_idx)}")
+
+    daily = audit[audit["selected"].astype(str).str.upper().eq("Y")].copy()
+    if not daily.empty:
+        sort_cols = [c for c in ["samsung_impact_score", "WeightedScore", "final_score", "topic_score", "Date"] if c in daily.columns]
+        daily = daily.sort_values(sort_cols, ascending=[False] * len(sort_cols)).reset_index(drop=True)
+        daily["rank"] = range(1, len(daily) + 1)
+    excluded2 = audit[audit["selected"].astype(str).str.upper().ne("Y")].copy()
+
+    for frame in [daily, audit, excluded2]:
+        for col in OUTPUT_COLS:
+            if col not in frame.columns:
+                frame[col] = ""
+    return daily, audit, excluded2
+
+# ======================================================================
+# End of GTI STEP4-2 TITLE KEYWORD STRICT GUARD v23
+# ======================================================================
 
 # ======================================================================
 # End of GTI STEP4-2 Strict Final Guard v22

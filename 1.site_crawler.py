@@ -1,6 +1,7 @@
 # -*- coding: utf-8 -*-
+# GTI FINAL CORE v5 - LAW1 official regulation, rest news
 r"""
-GTI STEP1 REGULATION-ONLY CLEAN v3.4 - official regulation sensing
+GTI STEP1 LAW1-ONLY + NEWS-REST CLEAN v4 - official regulation sensing
 
 Input:
 - C:\temp\sites.xlsx
@@ -65,7 +66,7 @@ OUT_ALL_FILE = BASE_DIR / "1.site_news_raw.xlsx"
 OUT_AUDIT_FILE = BASE_DIR / "1.site_news_audit.xlsx"
 OUT_REG_FILE = BASE_DIR / "1-1.regulation_raw.xlsx"
 OUT_REG_NEW_FILE = BASE_DIR / "1-1.regulation_new_raw.xlsx"
-OUT_NEWS_FILE = BASE_DIR / "1-2.site_news_raw.xlsx"
+OUT_NEWS_FILE = BASE_DIR / "1-2.site_news_raw.xlsx"  # non-LAW1 rows are news/reference candidates
 REJECT_FILE = BASE_DIR / "1.site_news_reject_debug.xlsx"
 FINAL_EXCLUDED_FILE = BASE_DIR / "1.site_news_final_excluded.xlsx"
 
@@ -3597,21 +3598,61 @@ def crawl_gwanbo_selenium(source_url, agency, site_type):
 def crawl_gwanbo(source_url, agency, site_type):
     return crawl_gwanbo_selenium(source_url, agency, site_type)
 
-# Override split-save once more so cumulative display/raw and new-only output are separated.
+# LAW1/NEWSREST final split rule (v4):
+# - 1-1.regulation_raw.xlsx must contain ONLY real official regulation / legal notice rows.
+# - Everything else from STEP1 is written to 1-2.site_news_raw.xlsx as news/reference candidate.
+# - STEP2-3 also collects official agency news, so 1-2 is a compatibility + fallback news file.
+def _law1_is_real_official_regulation(row) -> bool:
+    try:
+        score = float(row.get("official_regulation_score", 0) or 0)
+    except Exception:
+        score = 0.0
+    text = _reg_text(row).lower() if "_reg_text" in globals() else " ".join([clean_text(row.get(c, "")) for c in ["title", "url", "source", "agency", "site_type"]]).lower()
+    if normalize_site_type(row.get("site_type", "")) != "regulation":
+        return False
+    if score < 45:
+        return False
+    # Real regulation/legal publication form. This prevents general official news/press pages
+    # from being treated as Regulation just because they are from an official agency.
+    legal_form_terms = [
+        "law.go.kr", "gwanbo", "federalregister.gov", "eur-lex", "official journal",
+        "notice", "regulation", "rule", "final rule", "proposed rule", "public notice",
+        "고시", "공고", "훈령", "예규", "법", "법률", "시행령", "시행규칙", "입법예고", "행정예고", "관보",
+    ]
+    trade_terms = TRADE_REG_TERMS if "TRADE_REG_TERMS" in globals() else ["customs", "tariff", "import", "export", "관세", "통관", "수입", "수출", "원산지", "fta"]
+    has_legal_form = any(t.lower() in text for t in legal_form_terms)
+    has_trade_signal = any(t.lower() in text for t in trade_terms)
+    return bool(has_legal_form and has_trade_signal)
+
 def save_split_files(df):
-    enhanced = enhance_regulation_rows(df)
-    enhanced = enhanced[enhanced["site_type"] == "regulation"].copy()
+    enhanced = enhance_regulation_rows(df).copy()
+    if enhanced.empty:
+        enhanced.to_excel(OUT_ALL_FILE, index=False)
+        enhanced.to_excel(OUT_REG_FILE, index=False)
+        enhanced.to_excel(OUT_REG_NEW_FILE, index=False)
+        enhanced.to_excel(OUT_NEWS_FILE, index=False)
+        return
+
+    law1_mask = enhanced.apply(_law1_is_real_official_regulation, axis=1)
+    enhanced["law1_regulation_flag"] = law1_mask.map(lambda x: "Y" if x else "N")
+
+    # Keep an all-candidate audit file, but split official-law-only vs news/reference candidates.
     enhanced.to_excel(OUT_ALL_FILE, index=False)
 
-    reg = enhanced.copy()
+    reg = enhanced[law1_mask].copy()
+    news = enhanced[~law1_mask].copy()
+    if not news.empty:
+        news["site_type"] = "news"
+        news["law1_news_reason"] = "not_real_official_regulation_or_low_trade_signal"
+
     if not reg.empty and "official_regulation_score" in reg.columns:
         sort_cols = [c for c in ["protected_regulation_candidate", "official_regulation_score", "date"] if c in reg.columns]
         if sort_cols:
             reg = reg.sort_values(sort_cols, ascending=[False] * len(sort_cols), kind="stable")
 
     reg.to_excel(OUT_REG_FILE, index=False)
+    news.to_excel(OUT_NEWS_FILE, index=False)
 
-    # New-only file for downstream optional use: cumulative duplicate = N.
     reg_new = reg.copy()
     if "is_cumulative_duplicate" in reg_new.columns:
         reg_new = reg_new[reg_new["is_cumulative_duplicate"].fillna("").astype(str).str.upper().ne("Y")].copy()
