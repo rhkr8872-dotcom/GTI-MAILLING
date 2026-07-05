@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
-# GTI FINAL CORE v5 - Mail engine, final quality guard
+# GTI FINAL CORE v27 - Mail engine, 24h + original URL accuracy guard
 """
-GTI STEP5 Mail Engine - LAW1/NEWSREST report quality form v25
+GTI STEP5 Mail Engine - LAW1/NEWSREST report quality form v27
 
 Report form
 -----------
@@ -4627,15 +4627,29 @@ def _v22_reg_keep(row: pd.Series) -> bool:
 
 
 def _v22_news_keep(row: pd.Series) -> bool:
-    text = _v22_text(row, ["Headline", "Major Changes", "Summary", "AI Analysis", "Action Plan", "Issue", "Impact Reason", "RejectReason", "URL_Quality"])
+    # Trust STEP4-selected news unless a real hard blocker remains. Do not use RejectReason
+    # itself as policy text, because labels such as "no_customs" can distort the signal.
+    text = _v22_text(row, ["Headline", "Major Changes", "Summary", "AI Analysis", "Action Plan", "Issue", "Impact Reason", "KeywordMatches"])
     rr = clean(row.get("RejectReason", ""))
     rr_set = {x.strip() for x in rr.split(";") if x.strip()}
-    broad_reasons = {"weighted_v18_not_topN_or_noise", "weak_samsung_relevance", "report_issue_duplicate_compressed"}
+    broad_reasons = {
+        "weighted_v18_not_topN_or_noise",
+        "v20_major_title_or_weighted_below_topN_or_noise",
+        "weak_samsung_relevance",
+        "report_issue_duplicate_compressed",
+        "expanded_policy_watch",
+        "v12_hard_reference_or_noise",
+        "v12_no_customs_trade_action_signal",
+        "strict_existing_hard_reject",
+        "strict_backfill_reportable_policy",
+    }
     if not _v22_good_url(row):
         return False
-    if any(x in rr for x in V22_HARD_REJECT_REASONS):
-        if not (rr_set <= broad_reasons and _v22_has_any(text, V22_STRONG_POLICY_TERMS)):
-            return False
+    hard_hits = [x for x in V22_HARD_REJECT_REASONS if x in rr and x not in broad_reasons]
+    if hard_hits:
+        return False
+    if rr_set and not rr_set <= broad_reasons and any(x in rr for x in V22_HARD_REJECT_REASONS):
+        return False
     if _v22_has_any(text, V22_NEWS_NOISE_TERMS):
         return False
     if not _v22_has_any(text, V22_STRONG_POLICY_TERMS):
@@ -4904,8 +4918,14 @@ def _v23_is_future_abnormal(row: pd.Series) -> bool:
 def _v23_is_event_seminar_noise(row: pd.Series) -> bool:
     if clean(row.get("Content Type")) != "News":
         return False
-    text = _v23_text(row)
-    if not _v23_has_any(text, V23_EVENT_SEMINAR_NOISE_TERMS):
+    # Event noise must be title/metadata based. Do not use AI-generated Summary/Action Plan,
+    # because trade-law articles can mention training/confirmation text in generated prose.
+    title_text = _v23_text(row, ["Headline", "Agency", "Source", "URL"])
+    if not _v23_has_any(title_text, V23_EVENT_SEMINAR_NOISE_TERMS):
+        return False
+    # Strong customs/trade-law titles such as preliminary anti-subsidy duty, tariff,
+    # export control, origin, or CBAM should not be removed as event/seminar noise.
+    if _v23_has_any(title_text, V22_STRONG_POLICY_TERMS):
         return False
     # Keep official customs/trade notices even if they include "comment request";
     # remove secondary event/seminar articles.
@@ -5271,6 +5291,343 @@ def choose_top3(rows: pd.DataFrame) -> pd.DataFrame:
 
 # ======================================================================
 # End of GTI STEP5 STRICT FINAL GUARD v25
+# ======================================================================
+
+
+# ======================================================================
+# GTI STEP5 STRICT FINAL GUARD v27
+# ----------------------------------------------------------------------
+# 24-hour mail exposure rule + original URL accuracy + official LAW1 source gate
+# - 72h collection is allowed upstream; final mail is limited to current daily window.
+# - EXCLUDED/REJECT rows are never mailed.
+# - Regulation rows must be from official source domains only.
+# - News rows must have an original/non-Google URL and known publish date.
+# - Top3 has stricter gates: title keyword + 24h + URL OK + not EXCLUDED.
+# - Add audit columns to Excel for traceability.
+# ======================================================================
+
+GTI_MAIL_MAX_AGE_HOURS_V27 = float(os.getenv("GTI_MAIL_MAX_AGE_HOURS", "24"))
+GTI_MAIL_ALLOW_PREVIOUS_DATE_ONLY_V27 = os.getenv("GTI_MAIL_ALLOW_PREVIOUS_DATE_ONLY", "Y").strip().upper() not in {"N", "NO", "0", "FALSE"}
+GTI_MAIL_DROP_UNKNOWN_DATE_V27 = os.getenv("GTI_MAIL_DROP_UNKNOWN_DATE", "Y").strip().upper() not in {"N", "NO", "0", "FALSE"}
+GTI_MAIL_STRICT_ORIGINAL_URL_V27 = os.getenv("GTI_MAIL_STRICT_ORIGINAL_URL", "Y").strip().upper() not in {"N", "NO", "0", "FALSE"}
+GTI_MAIL_OFFICIAL_REG_ONLY_V27 = os.getenv("GTI_MAIL_OFFICIAL_REG_ONLY", "Y").strip().upper() not in {"N", "NO", "0", "FALSE"}
+
+# Extend Excel output with audit columns. Keep original order and append trace fields.
+_V27_AUDIT_COLUMNS = [
+    "GoogleURL", "OriginalURLCandidate", "BestLinkURL", "URLRestoreStatus", "URLDecodeStatus",
+    "FinalURLDomain", "FreshnessAgeHours", "FreshnessStatus", "OfficialSourceFlag", "RejectReason", "MailGuardReason",
+]
+for _v27_col in _V27_AUDIT_COLUMNS:
+    if _v27_col not in OUTPUT_COLUMNS:
+        OUTPUT_COLUMNS.append(_v27_col)
+
+V27_OFFICIAL_REG_DOMAINS = [
+    # Korea official law/customs sources
+    "customs.go.kr", "unipass.customs.go.kr", "law.go.kr", "moleg.go.kr", "gwanbo.go.kr",
+    "moef.go.kr", "motie.go.kr", "korea.kr",
+    # US official sources
+    "federalregister.gov", "cbp.gov", "ustr.gov", "bis.gov", "trade.gov", "usitc.gov", "commerce.gov",
+    # EU / international / major production-country official sources
+    "europa.eu", "taxation-customs.ec.europa.eu", "policy.trade.ec.europa.eu",
+    "wto.org", "wcoomd.org", "gov.uk", "customs.go.jp", "mof.go.jp", "meti.go.jp",
+    "cbic.gov.in", "dgft.gov.in", "mofcom.gov.cn", "customs.gov.cn", "gacc.gov.cn",
+    "moit.gov.vn", "customs.gov.vn", "gov.br", "sat.gob.mx", "gob.mx",
+]
+
+V27_BAD_URL_TERMS = [
+    "google.co.kr/alerts/feeds", "google.com/alerts/feeds", "alerts/feeds/",
+    "news.google.com/rss/articles", "news.google.com/articles", "news.google.com/",
+    "https://news.google.com", "http://news.google.com",
+]
+
+V27_ALLOWED_URL_STATUSES = {
+    "", "ORIGINAL_INPUT", "RESOLVED_DIRECT", "RESOLVED_REDIRECT", "RESOLVED_SELENIUM",
+    "RESTORED_ORIGINAL_CANDIDATE", "RESTORED_CANONICAL_CANDIDATE", "RESTORED_GOOGLE_QUERY",
+}
+
+V27_EXCLUDED_PRIORITY_TERMS = ["EXCLUDED", "REJECT", "REJECTED", "DROP", "NOISE"]
+V27_HARD_REJECT_TERMS = [
+    "event_training_tender_noise", "financial_industry_noise_without_trade_policy",
+    "samsung_general_business_noise", "bilateral_industry_news_without_trade_policy",
+    "body_unavailable", "google_alert_url_unresolved", "search_no_good_result",
+    "bad_url", "unresolved", "strict_bad_or_unresolved_url", "strict_digest_politics_market_noise",
+    "strict_reference_not_reportable", "strict_no_concrete_customs_trade_signal",
+]
+
+
+def _v27_domain(url: object) -> str:
+    try:
+        from urllib.parse import urlparse
+        raw = best_url_from_values([url]) or clean(url)
+        host = urlparse(raw).netloc.lower().removeprefix("www.")
+        return host
+    except Exception:
+        return ""
+
+
+def _v27_is_bad_google_or_generic_url(url: object) -> bool:
+    raw = clean(url).lower()
+    if not raw or raw in {"nan", "none", "null", "https://news", "http://news", "https://new", "http://new"}:
+        return True
+    if not re.match(r"^https?://", raw):
+        return True
+    return any(term in raw for term in V27_BAD_URL_TERMS)
+
+
+def _v27_url_quality_ok(row: pd.Series) -> bool:
+    url = clean(row.get("URL"))
+    status = clean(row.get("URLDecodeStatus")) or clean(row.get("URLRestoreStatus")) or clean(row.get("URL_Quality"))
+    status_upper = status.upper()
+    if _v27_is_bad_google_or_generic_url(url):
+        return False
+    if any(term in status_upper for term in ["GOOGLE_REMAINED", "GOOGLE_UNRESOLVED", "FAILED", "SEARCH_NO_GOOD_RESULT", "BAD_URL"]):
+        return False
+    # Do not reject blank legacy status when URL is clearly original/non-Google.
+    if status and status not in V27_ALLOWED_URL_STATUSES and status_upper not in {s.upper() for s in V27_ALLOWED_URL_STATUSES}:
+        # Keep if it is a non-Google URL and the status is informational, but discount unknown bad statuses.
+        if any(x in status_upper for x in ["ERROR", "TIMEOUT", "EMPTY"]):
+            return False
+    return True
+
+
+def _v27_is_official_reg_source(row: pd.Series) -> bool:
+    content_type = clean(row.get("Content Type"))
+    if content_type != "Regulation":
+        return True
+    if not GTI_MAIL_OFFICIAL_REG_ONLY_V27:
+        return True
+    text = " ".join(clean(row.get(c)) for c in ["URL", "BestLinkURL", "OriginalURLCandidate", "Source", "Agency", "Source File"]).lower()
+    return any(d in text for d in V27_OFFICIAL_REG_DOMAINS)
+
+
+def _v27_reference_datetime() -> pd.Timestamp:
+    ref = os.getenv("GTI_MAIL_REFERENCE_DATETIME", "").strip()
+    if ref:
+        dt = pd.to_datetime(ref, errors="coerce")
+        if not pd.isna(dt):
+            return pd.Timestamp(dt).tz_localize(None) if getattr(dt, "tzinfo", None) else pd.Timestamp(dt)
+    # Default to actual execution time. This makes the mail truly 24-hour based.
+    return pd.Timestamp(datetime.now())
+
+
+def _v27_date_candidates(row: pd.Series) -> str:
+    return " ".join(clean(row.get(c)) for c in [
+        "Date", "Publish Date", "Published", "CollectedAt", "Headline", "Summary", "Major Changes", "URL"
+    ])
+
+
+def _v27_parse_publish_dt(row: pd.Series):
+    # Prefer _sort_date if it is a real timestamp and not Timestamp.min.
+    try:
+        dt = pd.to_datetime(row.get("_sort_date"), errors="coerce")
+        if not pd.isna(dt) and dt.year > 1970:
+            return pd.Timestamp(dt), False
+    except Exception:
+        pass
+
+    for col in ["Date", "Publish Date", "Published", "CollectedAt"]:
+        raw = clean(row.get(col))
+        if raw and raw not in {"확인 필요", "미확인", "nan", "None"}:
+            dt = pd.to_datetime(raw, errors="coerce")
+            if not pd.isna(dt) and dt.year > 1970:
+                # If raw is date-only, treat as date-only for calendar-day allowance.
+                date_only = bool(re.fullmatch(r"\d{4}[-./]\d{1,2}[-./]\d{1,2}", raw[:10])) and len(raw.strip()) <= 10
+                return pd.Timestamp(dt), date_only
+
+    # Last resort: find YYYY-MM-DD-like string in text.
+    text = _v27_date_candidates(row)
+    m = re.search(r"(20\d{2})[-./](\d{1,2})[-./](\d{1,2})", text)
+    if m:
+        dt = pd.to_datetime(f"{m.group(1)}-{m.group(2)}-{m.group(3)}", errors="coerce")
+        if not pd.isna(dt):
+            return pd.Timestamp(dt), True
+    return pd.NaT, False
+
+
+def _v27_freshness(row: pd.Series) -> tuple[bool, str, str]:
+    dt, date_only = _v27_parse_publish_dt(row)
+    if pd.isna(dt):
+        return (not GTI_MAIL_DROP_UNKNOWN_DATE_V27), "UNKNOWN_DATE", ""
+    ref = _v27_reference_datetime()
+    age_hours = (ref - dt).total_seconds() / 3600.0
+    # Future-dated within one day can happen because of timezone/date-only parsing; allow but mark.
+    if age_hours < -24:
+        return False, "FUTURE_DATE_OVER_24H", f"{age_hours:.1f}"
+    if date_only and GTI_MAIL_ALLOW_PREVIOUS_DATE_ONLY_V27:
+        min_date = (ref.normalize() - pd.Timedelta(days=1)).date()
+        if dt.date() >= min_date:
+            return True, "OK_DATE_WINDOW_24H", f"{age_hours:.1f}"
+    if age_hours <= GTI_MAIL_MAX_AGE_HOURS_V27:
+        return True, "OK_24H", f"{age_hours:.1f}"
+    return False, "STALE_OVER_24H", f"{age_hours:.1f}"
+
+
+def _v27_priority_excluded(row: pd.Series) -> bool:
+    p = clean(row.get("Priority Group")).upper()
+    tier = clean(row.get("Tier")).upper()
+    return any(t in p for t in V27_EXCLUDED_PRIORITY_TERMS) or any(t in tier for t in V27_EXCLUDED_PRIORITY_TERMS)
+
+
+def _v27_reject_reason_hard(row: pd.Series) -> bool:
+    rr = clean(row.get("RejectReason"))
+    if not rr:
+        return False
+    rr_set = {x.strip().lower() for x in rr.split(";") if x.strip()}
+    broad_prior_reasons = {
+        "v12_hard_reference_or_noise",
+        "v12_no_customs_trade_action_signal",
+        "weighted_v18_not_topn_or_noise",
+        "v20_major_title_or_weighted_below_topn_or_noise",
+        "weak_samsung_relevance",
+        "report_issue_duplicate_compressed",
+        "expanded_policy_watch",
+        "strict_existing_hard_reject",
+    }
+    if rr_set and rr_set <= broad_prior_reasons:
+        return False
+    low = rr.lower()
+    return any(t in low for t in V27_HARD_REJECT_TERMS)
+
+
+def _v27_add_audit_fields(rows: pd.DataFrame) -> pd.DataFrame:
+    rows = rows.copy()
+    for col in _V27_AUDIT_COLUMNS:
+        if col not in rows.columns:
+            rows[col] = ""
+    rows["FinalURLDomain"] = rows["URL"].apply(_v27_domain)
+    rows["OfficialSourceFlag"] = rows.apply(lambda r: "Y" if _v27_is_official_reg_source(r) else "N", axis=1)
+    statuses = []
+    ages = []
+    for _, r in rows.iterrows():
+        ok, status, age = _v27_freshness(r)
+        statuses.append(status)
+        ages.append(age)
+    rows["FreshnessStatus"] = statuses
+    rows["FreshnessAgeHours"] = ages
+    return rows
+
+
+def _v27_final_mail_filter(rows: pd.DataFrame, top3_mode: bool = False) -> pd.DataFrame:
+    if rows.empty:
+        return rows
+    before = len(rows)
+    rows = _v27_add_audit_fields(rows)
+    keep_flags = []
+    reasons_all = []
+    for _, row in rows.iterrows():
+        reasons = []
+        fresh_ok, fresh_status, _age = _v27_freshness(row)
+        if not fresh_ok:
+            reasons.append(f"v27_{fresh_status.lower()}")
+        if _v27_priority_excluded(row):
+            reasons.append("v27_priority_excluded")
+        if _v27_reject_reason_hard(row):
+            reasons.append("v27_reject_reason_hard")
+        if not _v27_url_quality_ok(row):
+            reasons.append("v27_original_url_not_verified")
+        if clean(row.get("Content Type")) == "Regulation" and not _v27_is_official_reg_source(row):
+            reasons.append("v27_non_official_regulation_source")
+        if top3_mode and not _v26_title_has_keyword(row):
+            reasons.append("v27_top3_no_title_keyword")
+        reasons_all.append("; ".join(reasons))
+        keep_flags.append(not reasons)
+
+    rows["MailGuardReason"] = reasons_all
+    dropped = rows.loc[[not x for x in keep_flags]].copy()
+    kept = rows.loc[keep_flags].copy().reset_index(drop=True)
+    label = "Top3" if top3_mode else "final mail"
+    if not dropped.empty:
+        print(f"[INFO] v27 {label} guard removed:")
+        for _, r in dropped.head(40).iterrows():
+            print(
+                f"  - {clean(r.get('Headline'))[:120]} / date={clean(r.get('Date'))} / "
+                f"domain={clean(r.get('FinalURLDomain'))} / reason={clean(r.get('MailGuardReason'))}"
+            )
+    print(f"[INFO] v27 {label} guard: before={before}, after={len(kept)}, removed={len(dropped)}, max_age_hours={GTI_MAIL_MAX_AGE_HOURS_V27:g}")
+    if "No" in kept.columns:
+        kept["No"] = range(1, len(kept) + 1)
+    return kept
+
+
+
+# ======================================================================
+# GTI STEP5 v28: date-only freshness fix
+# ----------------------------------------------------------------------
+# If STEP4 gives Date/Publish Date as YYYY-MM-DD, treat it as a date-only
+# signal before using internal _sort_date. Otherwise previous-day official
+# regulation rows are incorrectly dropped as STALE_OVER_24H at morning runs.
+# ======================================================================
+
+_v28_parse_publish_dt_base = _v27_parse_publish_dt
+
+def _v27_parse_publish_dt(row: pd.Series):
+    for col in ["Date", "Publish Date", "Published", "CollectedAt"]:
+        raw = clean(row.get(col))
+        if raw and raw not in {"?", "nan", "None", "Nat", "NaT"}:
+            head = raw.strip()[:10]
+            if re.fullmatch(r"\d{4}[-./]\d{1,2}[-./]\d{1,2}", head) and len(raw.strip()) <= 10:
+                dt = pd.to_datetime(head, errors="coerce")
+                if not pd.isna(dt) and dt.year > 1970:
+                    return pd.Timestamp(dt), True
+    return _v28_parse_publish_dt_base(row)
+
+# ======================================================================
+# End of GTI STEP5 v28
+# ======================================================================
+
+# Preserve audit columns from STEP4 inputs. The base normalizer intentionally kept the report schema small;
+# v27 extends it for source/freshness traceability.
+_v27_normalize_input_base = normalize_input
+
+def normalize_input(df: pd.DataFrame, content_type: str, source_file: Path) -> pd.DataFrame:
+    out = _v27_normalize_input_base(df, content_type, source_file)
+    df2 = df.copy()
+    df2.columns = [str(c).strip() for c in df2.columns]
+    audit_map = {
+        "GoogleURL": ["GoogleURL", "google_url"],
+        "OriginalURLCandidate": ["OriginalURLCandidate", "original_url", "original_url_candidate"],
+        "BestLinkURL": ["BestLinkURL", "best_link_url"],
+        "URLRestoreStatus": ["URLRestoreStatus", "url_restore_status", "URL_Quality", "url_quality"],
+        "URLDecodeStatus": ["URLDecodeStatus", "url_decode_status"],
+        "RejectReason": ["RejectReason", "reject_reason"],
+        "Tier": ["Tier", "tier"],
+        "Publish Date": ["Publish Date", "Published", "published", "publish_date"],
+    }
+    for out_col, candidates in audit_map.items():
+        src = pick_col(df2, candidates)
+        if src and len(df2[src]) >= len(out):
+            out[out_col] = df2[src].iloc[:len(out)].apply(clean).values
+        elif out_col not in out.columns:
+            out[out_col] = ""
+    return out
+
+
+_v27_prepare_rows_base = prepare_rows
+
+def prepare_rows(rows: pd.DataFrame) -> pd.DataFrame:
+    rows = _v27_prepare_rows_base(rows)
+    rows = _v27_final_mail_filter(rows, top3_mode=False)
+    if "_report_score" in rows.columns and "_sort_date" in rows.columns:
+        rows = rows.sort_values(["_report_score", "_sort_date"], ascending=[False, False]).reset_index(drop=True)
+    if "No" in rows.columns:
+        rows["No"] = range(1, len(rows) + 1)
+    return rows
+
+
+_v27_choose_top3_base = choose_top3
+
+def choose_top3(rows: pd.DataFrame) -> pd.DataFrame:
+    pool = _v27_final_mail_filter(rows, top3_mode=True)
+    if pool.empty:
+        return pool
+    out = _v27_choose_top3_base(pool)
+    out = _v27_final_mail_filter(out, top3_mode=True)
+    if not out.empty:
+        out["No"] = range(1, len(out) + 1)
+    return out
+
+# ======================================================================
+# End of GTI STEP5 STRICT FINAL GUARD v27
 # ======================================================================
 
 def main() -> None:

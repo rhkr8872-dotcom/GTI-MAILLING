@@ -1,7 +1,7 @@
-# -*- coding: utf-8 -*-
-# GTI FINAL CORE v5 - LAW1 official regulation, rest news
+﻿# -*- coding: utf-8 -*-
+# GTI FINAL CORE v6 - LAW1 official regulation, rest news
 r"""
-GTI STEP1 LAW1-ONLY + NEWS-REST CLEAN v4 - official regulation sensing
+GTI STEP1 LAW1-ONLY + NEWS-REST CLEAN v6 - official regulation sensing
 
 Input:
 - C:\temp\sites.xlsx
@@ -178,13 +178,15 @@ MEDIUM_VALUE_POLICY_TERMS = [
 ]
 
 
-def clean_text(value: str) -> str:
+def clean_text(value: str, max_len: int | None = None) -> str:
     if value is None:
         return ""
     value = unescape(str(value))
     value = value.replace("\xa0", " ").replace("\u200b", "")
-    value = re.sub(r"\s+", " ", value)
-    return value.strip()
+    value = re.sub(r"\s+", " ", value).strip()
+    if max_len is not None and max_len > 0 and len(value) > max_len:
+        return value[:max_len].rstrip()
+    return value
 
 
 def now_str() -> str:
@@ -2381,7 +2383,10 @@ def update_cumulative_file(final_df):
     if final_df.empty:
         return 0
 
-    new_df = final_df.copy()
+    new_df = _law1_require_headline_url(final_df, "cumulative_update")
+    if new_df.empty:
+        print("[LAW1 QUALITY] cumulative_update skipped: no rows with mandatory title/url")
+        return 0
     new_df["cumulative_updated_at"] = now_str()
 
     if CUMULATIVE_FILE.exists():
@@ -2393,6 +2398,7 @@ def update_cumulative_file(final_df):
     else:
         combined = new_df
 
+    combined = _law1_require_headline_url(combined, "cumulative_file")
     combined["_norm_url"] = combined["url"].map(normalize_url_for_compare)
     before = len(combined)
     combined = combined.drop_duplicates(subset=["_norm_url"], keep="first")
@@ -3598,16 +3604,142 @@ def crawl_gwanbo_selenium(source_url, agency, site_type):
 def crawl_gwanbo(source_url, agency, site_type):
     return crawl_gwanbo_selenium(source_url, agency, site_type)
 
-# LAW1/NEWSREST final split rule (v4):
+# LAW1/NEWSREST final split rule (v7):
 # - 1-1.regulation_raw.xlsx must contain ONLY real official regulation / legal notice rows.
 # - Everything else from STEP1 is written to 1-2.site_news_raw.xlsx as news/reference candidate.
 # - STEP2-3 also collects official agency news, so 1-2 is a compatibility + fallback news file.
+LAW1_NEWS_OR_PRESS_HINTS = [
+    "korea.kr", "policy briefing", "pressreleaseview", "briefingroom",
+    "press release", "press-releases", "newsroom", "/news/", "latest-news",
+    "\uc815\ucc45\ube0c\ub9ac\ud551", "\ubcf4\ub3c4\uc790\ub8cc", "\ube0c\ub9ac\ud551",
+    "\ub274\uc2a4", "\uae30\uc0ac", "\ub3d9\ud5a5", "\uc124\uba85\ud68c", "\uc138\ubbf8\ub098",
+]
+
+LAW1_INTERNAL_OR_LOW_ACTION_HINTS = [
+    "\uc0c1 \uc6b4\uc601", "\uc0c1\uc6b4\uc601", "\ud575\uc2ec\uac00\uce58\uc0c1", "\ud45c\ucc3d",
+    "\uc778\uc0ac", "\uc870\uc9c1", "\ud589\uc0ac", "\ucc44\uc6a9",
+]
+
+LAW1_GWANBO_FALSE_TRADE_HINTS = [
+    "출입국", "수출입은행", "국적상실", "국적이탈", "외국인사무소", "비자", "체류",
+]
+
+LAW1_CUSTOMS_TRADE_STRONG_TERMS = [
+    "관세", "통관", "세관", "세관장확인", "통합공고", "수출입물품", "수출입물품등",
+    "품목분류", "hs", "hs코드", "관세율", "관세환급", "환급사무", "보세", "보세공장",
+    "보세운송", "자유무역", "fta", "원산지", "덤핑방지관세", "반덤핑", "상계관세",
+    "무역위원회", "대외무역", "전략물자", "수출통제", "수입규제", "할당관세",
+    "customs", "tariff", "duty", "duties", "classification", "rules of origin",
+    "anti-dumping", "antidumping", "countervailing", "safeguard", "export control",
+]
+
+LAW1_CUSTOMS_TRADE_CONTEXT_TERMS = [
+    "수입", "수출", "무역", "교역", "수출입",
+]
+
+
+def _law1_has_required_headline_url(row) -> bool:
+    title = clean_text(row.get("title", ""))
+    url = clean_text(row.get("url", ""))
+    return bool(title and url.startswith("http") and normalize_url_for_compare(url))
+
+
+def _law1_require_headline_url(df, context: str):
+    if df is None or df.empty:
+        return df.copy() if df is not None else pd.DataFrame()
+    work = df.copy()
+    if "title" in work.columns:
+        if "headline" not in work.columns:
+            work["headline"] = work["title"]
+        else:
+            blank_headline = work["headline"].isna() | work["headline"].astype(str).str.strip().eq("")
+            work.loc[blank_headline, "headline"] = work.loc[blank_headline, "title"]
+    mask = work.apply(_law1_has_required_headline_url, axis=1)
+    removed = int((~mask).sum())
+    if removed:
+        print(f"[LAW1 QUALITY] {context}: removed {removed} rows without mandatory title/url")
+    return work[mask].copy()
+
+
+def _law1_text(row, cols=None) -> str:
+    cols = cols or [
+        "title", "url", "source", "agency", "site_type", "official_regulation_reason",
+        "matched_policy_terms", "regulation_fallback_body",
+    ]
+    return " ".join(clean_text(row.get(c, "")) for c in cols).lower()
+
+
+def _law1_is_news_or_press_material(row) -> bool:
+    text = _law1_text(row)
+    if any(h.lower() in text for h in LAW1_NEWS_OR_PRESS_HINTS):
+        return True
+    # Policy briefing and general official press pages are not law sources even when
+    # their site row is accidentally marked as regulation in sites.xlsx.
+    agency = clean_text(row.get("agency", "")).lower()
+    source = clean_text(row.get("source", "")).lower()
+    return ("policy" in agency and "brief" in agency) or ("korea.kr" in source)
+
+
+def _law1_is_cumulative_duplicate(row) -> bool:
+    return clean_text(row.get("is_cumulative_duplicate", "")).upper() == "Y"
+
+
+def _law1_is_review_only_candidate(row) -> bool:
+    protected = clean_text(row.get("protected_regulation_candidate", "")).upper() == "Y"
+    no_date = clean_text(row.get("date_status", "")).lower() == "no_date"
+    return protected or no_date
+
+
+def _law1_is_low_action_internal_notice(row) -> bool:
+    text = _law1_text(row)
+    return any(h.lower() in text for h in LAW1_INTERNAL_OR_LOW_ACTION_HINTS)
+
+
+def _law1_compact_text(row) -> str:
+    text = " ".join([
+        clean_text(row.get("title", "")),
+        clean_text(row.get("headline", "")),
+        clean_text(row.get("matched_policy_terms", "")),
+        clean_text(row.get("official_regulation_reason", "")),
+        clean_text(row.get("regulation_fallback_body", "")),
+    ]).lower()
+    return re.sub(r"\s+", "", text)
+
+
+def _law1_is_gwanbo_row(row) -> bool:
+    text = _law1_text(row)
+    agency = clean_text(row.get("agency", ""))
+    return "gwanbo.go.kr" in text or "관보" in text or "관보" in agency
+
+
+def _law1_has_false_trade_signal(row) -> bool:
+    compact = _law1_compact_text(row)
+    return any(term.lower().replace(" ", "") in compact for term in LAW1_GWANBO_FALSE_TRADE_HINTS)
+
+
+def _law1_has_customs_trade_signal(row) -> bool:
+    text = _law1_text(row)
+    compact = _law1_compact_text(row)
+    if _law1_has_false_trade_signal(row):
+        return False
+    for term in LAW1_CUSTOMS_TRADE_STRONG_TERMS:
+        needle = term.lower().replace(" ", "")
+        if needle and (needle in compact or term.lower() in text):
+            return True
+    legal_form = any(term in compact for term in ["고시", "공고", "법률", "시행령", "시행규칙", "입법예고", "행정예고", "규칙"])
+    return bool(legal_form and any(term in compact for term in LAW1_CUSTOMS_TRADE_CONTEXT_TERMS))
+
+
 def _law1_is_real_official_regulation(row) -> bool:
     try:
         score = float(row.get("official_regulation_score", 0) or 0)
     except Exception:
         score = 0.0
     text = _reg_text(row).lower() if "_reg_text" in globals() else " ".join([clean_text(row.get(c, "")) for c in ["title", "url", "source", "agency", "site_type"]]).lower()
+    if _law1_is_news_or_press_material(row):
+        return False
+    if _law1_is_low_action_internal_notice(row):
+        return False
     if normalize_site_type(row.get("site_type", "")) != "regulation":
         return False
     if score < 45:
@@ -3621,11 +3753,14 @@ def _law1_is_real_official_regulation(row) -> bool:
     ]
     trade_terms = TRADE_REG_TERMS if "TRADE_REG_TERMS" in globals() else ["customs", "tariff", "import", "export", "관세", "통관", "수입", "수출", "원산지", "fta"]
     has_legal_form = any(t.lower() in text for t in legal_form_terms)
-    has_trade_signal = any(t.lower() in text for t in trade_terms)
+    has_trade_signal = any(t.lower() in text for t in trade_terms) or _law1_has_customs_trade_signal(row)
+    if _law1_is_gwanbo_row(row):
+        return bool(has_legal_form and _law1_has_customs_trade_signal(row))
     return bool(has_legal_form and has_trade_signal)
 
 def save_split_files(df):
     enhanced = enhance_regulation_rows(df).copy()
+    enhanced = _law1_require_headline_url(enhanced, "save_split_files")
     if enhanced.empty:
         enhanced.to_excel(OUT_ALL_FILE, index=False)
         enhanced.to_excel(OUT_REG_FILE, index=False)
@@ -3639,11 +3774,23 @@ def save_split_files(df):
     # Keep an all-candidate audit file, but split official-law-only vs news/reference candidates.
     enhanced.to_excel(OUT_ALL_FILE, index=False)
 
-    reg = enhanced[law1_mask].copy()
-    news = enhanced[~law1_mask].copy()
+    review_mask = enhanced.apply(_law1_is_review_only_candidate, axis=1)
+    duplicate_mask = enhanced.apply(_law1_is_cumulative_duplicate, axis=1)
+    reg_final_mask = law1_mask & ~review_mask & ~duplicate_mask
+
+    reg = enhanced[reg_final_mask].copy()
+    news = enhanced[~reg_final_mask].copy()
     if not news.empty:
         news["site_type"] = "news"
-        news["law1_news_reason"] = "not_real_official_regulation_or_low_trade_signal"
+        news["law1_news_reason"] = news.apply(
+            lambda r: (
+                "official_news_or_press_material" if _law1_is_news_or_press_material(r)
+                else "review_only_no_date_or_protected_candidate" if _law1_is_review_only_candidate(r)
+                else "cumulative_duplicate_excluded_from_regulation" if _law1_is_cumulative_duplicate(r)
+                else "not_real_official_regulation_or_low_trade_signal"
+            ),
+            axis=1,
+        )
 
     if not reg.empty and "official_regulation_score" in reg.columns:
         sort_cols = [c for c in ["protected_regulation_candidate", "official_regulation_score", "date"] if c in reg.columns]
@@ -3654,20 +3801,275 @@ def save_split_files(df):
     news.to_excel(OUT_NEWS_FILE, index=False)
 
     reg_new = reg.copy()
-    if "is_cumulative_duplicate" in reg_new.columns:
-        reg_new = reg_new[reg_new["is_cumulative_duplicate"].fillna("").astype(str).str.upper().ne("Y")].copy()
     try:
         reg_new.to_excel(OUT_REG_NEW_FILE, index=False)
     except Exception as e:
         print(f"⚠ 신규 법규 파일 저장 실패: {OUT_REG_NEW_FILE} / {e}")
 
-    if "protected_regulation_candidate" in reg.columns:
-        review = reg[reg["protected_regulation_candidate"].fillna("").astype(str).eq("Y")].copy()
+    if "protected_regulation_candidate" in enhanced.columns:
+        review = enhanced[review_mask & law1_mask].copy()
         if not review.empty:
             try:
                 review.to_excel(OUT_REG_REVIEW_FILE, index=False)
             except Exception as e:
                 print(f"[REG REVIEW SAVE WARN] skipped: {OUT_REG_REVIEW_FILE} / {e}")
 
+    print(
+        f"[LAW1 FINAL] regulation={len(reg)}, news_or_reference={len(news)}, "
+        f"review_only={int((review_mask & law1_mask).sum())}, "
+        f"cumulative_duplicate_removed={int((duplicate_mask & law1_mask).sum())}"
+    )
+
+
+# =========================================================
+# GTI Domestic Official Law Watch Patch v29 - 2026-07-03
+# Purpose:
+# - 관보(gwanbo.go.kr) / 국가법령정보센터(law.go.kr) 법규는 일반 뉴스 후보와 별도로 보존한다.
+# - 할당관세, 관세법 제71조, FTA/원산지, 협정세율, HS/품목분류, 통관/보세, 수출통제 등
+#   삼성전자 관세업무 핵심 법규는 제목/기관명의 한글 띄어쓰기 깨짐에도 감지한다.
+# - 1-1.regulation_raw.xlsx는 최근 법규 후보 전체를 유지하고,
+#   1-1.regulation_new_raw.xlsx에서만 누적 중복을 제외한다.
+# Korean literals are generated from unicode escapes to survive CP949/UTF-8 copy paths.
+# =========================================================
+
+_GTI_PRE_V29_ENHANCE_REGULATION_ROWS = enhance_regulation_rows
+_GTI_PRE_V29_LAW1_IS_REAL_OFFICIAL_REGULATION = _law1_is_real_official_regulation
+
+
+def _v29_u(s: str) -> str:
+    return s.encode("ascii").decode("unicode_escape")
+
+
+def _v29_clean_compact(value: str) -> str:
+    text = clean_text(value).lower()
+    text = re.sub(r"\s+", "", text)
+    return text
+
+
+def _v29_row_text(row) -> str:
+    cols = [
+        "title", "headline", "url", "source", "agency", "site_type",
+        "matched_policy_terms", "official_regulation_reason", "regulation_fallback_body",
+        "summary", "Summary", "description", "Description",
+    ]
+    return " ".join(clean_text(row.get(c, "")) for c in cols)
+
+
+V29_DOMESTIC_OFFICIAL_DOMAINS = [
+    "law.go.kr", "gwanbo.go.kr", "customs.go.kr", "unipass.customs.go.kr",
+    "moleg.go.kr", "moef.go.kr", "motie.go.kr", "korea.kr",
+]
+
+V29_DOMESTIC_LEGAL_FORMS = [
+    _v29_u("\\uace0\\uc2dc"),              # 고시
+    _v29_u("\\uacf5\\uace0"),              # 공고
+    _v29_u("\\ubc95\\ub960"),              # 법률
+    _v29_u("\\ubc95\\ub839"),              # 법령
+    _v29_u("\\uc2dc\\ud589\\ub839"),       # 시행령
+    _v29_u("\\uc2dc\\ud589\\uaddc\\uce59"), # 시행규칙
+    _v29_u("\\ub300\\ud1b5\\ub839\\ub839"), # 대통령령
+    _v29_u("\\uae30\\ud68d\\uc7ac\\uc815\\ubd80\\ub839"), # 기획재정부령
+    _v29_u("\\uad00\\uc138\\uccad\\uace0\\uc2dc"), # 관세청고시
+    _v29_u("\\uc785\\ubc95\\uc608\\uace0"), # 입법예고
+    _v29_u("\\ud589\\uc815\\uc608\\uace0"), # 행정예고
+    _v29_u("\\ud6c8\\ub839"),              # 훈령
+    _v29_u("\\uc608\\uaddc"),              # 예규
+]
+
+V29_SAMSUNG_CUSTOMS_CRITICAL_TERMS = [
+    _v29_u("\\ud560\\ub2f9\\uad00\\uc138"), # 할당관세
+    _v29_u("\\uad00\\uc138\\ubc95\\uc81c71\\uc870"), # 관세법제71조
+    _v29_u("\\uad00\\uc138\\ubc9571\\uc870"), # 관세법71조
+    _v29_u("\\uc790\\uc720\\ubb34\\uc5ed\\ud611\\uc815"), # 자유무역협정
+    _v29_u("\\ud611\\uc815\\uc138\\uc728"), # 협정세율
+    _v29_u("\\uc6d0\\uc0b0\\uc9c0"),       # 원산지
+    _v29_u("\\uc6d0\\uc0b0\\uc9c0\\uc99d\\uba85"), # 원산지증명
+    _v29_u("\\ud488\\ubaa9\\ubd84\\ub958"), # 품목분류
+    _v29_u("\\uc138\\ubc88"),              # 세번
+    _v29_u("\\uad00\\uc138\\uc728"),       # 관세율
+    _v29_u("\\uad00\\uc138"),              # 관세
+    _v29_u("\\ud1b5\\uad00"),              # 통관
+    _v29_u("\\uc218\\uc785\\ud1b5\\uad00"), # 수입통관
+    _v29_u("\\uc218\\ucd9c\\ud1b5\\uad00"), # 수출통관
+    _v29_u("\\uc218\\ucd9c\\uc785\\ud654\\ubb3c"), # 수출입화물
+    _v29_u("\\uac80\\uc0ac\\ube44\\uc6a9"), # 검사비용
+    _v29_u("\\ubcf4\\uc138"),              # 보세
+    _v29_u("\\ubc18\\ub364\\ud551"),       # 반덤핑
+    _v29_u("\\uc0c1\\uacc4\\uad00\\uc138"), # 상계관세
+    _v29_u("\\uc138\\uc774\\ud504\\uac00\\ub4dc"), # 세이프가드
+    _v29_u("\\uc218\\ucd9c\\ud1b5\\uc81c"), # 수출통제
+    _v29_u("\\uc804\\ub7b5\\ubb3c\\uc790"), # 전략물자
+    _v29_u("\\uc218\\uc785\\uaddc\\uc81c"), # 수입규제
+    "fta", "hs", "hscode", "hs code", "classification", "rulesoforigin",
+    "tariffquota", "tariff", "customs", "duty", "anti-dumping", "antidumping",
+    "countervailing", "safeguard", "exportcontrol", "entitylist", "uflpa",
+]
+
+V29_DOMESTIC_LOW_VALUE_NOISE = [
+    _v29_u("\\uc9c1\\uc81c"),              # 직제
+    _v29_u("\\uc778\\uc0ac"),              # 인사
+    _v29_u("\\ucc44\\uc6a9"),              # 채용
+    _v29_u("\\uc0c1\\ud6c8"),              # 상훈
+    _v29_u("\\uacf5\\ubaa8\\uc804"),       # 공모전
+    _v29_u("\\ubd80\\uc815\\uccad\\ud0c1"), # 부정청탁
+    _v29_u("\\uac1c\\uc778\\uc815\\ubcf4"), # 개인정보
+    _v29_u("\\uc2b9\\uac1d\\uc608\\uc57d\\uc790\\ub8cc"), # 승객예약자료
+]
+
+
+def _v29_domestic_law_signal(row) -> tuple[bool, str, int]:
+    raw_text = _v29_row_text(row)
+    compact = _v29_clean_compact(raw_text)
+    text_low = raw_text.lower()
+
+    domain_hits = [d for d in V29_DOMESTIC_OFFICIAL_DOMAINS if d in text_low]
+    legal_hits = [t for t in V29_DOMESTIC_LEGAL_FORMS if _v29_clean_compact(t) in compact]
+    critical_hits = []
+    for term in V29_SAMSUNG_CUSTOMS_CRITICAL_TERMS:
+        needle = _v29_clean_compact(term)
+        if needle and needle in compact:
+            critical_hits.append(term)
+
+    noise_hits = [t for t in V29_DOMESTIC_LOW_VALUE_NOISE if _v29_clean_compact(t) in compact]
+
+    score = 0
+    if domain_hits:
+        score += 40
+    if legal_hits:
+        score += min(25, len(legal_hits) * 8)
+    if critical_hits:
+        score += min(45, len(critical_hits) * 10)
+    if "gwanbo.go.kr" in text_low:
+        score += 10
+    if "law.go.kr" in text_low:
+        score += 10
+    if noise_hits and not critical_hits:
+        score -= 35
+
+    # 관보/법령정보센터는 공식 출처 + 법규 형식 + 관세 핵심어 중 하나면 보존한다.
+    keep = bool(domain_hits and legal_hits and critical_hits and score >= 70)
+
+    reason_parts = [
+        "v29_domestic_official_law_watch",
+        f"score={max(0, min(score, 100))}",
+        "domains=" + ",".join(domain_hits[:5]) if domain_hits else "",
+        "legal_forms=" + ",".join(legal_hits[:5]) if legal_hits else "",
+        "critical_terms=" + ",".join(map(str, critical_hits[:8])) if critical_hits else "",
+        "noise=" + ",".join(noise_hits[:5]) if noise_hits else "",
+    ]
+    return keep, "; ".join([p for p in reason_parts if p]), max(0, min(score, 100))
+
+
+def _law1_has_customs_trade_signal(row) -> bool:
+    keep, _, _ = _v29_domestic_law_signal(row)
+    if keep:
+        return True
+    compact = _v29_clean_compact(_v29_row_text(row))
+    for term in V29_SAMSUNG_CUSTOMS_CRITICAL_TERMS:
+        needle = _v29_clean_compact(term)
+        if needle and needle in compact:
+            return True
+    return False
+
+
+def enhance_regulation_rows(df):
+    out = _GTI_PRE_V29_ENHANCE_REGULATION_ROWS(df)
+    if out is None or out.empty:
+        return out
+    out = out.copy()
+    for idx, row in out.iterrows():
+        keep, reason, score = _v29_domestic_law_signal(row)
+        if not keep:
+            continue
+        prev_score = 0
+        try:
+            prev_score = int(float(row.get("official_regulation_score", 0) or 0))
+        except Exception:
+            prev_score = 0
+        out.at[idx, "site_type"] = "regulation"
+        out.at[idx, "official_regulation_flag"] = "Y"
+        out.at[idx, "official_regulation_type"] = "domestic_critical_trade_regulation"
+        out.at[idx, "official_regulation_score"] = max(prev_score, score)
+        prev_reason = clean_text(row.get("official_regulation_reason", ""))
+        out.at[idx, "official_regulation_reason"] = (prev_reason + "; " if prev_reason else "") + reason
+        out.at[idx, "protected_regulation_candidate"] = "N"
+        out.at[idx, "step1_relevance_status"] = "HIGH_DOMESTIC_OFFICIAL_LAW"
+        fallback = clean_text(row.get("regulation_fallback_body", ""))
+        if not fallback:
+            out.at[idx, "regulation_fallback_body"] = " | ".join([
+                f"Title: {clean_text(row.get('title', ''))}",
+                f"Agency: {clean_text(row.get('agency', ''))}",
+                f"Date: {clean_text(row.get('date', ''))}",
+                f"URL: {clean_text(row.get('url', ''))}",
+                f"Signals: {reason}",
+            ])
+    return out
+
+
+def _law1_is_real_official_regulation(row) -> bool:
+    keep, _, _ = _v29_domestic_law_signal(row)
+    if keep:
+        return True
+    return _GTI_PRE_V29_LAW1_IS_REAL_OFFICIAL_REGULATION(row)
+
+
+def save_split_files(df):
+    enhanced = enhance_regulation_rows(df).copy()
+    enhanced = _law1_require_headline_url(enhanced, "save_split_files_v29")
+    if enhanced.empty:
+        enhanced.to_excel(OUT_ALL_FILE, index=False)
+        enhanced.to_excel(OUT_REG_FILE, index=False)
+        enhanced.to_excel(OUT_REG_NEW_FILE, index=False)
+        enhanced.to_excel(OUT_NEWS_FILE, index=False)
+        return
+
+    law1_mask = enhanced.apply(_law1_is_real_official_regulation, axis=1)
+    enhanced["law1_regulation_flag"] = law1_mask.map(lambda x: "Y" if x else "N")
+    enhanced.to_excel(OUT_ALL_FILE, index=False)
+
+    review_mask = enhanced.apply(_law1_is_review_only_candidate, axis=1)
+    duplicate_mask = enhanced.apply(_law1_is_cumulative_duplicate, axis=1)
+
+    # v29: regulation_raw keeps recent official law candidates even if already in cumulative.
+    # new_raw is the place where cumulative duplicates are removed.
+    reg_mask = law1_mask & ~review_mask
+    reg = enhanced[reg_mask].copy()
+    reg_new = enhanced[reg_mask & ~duplicate_mask].copy()
+    news = enhanced[~reg_mask].copy()
+
+    if not news.empty:
+        news["site_type"] = "news"
+        news["law1_news_reason"] = news.apply(
+            lambda r: (
+                "official_news_or_press_material" if _law1_is_news_or_press_material(r)
+                else "review_only_no_date_or_protected_candidate" if _law1_is_review_only_candidate(r)
+                else "not_real_official_regulation_or_low_trade_signal"
+            ),
+            axis=1,
+        )
+
+    sort_cols = [c for c in ["official_regulation_score", "date"] if c in reg.columns]
+    if sort_cols and not reg.empty:
+        reg = reg.sort_values(sort_cols, ascending=[False] * len(sort_cols), kind="stable")
+    sort_cols_new = [c for c in ["official_regulation_score", "date"] if c in reg_new.columns]
+    if sort_cols_new and not reg_new.empty:
+        reg_new = reg_new.sort_values(sort_cols_new, ascending=[False] * len(sort_cols_new), kind="stable")
+
+    reg.to_excel(OUT_REG_FILE, index=False)
+    news.to_excel(OUT_NEWS_FILE, index=False)
+    reg_new.to_excel(OUT_REG_NEW_FILE, index=False)
+
+    review = enhanced[review_mask & law1_mask].copy()
+    if not review.empty:
+        try:
+            review.to_excel(OUT_REG_REVIEW_FILE, index=False)
+        except Exception as e:
+            print(f"[REG REVIEW SAVE WARN] skipped: {OUT_REG_REVIEW_FILE} / {e}")
+
+    print(
+        f"[LAW1 FINAL v29] regulation={len(reg)}, new_regulation={len(reg_new)}, "
+        f"news_or_reference={len(news)}, review_only={int((review_mask & law1_mask).sum())}, "
+        f"cumulative_duplicate_marked={int((duplicate_mask & law1_mask).sum())}"
+    )
 if __name__ == "__main__":
     main()

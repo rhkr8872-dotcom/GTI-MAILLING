@@ -2442,6 +2442,396 @@ def _v15_split_reg_daily(daily):
     return kept, removed
 
 
+
+# ======================================================================
+# GTI STEP4-1 Samsung Customs Regulation Priority Patch v16b
+# ASCII source, Korean terms decoded at runtime to avoid Windows codepage loss.
+# ======================================================================
+
+def _v16u(s: str) -> str:
+    return s.encode("ascii").decode("unicode_escape")
+
+V16_CRITICAL_RULES = [
+    (_v16u(r"\uad00\uc138\uc815\ucc45"), "Direct", 120, [_v16u(r"\uad00\uc138\ubc95 \uc81c71\uc870"), _v16u(r"\ud560\ub2f9\uad00\uc138"), _v16u(r"\uad00\uc138\uc728"), _v16u(r"\uad00\uc138\ucffc\ud130"), "tariff quota", "tariff rate", "customs duty", "import duty"]),
+    (_v16u(r"FTA/\uc6d0\uc0b0\uc9c0"), "Direct", 115, [_v16u(r"\uc790\uc720\ubb34\uc5ed\ud611\uc815"), "FTA", "fta", "CEPA", "cepa", _v16u(r"\ud611\uc815\uc138\uc728"), _v16u(r"\uc6d0\uc0b0\uc9c0"), _v16u(r"\uc6d0\uc0b0\uc9c0\uc99d\uba85"), "rules of origin", "certificate of origin"]),
+    (_v16u(r"HS/\ud488\ubaa9\ubd84\ub958"), "Direct", 110, [_v16u(r"\ud488\ubaa9\ubd84\ub958"), "HS", "hs code", "classification"]),
+    (_v16u(r"\uc218\ucd9c\ud1b5\uc81c"), "Direct", 115, [_v16u(r"\uc218\ucd9c\ud1b5\uc81c"), _v16u(r"\uc804\ub7b5\ubb3c\uc790"), _v16u(r"\uc774\uc911\uc6a9\ub3c4"), "entity list", "export control", "dual-use", "UFLPA", "forced labor"]),
+    (_v16u(r"\ubc18\ub364\ud551/\uc0c1\uacc4\uad00\uc138"), "Direct", 115, [_v16u(r"\ubc18\ub364\ud551"), _v16u(r"\ub364\ud551\ubc29\uc9c0"), _v16u(r"\uc0c1\uacc4\uad00\uc138"), _v16u(r"\uc138\uc774\ud504\uac00\ub4dc"), "anti-dumping", "antidumping", "countervailing", "safeguard", "AD/CVD"]),
+    (_v16u(r"\ud1b5\uad00/\uc138\uad00"), "Indirect", 95, [_v16u(r"\uc218\ucd9c\uc785\ud654\ubb3c \uac80\uc0ac\ube44\uc6a9"), _v16u(r"\uac80\uc0ac\ube44\uc6a9 \uc9c0\uc6d0"), _v16u(r"\uc218\uc785\uc2e0\uace0"), _v16u(r"\uc218\ucd9c\uc2e0\uace0"), _v16u(r"\ud1b5\uad00"), _v16u(r"\uc138\uad00\uc7a5\ud655\uc778"), _v16u(r"\ud1b5\ud569\uacf5\uace0"), _v16u(r"\ubcf4\uc138"), "customs clearance", "customs declaration"]),
+    ("CBAM", "Indirect", 100, ["CBAM", "carbon border", _v16u(r"\ud0c4\uc18c\uad6d\uacbd")]),
+]
+
+V16_ADMIN_NOISE_TERMS = [
+    _v16u(r"\uad00\uc138\uccad\uacfc \uadf8 \uc18c\uc18d\uae30\uad00 \uc9c1\uc81c"), _v16u(r"\uc9c1\uc81c \uc2dc\ud589\uaddc\uce59"),
+    _v16u(r"\ubd80\uc815\uccad\ud0c1"), _v16u(r"\uae08\ud488\ub4f1 \uc218\uc218"), _v16u(r"\uc9c8\uc11c\uc704\ubc18\ud589\uc704\uaddc\uc81c\ubc95"),
+    _v16u(r"\uc2b9\uac1d\uc608\uc57d\uc790\ub8cc"), _v16u(r"\uc9c0\ubc29\ud589\uc815\uccb4\uc81c"), _v16u(r"\uc120\ubc15\uad50\ud1b5\uad00\uc81c"),
+    _v16u(r"\ubcf4\uc138\ud310\ub9e4\uc7a5"), _v16u(r"\ub300\ud1b5\ub839\ub839 \uc81c"), _v16u(r"\uac1c\ubcc4\uc18c\ube44\uc138\ubc95 \uc2dc\ud589\ub839"),
+]
+
+V16_NON_TRADE_LAW_TERMS = [_v16u(r"\uc0dd\ud65c\ud654\ud559\uc81c\ud488"), _v16u(r"\ubc29\uc704\uc0ac\uc5c5\ubc95 \uc2dc\ud589\uaddc\uce59"), _v16u(r"\uc758\ub8cc\uae30\uae30\ubc95 \uc2dc\ud589\uaddc\uce59")]
+V16_OFFICIAL_SOURCE_HINTS = [_v16u(r"\uad00\uc138\uccad"), _v16u(r"\uc720\ub2c8\ud328\uc2a4"), _v16u(r"\uad6d\uac00\ubc95\ub839\uc815\ubcf4\uc13c\ud130"), "law.go.kr", "unipass.customs.go.kr", "customs.go.kr", "gwanbo.go.kr", "clhs.co.kr", "federalregister.gov", "cbp.gov", "ustr.gov", "usitc.gov", "dgft.gov.in", "cbic.gov.in", "mofcom.gov.cn", "customs.gov.cn", "gacc.gov.cn", "moit.gov.vn"]
+
+
+def _v16_text(value) -> str:
+    try:
+        if pd.isna(value):
+            return ""
+    except Exception:
+        pass
+    return str(value or "").strip()
+
+
+def _v16_blob(row) -> str:
+    cols = ["Headline", "Title", "title", "headline", "Summary", "AI Analysis", "Action Plan", "article_body", "regulation_fallback_body", "KeywordMatches", "Agency", "agency", "Source", "source", "URL", "url", "effective_date_hint", "hs_hint", "tariff_rate_hint"]
+    return " ".join(_v16_text(row.get(c, "")) for c in cols).lower()
+
+
+def _v16_title(row) -> str:
+    for c in ["Headline", "headline", "Title", "title"]:
+        v = _v16_text(row.get(c, ""))
+        if v:
+            return v
+    return ""
+
+
+def _v16_matches(blob: str, terms) -> list[str]:
+    return [t for t in terms if str(t).lower() in blob]
+
+
+def _v16_priority(row) -> dict:
+    blob = _v16_blob(row)
+    title_l = _v16_title(row).lower()
+    best = {"issue": "Reference", "impact": "Reference", "score": 0, "terms": []}
+    for issue, impact, base_score, terms in V16_CRITICAL_RULES:
+        found = _v16_matches(blob, terms)
+        if not found:
+            continue
+        title_bonus = 12 if _v16_matches(title_l, terms) else 0
+        official_bonus = 8 if any(x.lower() in blob for x in V16_OFFICIAL_SOURCE_HINTS) else 0
+        score = base_score + min(len(found), 4) * 4 + title_bonus + official_bonus
+        if score > best["score"]:
+            best = {"issue": issue, "impact": impact, "score": score, "terms": found}
+    return best
+
+
+def _v16_is_admin_noise(row) -> bool:
+    blob = _v16_blob(row)
+    title = _v16_title(row).lower()
+    priority = _v16_priority(row)
+    if priority["score"] >= 110:
+        return False
+    if any(t.lower() in title for t in V16_ADMIN_NOISE_TERMS):
+        return True
+    if any(t.lower() in title for t in V16_NON_TRADE_LAW_TERMS) and priority["score"] < 120:
+        return True
+    return False
+
+
+def _v16_summary(row, issue: str) -> str:
+    title_body = f"{_v16_title(row)} {_v16_text(row.get('Summary', ''))} {_v16_text(row.get('article_body', ''))}"
+    if _v16u(r"\ud560\ub2f9\uad00\uc138") in title_body or _v16u(r"\uad00\uc138\ubc95 \uc81c71\uc870") in title_body:
+        return _v16u(r"\uad00\uc138\ubc95 \uc81c71\uc870\uc5d0 \ub530\ub978 \ud560\ub2f9\uad00\uc138 \uc801\uc6a9/\ucd94\ucc9c \uc694\uac74 \uad00\ub828 \ubc95\uaddc\uc785\ub2c8\ub2e4. \ub300\uc0c1 \ud488\ubaa9, \uc801\uc6a9 \uc138\uc728, \ucd94\ucc9c\uc11c\u00b7\uc99d\ube59 \uc694\uac74, \uc2dc\ud589\uae30\uac04\uc744 \uc218\uc785 \ud488\ubaa9 \ub9c8\uc2a4\ud130\uc640 \ub300\uc870\ud574\uc57c \ud569\ub2c8\ub2e4.")
+    if any(x in title_body for x in [_v16u(r"\uc790\uc720\ubb34\uc5ed\ud611\uc815"), "FTA", _v16u(r"\ud611\uc815\uc138\uc728"), _v16u(r"\uc6d0\uc0b0\uc9c0")]):
+        return _v16u(r"FTA \ud611\uc815\uc138\uc728 \ub610\ub294 \uc6d0\uc0b0\uc9c0 \uc99d\uba85\u00b7\ud310\uc815 \uc808\ucc28\uc640 \uad00\ub828\ub41c \ubc95\uaddc/\uacf5\uc9c0\uc785\ub2c8\ub2e4. \ud611\uc815\ubcc4 \uc138\uc728, \uc6d0\uc0b0\uc9c0 \uc99d\ube59, BOM/HS \uae30\uc900 \ubc18\uc601 \uc5ec\ubd80\uac00 \ud575\uc2ec\uc785\ub2c8\ub2e4.")
+    if any(x in title_body for x in [_v16u(r"\uc218\ucd9c\uc785\ud654\ubb3c \uac80\uc0ac\ube44\uc6a9"), _v16u(r"\uac80\uc0ac\ube44\uc6a9 \uc9c0\uc6d0")]):
+        return _v16u(r"\uc218\ucd9c\uc785\ud654\ubb3c \uac80\uc0ac\ube44\uc6a9 \uc9c0\uc6d0 \uc0ac\ubb34\ucc98\ub9ac \uad00\ub828 \uace0\uc2dc\uc785\ub2c8\ub2e4. \uac80\uc0ac \ub300\uc0c1 \uc218\uc785\ud654\ubb3c, \ube44\uc6a9 \uc9c0\uc6d0 \uac00\ub2a5 \uc5ec\ubd80, \ud1b5\uad00 \ube44\uc6a9 \ud68c\uc218 \uc808\ucc28\ub97c \ud655\uc778\ud574\uc57c \ud569\ub2c8\ub2e4.")
+    return (_v16_text(row.get("Summary", "")) or f"{_v16_title(row)} official regulation requiring customs review.")[:700]
+
+
+def _v16_action(row, issue: str) -> str:
+    title_body = f"{_v16_title(row)} {_v16_text(row.get('Summary', ''))} {_v16_text(row.get('article_body', ''))}"
+    if _v16u(r"\ud560\ub2f9\uad00\uc138") in title_body or _v16u(r"\uad00\uc138\ubc95 \uc81c71\uc870") in title_body:
+        return _v16u(r"\uc989\uc2dc\uc870\uce58: \ud558\ubc18\uae30 \ud560\ub2f9\uad00\uc138 HS \ub9ac\uc2a4\ud2b8\uc640 \uc0bc\uc131\uc804\uc790/1\ucc28 \ud611\ub825\uc0ac \uc218\uc785 \uc6d0\ubd80\uc790\uc7ac \ub9c8\uc2a4\ud130\ub97c \uad50\ucc28 \ub9e4\ud551\ud558\uc2ed\uc2dc\uc624. 1\uc8fc \ub0b4: \ucd94\ucc9c\uc11c\u00b7\uc99d\ube59\u00b7\uc218\uc785\uc2e0\uace0 \uc808\ucc28\ub97c \uad00\uc138\uc0ac/\uad6c\ub9e4\uc640 \ud655\uc815\ud558\uc2ed\uc2dc\uc624. Owner: HQ Customs + \uad6c\ub9e4 + \ubb3c\ub958")
+    if any(x in title_body for x in [_v16u(r"\uc790\uc720\ubb34\uc5ed\ud611\uc815"), "FTA", _v16u(r"\ud611\uc815\uc138\uc728"), _v16u(r"\uc6d0\uc0b0\uc9c0")]):
+        return _v16u(r"\uc989\uc2dc\uc870\uce58: \ub300\uc0c1 \ud611\uc815\uacfc \ud488\ubaa9\ubcc4 HS/\ud611\uc815\uc138\uc728 \ubcc0\uacbd \uc5ec\ubd80\ub97c \ud655\uc778\ud558\uc2ed\uc2dc\uc624. 1\uc8fc \ub0b4: BOM \uae30\uc900 \uc6d0\uc0b0\uc9c0 \ud310\uc815, \uc6d0\uc0b0\uc9c0\uc99d\uba85\uc11c \ubc1c\uae09/\ubcf4\uad00 \uc694\uac74, \ud611\ub825\uc0ac \uc6d0\uc0b0\uc9c0\ud655\uc778\uc11c \uc601\ud5a5\uc744 \uc810\uac80\ud558\uc2ed\uc2dc\uc624. Owner: FTA/Origin + Customs IT")
+    if issue == _v16u(r"\uc218\ucd9c\ud1b5\uc81c"):
+        return _v16u(r"\uc989\uc2dc\uc870\uce58: \ub300\uc0c1 \ud488\ubaa9\uc758 \uc804\ub7b5\ubb3c\uc790/ECCN \ud574\ub2f9 \uc5ec\ubd80\uc640 \ucd5c\uc885 \uc0ac\uc6a9\uc790 \uc2a4\ud06c\ub9ac\ub2dd\uc744 \ud655\uc778\ud558\uc2ed\uc2dc\uc624. Owner: Export Control + \ubc95\ubb34 + \uc0ac\uc5c5\ubd80")
+    return _v16u(r"\uc989\uc2dc\uc870\uce58: \uc6d0\ubb38 \uae30\uc900 \uc2dc\ud589\uc77c, \uc801\uc6a9 \ud488\ubaa9, HS, \uc138\uc728, \uc2e0\uace0\uc808\ucc28 \ubcc0\uacbd \uc5ec\ubd80\ub97c \ud655\uc778\ud558\uc2ed\uc2dc\uc624. 1\uc8fc \ub0b4: \uad00\ub828 \ubc95\uc778/\ud488\ubaa9 \ub9c8\uc2a4\ud130\uc640 \uc601\ud5a5 \uc5ec\ubd80\ub97c \ub9e4\ud551\ud558\uc2ed\uc2dc\uc624. Owner: \uad00\uc138/\ud1b5\uc0c1 \ub9ac\uc2a4\ud06c \ubd84\uc11d\ud300")
+
+
+def _v16_country(row) -> str:
+    blob = _v16_blob(row)
+    if any(x in blob for x in [_v16u(r"\uad00\uc138\uccad"), _v16u(r"\uc720\ub2c8\ud328\uc2a4"), "law.go.kr", _v16u(r"\ub300\ud55c\ubbfc\uad6d"), _v16u(r"\ud55c\uad6d")]):
+        return _v16u(r"\ud55c\uad6d")
+    if any(x in blob for x in ["vietnam", "moit.gov.vn", "customs.gov.vn"]): return _v16u(r"\ubca0\ud2b8\ub0a8")
+    if any(x in blob for x in ["india", "dgft", "cbic"]): return _v16u(r"\uc778\ub3c4")
+    if any(x in blob for x in ["china", "mofcom", "gacc", "customs.gov.cn"]): return _v16u(r"\uc911\uad6d")
+    if any(x in blob for x in ["europa", "european", " eu "]): return "EU"
+    if any(x in blob for x in ["federalregister", "cbp.gov", "ustr.gov", "usitc.gov", "united states", " u.s."]): return _v16u(r"\ubbf8\uad6d")
+    return _v16u(r"\uad00\ub828\uad6d")
+
+
+def _v16_risk(issue: str, impact: str, score: int) -> str:
+    return _v16u(r"\uc0c1") if impact == "Direct" or score >= 120 else _v16u(r"\uc911")
+
+_v16_to_output_base = to_output
+
+def to_output(df, content_type="Regulation"):
+    if content_type != "Regulation":
+        return _v16_to_output_base(df, content_type)
+    rows = []
+    if df is None:
+        df = pd.DataFrame()
+    for _, r in df.reset_index(drop=True).iterrows():
+        priority = _v16_priority(r)
+        issue = priority["issue"] if priority["issue"] != "Reference" else _v12_reg_issue(r)
+        if issue == "Reference":
+            impact = "Reference"
+            score = int(float(r.get("score", 0) or 0))
+        else:
+            impact = priority["impact"] if priority["impact"] != "Reference" else "Watch"
+            score = max(int(float(r.get("score", 0) or 0)), int(priority["score"]))
+        title = _v16_title(r)
+        pub_date = _v12_publish_date(r)
+        rows.append({
+            "No": len(rows) + 1, "Content Type": content_type, "Mail Group": "Regulation", "Samsung Impact": impact,
+            "Affected Subsidiary": _v16u(r"\ud55c\uad6d/\uc8fc\uc694 \uc0dd\uc0b0\ubc95\uc778 \ubc0f \uad00\ub828 \uc218\uc785\u00b7\uc218\ucd9c \ubc95\uc778"),
+            "Impact Reason": "v16_samsung_customs_law_priority:" + ",".join(priority.get("terms", [])[:5]),
+            "Date": pub_date, "Publish Date": pub_date, "Headline": title, "Summary": _v16_summary(r, issue),
+            "AI Analysis": _v16u(r"\uc0bc\uc131\uc804\uc790 \uad00\uc138 \ub2f4\ub2f9 \uad00\uc810\uc5d0\uc11c \uc218\uc785\ud1b5\uad00, FTA\u00b7\uc6d0\uc0b0\uc9c0, HS/\ud488\ubaa9\ubd84\ub958, \uad00\uc138\ube44\uc6a9 \ub610\ub294 \uc218\ucd9c\ud1b5\uc81c \uc808\ucc28\uc5d0 \uc601\ud5a5\uc744 \uc904 \uc218 \uc788\ub294 \uacf5\uc2dd \ubc95\uaddc\uc785\ub2c8\ub2e4. \uc6d0\ubb38 \uae30\uc900 \uc801\uc6a9 \ud488\ubaa9\u00b7HS\u00b7\uc138\uc728\u00b7\uc2dc\ud589\uc77c\u00b7\uc99d\ube59\uc694\uac74\uc744 \ud488\ubaa9 \ub9c8\uc2a4\ud130\uc640 \ub300\uc870\ud574\uc57c \ud569\ub2c8\ub2e4."),
+            "Action Plan": _v16_action(r, issue), "Country": _v16_country(r), "Agency": _v16_text(r.get("Agency", r.get("agency", ""))),
+            "Risk": _v16_risk(issue, impact, score), "Importance Score": score,
+            "Priority Group": "CORE" if score >= 110 else ("USABLE" if impact != "Reference" else "REFERENCE"),
+            "Issue": issue, "Cluster": title, "URL": _v13_fix_unipass_url(r), "Source": _v16_text(r.get("Source", r.get("source", ""))),
+            "Source File": "3-1.regulation_article_summary.xlsx", "RejectReason": _v16_text(r.get("RejectReason", "")),
+            "KeywordMatches": _v16_text(r.get("KeywordMatches", ",".join(priority.get("terms", [])))),
+            "effective_date_hint": _v16_text(r.get("effective_date_hint", _v16u(r"\ubcf8\ubb38\uc5d0\uc11c \ud655\uc778 \ud544\uc694"))) or _v16u(r"\ubcf8\ubb38\uc5d0\uc11c \ud655\uc778 \ud544\uc694"),
+            "hs_hint": _v16_text(r.get("hs_hint", _v16u(r"\ubcf8\ubb38\uc5d0\uc11c \ud655\uc778 \ud544\uc694"))) or _v16u(r"\ubcf8\ubb38\uc5d0\uc11c \ud655\uc778 \ud544\uc694"),
+            "tariff_rate_hint": _v16_text(r.get("tariff_rate_hint", _v16u(r"\ubcf8\ubb38\uc5d0\uc11c \ud655\uc778 \ud544\uc694"))) or _v16u(r"\ubcf8\ubb38\uc5d0\uc11c \ud655\uc778 \ud544\uc694"),
+            "article_extract_status": _v16_text(r.get("article_extract_status", "")), "ExecutiveMessage": _v16_summary(r, issue)[:500],
+        })
+    return pd.DataFrame(rows, columns=OUTPUT_COLS)
+
+_v16_reportable_base = _v15_is_reportable_regulation
+
+def _v15_is_reportable_regulation(row):
+    if _v16_is_admin_noise(row):
+        return False
+    priority = _v16_priority(row)
+    if priority["score"] >= 95:
+        return True
+    return _v16_reportable_base(row)
+
+_v16_split_base = _v15_split_reg_daily
+
+def _v15_split_reg_daily(daily):
+    kept, removed = _v16_split_base(daily)
+    if kept is None or kept.empty:
+        return kept, removed
+    kept = kept.copy()
+    kept["_v16_score"] = kept.apply(lambda r: _v16_priority(r).get("score", 0), axis=1)
+    kept["_v16_issue_rank"] = kept["Issue"].map({_v16u(r"\uad00\uc138\uc815\ucc45"):10, _v16u(r"FTA/\uc6d0\uc0b0\uc9c0"):9, _v16u(r"\uc218\ucd9c\ud1b5\uc81c"):8, _v16u(r"\ubc18\ub364\ud551/\uc0c1\uacc4\uad00\uc138"):8, _v16u(r"HS/\ud488\ubaa9\ubd84\ub958"):7, _v16u(r"\ud1b5\uad00/\uc138\uad00"):6, "CBAM":5}).fillna(1)
+    kept = kept.sort_values(["_v16_score", "_v16_issue_rank", "Importance Score"], ascending=[False, False, False])
+    limit = int(os.getenv("GTI_STEP4_REG_REPORT_MAX", "8"))
+    overflow = pd.DataFrame(columns=kept.columns)
+    if limit > 0 and len(kept) > limit:
+        overflow = kept.iloc[limit:].copy()
+        kept = kept.iloc[:limit].copy()
+        overflow["RejectReason"] = overflow.get("RejectReason", "").fillna("").astype(str).apply(lambda v: (v + "; " if v else "") + "v16_over_report_limit_lower_priority")
+    kept = kept.drop(columns=["_v16_score", "_v16_issue_rank"], errors="ignore").reset_index(drop=True)
+    if not overflow.empty:
+        overflow = overflow.drop(columns=["_v16_score", "_v16_issue_rank"], errors="ignore").reset_index(drop=True)
+        removed = pd.concat([removed, overflow], ignore_index=True, sort=False) if removed is not None else overflow
+    if "No" in kept.columns:
+        kept["No"] = range(1, len(kept) + 1)
+    return kept, removed
+
+# ======================================================================
+# End of GTI STEP4-1 Samsung Customs Regulation Priority Patch v16b
+# ======================================================================
+
+
+# ======================================================================
+# GTI STEP4-1 v16c: classify only from original/title/source fields.
+# Previous AI/Action text can contain broad FTA fallback wording and must not
+# influence regulation sensing.
+# ======================================================================
+
+def _v16_source_blob(row) -> str:
+    cols = [
+        "Headline", "Title", "title", "headline", "article_body", "regulation_fallback_body",
+        "original_url", "URL", "url", "Agency", "agency", "Source", "source",
+        "effective_date_hint", "hs_hint", "tariff_rate_hint", "official_regulation_reason",
+        "protected_regulation_reason", "matched_policy_terms",
+    ]
+    return " ".join(_v16_text(row.get(c, "")) for c in cols).lower()
+
+
+def _v16_priority(row) -> dict:
+    blob = _v16_source_blob(row)
+    title_l = _v16_title(row).lower()
+    best = {"issue": "Reference", "impact": "Reference", "score": 0, "terms": []}
+    for issue, impact, base_score, terms in V16_CRITICAL_RULES:
+        found = _v16_matches(blob, terms)
+        if not found:
+            continue
+        title_bonus = 18 if _v16_matches(title_l, terms) else 0
+        official_bonus = 8 if any(x.lower() in blob for x in V16_OFFICIAL_SOURCE_HINTS) else 0
+        score = base_score + min(len(found), 4) * 4 + title_bonus + official_bonus
+        if score > best["score"]:
+            best = {"issue": issue, "impact": impact, "score": score, "terms": found}
+    return best
+
+
+def _v16_is_admin_noise(row) -> bool:
+    title = _v16_title(row).lower()
+    priority = _v16_priority(row)
+    if priority["score"] >= 115:
+        return False
+    if any(t.lower() in title for t in V16_ADMIN_NOISE_TERMS):
+        return True
+    if any(t.lower() in title for t in V16_NON_TRADE_LAW_TERMS) and priority["score"] < 130:
+        return True
+    return False
+
+
+def _v15_is_reportable_regulation(row):
+    if _v16_is_admin_noise(row):
+        return False
+    return _v16_priority(row)["score"] >= 95
+
+
+def to_output(df, content_type="Regulation"):
+    if content_type != "Regulation":
+        return _v16_to_output_base(df, content_type)
+    rows = []
+    if df is None:
+        df = pd.DataFrame()
+    for _, r in df.reset_index(drop=True).iterrows():
+        priority = _v16_priority(r)
+        issue = priority["issue"]
+        impact = priority["impact"]
+        score = max(int(float(r.get("score", 0) or 0)), int(priority["score"])) if issue != "Reference" else int(float(r.get("score", 0) or 0))
+        title = _v16_title(r)
+        pub_date = _v12_publish_date(r)
+        rows.append({
+            "No": len(rows) + 1, "Content Type": content_type, "Mail Group": "Regulation", "Samsung Impact": impact,
+            "Affected Subsidiary": _v16u(r"\ud55c\uad6d/\uc8fc\uc694 \uc0dd\uc0b0\ubc95\uc778 \ubc0f \uad00\ub828 \uc218\uc785\u00b7\uc218\ucd9c \ubc95\uc778"),
+            "Impact Reason": "v16c_original_field_priority:" + ",".join(priority.get("terms", [])[:5]),
+            "Date": pub_date, "Publish Date": pub_date, "Headline": title, "Summary": _v16_summary(r, issue),
+            "AI Analysis": _v16u(r"\uc0bc\uc131\uc804\uc790 \uad00\uc138 \ub2f4\ub2f9 \uad00\uc810\uc5d0\uc11c \uc218\uc785\ud1b5\uad00, FTA\u00b7\uc6d0\uc0b0\uc9c0, HS/\ud488\ubaa9\ubd84\ub958, \uad00\uc138\ube44\uc6a9 \ub610\ub294 \uc218\ucd9c\ud1b5\uc81c \uc808\ucc28\uc5d0 \uc601\ud5a5\uc744 \uc904 \uc218 \uc788\ub294 \uacf5\uc2dd \ubc95\uaddc\uc785\ub2c8\ub2e4. \uc6d0\ubb38 \uae30\uc900 \uc801\uc6a9 \ud488\ubaa9\u00b7HS\u00b7\uc138\uc728\u00b7\uc2dc\ud589\uc77c\u00b7\uc99d\ube59\uc694\uac74\uc744 \ud488\ubaa9 \ub9c8\uc2a4\ud130\uc640 \ub300\uc870\ud574\uc57c \ud569\ub2c8\ub2e4."),
+            "Action Plan": _v16_action(r, issue), "Country": _v16_country(r), "Agency": _v16_text(r.get("Agency", r.get("agency", ""))),
+            "Risk": _v16_risk(issue, impact, score), "Importance Score": score,
+            "Priority Group": "CORE" if score >= 110 else ("USABLE" if impact != "Reference" else "REFERENCE"),
+            "Issue": issue, "Cluster": title, "URL": _v13_fix_unipass_url(r), "Source": _v16_text(r.get("Source", r.get("source", ""))),
+            "Source File": "3-1.regulation_article_summary.xlsx", "RejectReason": _v16_text(r.get("RejectReason", "")),
+            "KeywordMatches": ",".join(priority.get("terms", [])) or _v16_text(r.get("KeywordMatches", "")),
+            "effective_date_hint": _v16_text(r.get("effective_date_hint", _v16u(r"\ubcf8\ubb38\uc5d0\uc11c \ud655\uc778 \ud544\uc694"))) or _v16u(r"\ubcf8\ubb38\uc5d0\uc11c \ud655\uc778 \ud544\uc694"),
+            "hs_hint": _v16_text(r.get("hs_hint", _v16u(r"\ubcf8\ubb38\uc5d0\uc11c \ud655\uc778 \ud544\uc694"))) or _v16u(r"\ubcf8\ubb38\uc5d0\uc11c \ud655\uc778 \ud544\uc694"),
+            "tariff_rate_hint": _v16_text(r.get("tariff_rate_hint", _v16u(r"\ubcf8\ubb38\uc5d0\uc11c \ud655\uc778 \ud544\uc694"))) or _v16u(r"\ubcf8\ubb38\uc5d0\uc11c \ud655\uc778 \ud544\uc694"),
+            "article_extract_status": _v16_text(r.get("article_extract_status", "")), "ExecutiveMessage": _v16_summary(r, issue)[:500],
+        })
+    return pd.DataFrame(rows, columns=OUTPUT_COLS)
+
+# ======================================================================
+# End of GTI STEP4-1 v16c
+# ======================================================================
+
+
+# ======================================================================
+# GTI STEP4-1 v16d: reduce false positives from clhs URL and generic import
+# requirement laws. Generic "?????/????" is review material unless the
+# title also contains Samsung customs core terms.
+# ======================================================================
+
+def _v16_match_blob(row) -> str:
+    cols = ["Headline", "Title", "title", "headline", "article_body", "regulation_fallback_body", "effective_date_hint", "hs_hint", "tariff_rate_hint", "matched_policy_terms"]
+    return " ".join(_v16_text(row.get(c, "")) for c in cols).lower()
+
+
+def _v16_matches(blob: str, terms) -> list[str]:
+    found = []
+    for t in terms:
+        tt = str(t)
+        if tt == "HS":
+            if re.search(r"(?<![A-Za-z])hs(?![A-Za-z])", blob, flags=re.I):
+                found.append(t)
+            continue
+        if tt.lower() in blob:
+            found.append(t)
+    return found
+
+
+def _v16_priority(row) -> dict:
+    match_blob = _v16_match_blob(row)
+    official_blob = _v16_source_blob(row)
+    title_l = _v16_title(row).lower()
+    best = {"issue": "Reference", "impact": "Reference", "score": 0, "terms": []}
+    for issue, impact, base_score, terms in V16_CRITICAL_RULES:
+        found = _v16_matches(match_blob, terms)
+        if not found:
+            continue
+        # Generic import-requirement terms alone are not enough for executive report.
+        if set(found) <= {_v16u(r"\uc138\uad00\uc7a5\ud655\uc778"), _v16u(r"\ud1b5\ud569\uacf5\uace0"), _v16u(r"\ubcf4\uc138")}:
+            title_core = any(x in title_l for x in [_v16u(r"\ud560\ub2f9\uad00\uc138"), _v16u(r"\uc6d0\uc0b0\uc9c0"), "fta", _v16u(r"\uad00\uc138\uc728"), _v16u(r"\uc218\ucd9c\ud1b5\uc81c"), _v16u(r"\ud488\ubaa9\ubd84\ub958")])
+            if not title_core:
+                continue
+        title_bonus = 18 if _v16_matches(title_l, terms) else 0
+        official_bonus = 8 if any(x.lower() in official_blob for x in V16_OFFICIAL_SOURCE_HINTS) else 0
+        score = base_score + min(len(found), 4) * 4 + title_bonus + official_bonus
+        if score > best["score"]:
+            best = {"issue": issue, "impact": impact, "score": score, "terms": found}
+    return best
+
+
+def _v16_is_admin_noise(row) -> bool:
+    title = _v16_title(row).lower()
+    critical_title_terms = [_v16u(r"\ud560\ub2f9\uad00\uc138"), _v16u(r"\uad00\uc138\ubc95 \uc81c71\uc870"), _v16u(r"\uc790\uc720\ubb34\uc5ed\ud611\uc815"), "fta", _v16u(r"\ud611\uc815\uc138\uc728"), _v16u(r"\uc6d0\uc0b0\uc9c0"), _v16u(r"\uc218\ucd9c\uc785\ud654\ubb3c \uac80\uc0ac\ube44\uc6a9"), _v16u(r"\uc218\ucd9c\ud1b5\uc81c"), _v16u(r"\ud488\ubaa9\ubd84\ub958")]
+    if any(t.lower() in title for t in V16_ADMIN_NOISE_TERMS) and not any(t.lower() in title for t in critical_title_terms):
+        return True
+    if any(t.lower() in title for t in V16_NON_TRADE_LAW_TERMS):
+        return True
+    priority = _v16_priority(row)
+    if priority["score"] >= 115:
+        return False
+    return False
+
+# ======================================================================
+# End of GTI STEP4-1 v16d
+# ======================================================================
+
+
+# ======================================================================
+# GTI STEP4-1 v16e: deduplicate the same regulation from multiple official
+# mirrors (UNIPASS/law.go.kr/clhs) before writing daily summary.
+# ======================================================================
+
+def _v16_reg_dedup_key(row) -> str:
+    title = _v16_title(row)
+    title = re.sub(r"\([^)]*\)", " ", title)
+    title = re.sub(r"\[[^]]*\]", " ", title)
+    title = re.sub(r"[^\w]+", "", title, flags=re.UNICODE).replace("_", "").lower()
+    title = re.sub(r"20\d{2}\d*", "", title)
+    title = title.replace(_v16u(r"\uc81c"), "").replace(_v16u(r"\ud638"), "")
+    for suffix in [_v16u(r"\uad00\uc138\uccad\uace0\uc2dc"), _v16u(r"\uace0\uc2dc")]:
+        title = title.replace(suffix, "")
+    return title[:90] or _v16_text(row.get("URL", ""))[:160]
+
+_v16e_split_base = _v15_split_reg_daily
+
+def _v15_split_reg_daily(daily):
+    kept, removed = _v16e_split_base(daily)
+    if kept is None or kept.empty:
+        return kept, removed
+    kept = kept.copy()
+    kept["_v16_dedup_key"] = kept.apply(_v16_reg_dedup_key, axis=1)
+    kept["_v16_source_rank"] = kept["URL"].astype(str).str.contains("law.go.kr", case=False, na=False).astype(int) * 2 + kept["URL"].astype(str).str.contains("unipass.customs.go.kr", case=False, na=False).astype(int)
+    kept = kept.sort_values(["Importance Score", "_v16_source_rank"], ascending=[False, False])
+    dup_mask = kept.duplicated("_v16_dedup_key", keep="first")
+    dups = kept.loc[dup_mask].copy()
+    kept = kept.loc[~dup_mask].copy()
+    if not dups.empty:
+        dups["RejectReason"] = dups.get("RejectReason", "").fillna("").astype(str).apply(lambda v: (v + "; " if v else "") + "v16_duplicate_same_regulation")
+        removed = pd.concat([removed, dups.drop(columns=["_v16_dedup_key", "_v16_source_rank"], errors="ignore")], ignore_index=True, sort=False) if removed is not None else dups
+    kept = kept.drop(columns=["_v16_dedup_key", "_v16_source_rank"], errors="ignore").reset_index(drop=True)
+    if "No" in kept.columns:
+        kept["No"] = range(1, len(kept) + 1)
+    return kept, removed
+
+# ======================================================================
+# End of GTI STEP4-1 v16e
+# ======================================================================
+
 def main():
     print("[STEP4-1] Regulation analysis start - GUARDRAIL v4.1")
     _gti_step4_gemini_log_once()

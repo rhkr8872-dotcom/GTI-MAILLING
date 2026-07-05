@@ -1,4 +1,4 @@
-# GTI FINAL CORE v5 - Google News with Selenium original URL recovery
+# GTI FINAL CORE v6 - Google News FAST with deferred Selenium original URL recovery
 # =========================================================
 # GTI STEP2-2 - GOOGLE NEWS RAW + ORIGINAL URL PARALLEL FINAL v3.4
 # 紐⑹쟻: 鍮좊Ⅸ ?섏쭛 + Google News ?먮Ц URL 蹂묐젹 蹂듦뎄 + ?ㅽ뻾?쒓컙 濡쒓렇
@@ -34,11 +34,15 @@ SLEEP_SEC = 0.05
 # Original URL resolve option.
 # Y: resolve Google News RSS URLs to publisher/source URLs.
 # N: keep Google News URLs for faster collection.
-ENABLE_ORIGINAL_URL_RESOLVE = os.getenv("GTI_STEP2_RESOLVE_ORIGINAL_URL", "Y").strip().upper() != "N"
+ENABLE_ORIGINAL_URL_RESOLVE = os.getenv("GTI_STEP2_RESOLVE_ORIGINAL_URL", "N").strip().upper() != "N"
 URL_RESOLVE_WORKERS = int(os.getenv("GTI_STEP2_URL_WORKERS", "5"))
 URL_RESOLVE_TIMEOUT = int(os.getenv("GTI_STEP2_URL_TIMEOUT", "20"))
 URL_RESOLVE_RETRY = int(os.getenv("GTI_STEP2_URL_RETRY", "2"))
 URL_RESOLVE_INTERVAL = float(os.getenv("GTI_STEP2_URL_INTERVAL", "0.25"))
+# v6: Step2 is a broad collection step. Do not spend hours resolving every Google URL.
+# Keep GoogleURL and resolve final candidates later in STEP3/STEP4 via Selenium.
+URL_RESOLVE_LIMIT = int(os.getenv("GTI_STEP2_URL_RESOLVE_LIMIT", "0"))  # 0 = no limit if enabled
+
 
 HEADERS = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120 Safari/537.36",
@@ -71,6 +75,7 @@ def safe_to_excel(df, output_path, index=False):
 FINAL_COLS = [
     "date",
     "title",
+    "headline",
     "url",
     "google_url",
     "source",
@@ -607,7 +612,7 @@ def resolve_original_urls_parallel(df):
     if df.empty:
         return df
     if not ENABLE_ORIGINAL_URL_RESOLVE:
-        df["url_decode_status"] = "SKIPPED_STEP2_FAST"
+        df["url_decode_status"] = "DEFERRED_TO_STEP3"
         return df
 
     started = time.perf_counter()
@@ -621,6 +626,13 @@ def resolve_original_urls_parallel(df):
 
     need_mask = ~has_hint & df["google_url"].astype(str).apply(is_google_news_url)
     urls = df.loc[need_mask, "google_url"].dropna().astype(str).str.strip().unique().tolist()
+    if URL_RESOLVE_LIMIT > 0 and len(urls) > URL_RESOLVE_LIMIT:
+        print(f"URL RESOLVE LIMIT: {len(urls)} -> {URL_RESOLVE_LIMIT}; remaining URLs deferred to STEP3")
+        deferred_urls = set(urls[URL_RESOLVE_LIMIT:])
+        urls = urls[:URL_RESOLVE_LIMIT]
+        df.loc[df["google_url"].isin(deferred_urls), "url_decode_status"] = "DEFERRED_TO_STEP3_LIMIT"
+    else:
+        deferred_urls = set()
 
     print(f"URL RESOLVE START: target={len(urls)} / mode=sequential_cache_first / timeout={URL_RESOLVE_TIMEOUT}s")
     if not urls:
@@ -650,13 +662,17 @@ def resolve_original_urls_parallel(df):
 
     for idx, row in df.loc[need_mask].iterrows():
         google_url = str(row.get("google_url", "")).strip()
+        if google_url in deferred_urls:
+            df.at[idx, "url"] = google_url
+            df.at[idx, "url_decode_status"] = "DEFERRED_TO_STEP3_LIMIT"
+            continue
         original_url, status = results.get(google_url, ("", "NOT_TRIED"))
         if original_url and not is_bad_original_url(original_url):
             df.at[idx, "original_url_candidate"] = original_url
             df.at[idx, "url"] = original_url
             df.at[idx, "url_decode_status"] = status
         else:
-            # ?ㅽ뙣 ??Google URL? google_url 而щ읆??蹂댁〈?섍퀬, url??fallback?쇰줈 ?좎?
+            # Failed Google URL remains in google_url and will be retried in STEP3.
             df.at[idx, "url"] = google_url
             df.at[idx, "url_decode_status"] = status or "FAILED"
 
@@ -739,6 +755,7 @@ def collect_google_rss(keywords):
             rows.append({
                 "date": dt,
                 "title": title,
+                "headline": title,
                 "url": google_url,
                 "google_url": google_url,
                 "source": "Google News RSS",
@@ -751,7 +768,7 @@ def collect_google_rss(keywords):
                 "importance": importance,
                 "importance_score": adjusted_score,
                 "score_reason": score_reason,
-                "url_decode_status": "PENDING_STEP2_RESOLVE" if ENABLE_ORIGINAL_URL_RESOLVE else "SKIPPED_STEP2_FAST",
+                "url_decode_status": "PENDING_STEP2_RESOLVE" if ENABLE_ORIGINAL_URL_RESOLVE else "DEFERRED_TO_STEP3",
                 "original_url_candidate": original_url_candidate,
                 "rss_url": rss_url,
             })

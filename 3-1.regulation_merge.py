@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-# GTI FINAL CORE v5 - Article body extraction with Selenium URL recovery
+# GTI FINAL CORE v6 - Article body extraction with Selenium URL recovery
 """
 GTI STEP3 - LAW1 Regulation / News Article Body Extract + Representative Clustering
 ----------------------------------------------------------------------------

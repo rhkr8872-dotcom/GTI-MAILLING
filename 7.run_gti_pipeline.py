@@ -1,7 +1,7 @@
-
+﻿
 # 7.run_gti_pipeline.py
 # -*- coding: utf-8 -*-
-# GTI FINAL CORE v5 - Full pipeline
+# GTI FINAL CORE v6 - Full pipeline
 """
 GTI LAW1/NEWSREST split pipeline.
 
@@ -19,9 +19,11 @@ from __future__ import annotations
 
 import argparse
 import os
+import queue
 import shutil
 import subprocess
 import sys
+import threading
 import time
 from dataclasses import dataclass, field
 from datetime import datetime
@@ -42,15 +44,30 @@ MAIL_OUTPUT_DIR = BASE_DIR / "12345" / "c_type_outputs"
 
 # Pipeline-level defaults. Individual scripts still allow explicit environment overrides.
 PIPELINE_ENV_DEFAULTS = {
-    "GTI_STEP1_HOURS_BACK": "72",
-    "GTI_LOOKBACK_HOURS": "72",
-    "GTI_STEP3_RECENT_HOURS": "72",
-    "GTI_STEP4_NEWS_MAX_AGE_HOURS": "72",
+    # Core rule: daily news and normal regulation sensing are based on the latest 24 hours.
+    # Official regulation protection/review logic remains inside Step1/Step4 so important law items are not lost.
+    "GTI_STEP1_HOURS_BACK": "24",
+    "GTI_LOOKBACK_HOURS": "24",
+    "GTI_STEP3_RECENT_HOURS": "24",
+    "GTI_STEP4_NEWS_MAX_AGE_HOURS": "24",
     "GTI_MAIL_MAX_AGE_DAYS": "45",
     "GTI_MAIL_MAX_AGE_DAYS_REG": "45",
-    "GTI_MAIL_MAX_AGE_DAYS_NEWS": "45",
+    "GTI_MAIL_MAX_AGE_DAYS_NEWS": "1",
     "GTI_GEMINI_MODEL": "gemini-2.5-flash-lite",
     "GTI_GEMINI_TIMEOUT": "20",
+    "GTI_ARTICLE_FETCH_TIMEOUT": "12",
+    "GTI_RSS_FETCH_TIMEOUT": "15",
+    # News must be Samsung customs-impact Top 30, with customs/trade signal in the original title.
+    "GTI_STEP4_NEWS_TARGET_MAX": "30",
+    "GTI_STRICT_NEWS_TARGET_MAX": "30",
+    "GTI_STRICT_FINAL_ENABLED": "1",
+    "GTI_NEWS_TITLE_KEYWORD_REQUIRED": "Y",
+    # Keep original URL/title accuracy high; Google broad collection defers final URL checks to Step3/Step4.
+    "GTI_STEP2_RESOLVE_ORIGINAL_URL": "N",
+    "GTI_STEP2_URL_RESOLVE_LIMIT": "0",
+    "GTI_ORIGINAL_URL_SEARCH_ENABLED": "1",
+    "GTI_SELENIUM_GOOGLE_RESOLVE": "1",
+    "GTI_SELENIUM_GOOGLE_TIMEOUT": "20",
 }
 
 
@@ -61,6 +78,7 @@ class Step:
     required: bool = True
     expected_outputs: tuple[str, ...] = field(default_factory=tuple)
     args: tuple[str, ...] = field(default_factory=tuple)
+    timeout_sec: int | None = None
 
 
 STAGE_1 = [
@@ -69,13 +87,14 @@ STAGE_1 = [
         "1.site_crawler.py",
         required=True,
         expected_outputs=("1-1.regulation_raw.xlsx",),
+        timeout_sec=1800,
     ),
 ]
 
 STAGE_2 = [
-    Step("STEP2_NAVER", "2-1.NAVER_news_collector.py", required=False, expected_outputs=("2-1.naver_news_raw.xlsx",)),
-    Step("STEP2_GOOGLE", "2-2.google_news_collector.py", required=False, expected_outputs=("2-2.google_news_raw.xlsx",)),
-    Step("STEP2_RSS", "2-3.rss_news_raw.py", required=False, expected_outputs=("2-3.rss_news_raw.xlsx",)),
+    Step("STEP2_NAVER", "2-1.NAVER_news_collector.py", required=False, expected_outputs=("2-1.naver_news_raw.xlsx",), timeout_sec=900),
+    Step("STEP2_GOOGLE", "2-2.google_news_collector.py", required=False, expected_outputs=("2-2.google_news_raw.xlsx",), timeout_sec=1200),
+    Step("STEP2_RSS", "2-3.rss_news_raw.py", required=False, expected_outputs=("2-3.rss_news_raw.xlsx",), timeout_sec=900),
 ]
 
 STAGE_3 = [
@@ -84,6 +103,7 @@ STAGE_3 = [
         "3-2.news_merge.py",
         required=True,
         expected_outputs=("3-2.news_summary.xlsx", "3-2.news_cumulative.xlsx"),
+        timeout_sec=1800,
     ),
 ]
 
@@ -97,6 +117,7 @@ STAGE_3_ARTICLE = [
             "3-2.news_article_summary.xlsx",
             "3-2.news_article_cluster_audit.xlsx",
         ),
+        timeout_sec=14400,
     ),
 ]
 
@@ -106,12 +127,14 @@ STAGE_4 = [
         "4-1.regulation_ai_analysis.py",
         required=True,
         expected_outputs=("4-1.regulation_ai_summary.xlsx", "4-1.regulation_ai_cumulative.xlsx"),
+        timeout_sec=1800,
     ),
     Step(
         "STEP4_2_NEWS_AI",
         "4-2.news_ai_analysis.py",
         required=True,
         expected_outputs=("4-2.news_ai_summary.xlsx", "4-2.news_ai_cumulative.xlsx"),
+        timeout_sec=1800,
     ),
 ]
 
@@ -129,6 +152,7 @@ STAGE_5 = [
             "--output-dir",
             str(MAIL_OUTPUT_DIR),
         ),
+        timeout_sec=1200,
     ),
 ]
 
@@ -261,6 +285,9 @@ def run_script(step: Step, python_exe: str, dry_run: bool = False) -> str:
     env = os.environ.copy()
     env.setdefault("PYTHONIOENCODING", "utf-8")
     env.setdefault("PYTHONUTF8", "1")
+    if step.timeout_sec:
+        log(f"TIMEOUT : {step.timeout_sec} sec")
+
     proc = subprocess.Popen(
         command,
         cwd=str(BASE_DIR),
@@ -272,10 +299,69 @@ def run_script(step: Step, python_exe: str, dry_run: bool = False) -> str:
         env=env,
     )
     assert proc.stdout is not None
-    for line in proc.stdout:
-        log(f"  {line.rstrip()}")
+
+    output_queue: queue.Queue[str | None] = queue.Queue()
+
+    def _reader() -> None:
+        try:
+            for out_line in proc.stdout:
+                output_queue.put(out_line)
+        finally:
+            output_queue.put(None)
+
+    reader = threading.Thread(target=_reader, daemon=True)
+    reader.start()
+    reader_done = False
+    timed_out = False
+
+    while True:
+        try:
+            out_line = output_queue.get(timeout=0.5)
+            if out_line is None:
+                reader_done = True
+            else:
+                log(f"  {out_line.rstrip()}")
+        except queue.Empty:
+            pass
+
+        if step.timeout_sec and proc.poll() is None and (time.time() - start) > step.timeout_sec:
+            timed_out = True
+            log(f"{step.name} TIMEOUT : exceeded {step.timeout_sec} sec; terminating process tree")
+            try:
+                if os.name == "nt":
+                    subprocess.run(["taskkill", "/PID", str(proc.pid), "/T", "/F"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                else:
+                    proc.kill()
+            except Exception as exc:
+                log(f"{step.name} TIMEOUT KILL WARN : {exc}")
+            break
+
+        if proc.poll() is not None:
+            if reader_done:
+                break
+            reader.join(timeout=2)
+            if not reader.is_alive():
+                reader_done = True
+                break
+            log(f"{step.name} OUTPUT READER WARN : process ended but output reader is still waiting; continuing")
+            break
+
+    try:
+        reader.join(timeout=2)
+    except RuntimeError:
+        pass
+
+    while not output_queue.empty():
+        out_line = output_queue.get_nowait()
+        if out_line:
+            log(f"  {out_line.rstrip()}")
+
     return_code = proc.wait()
     elapsed = round(time.time() - start, 2)
+
+    if timed_out:
+        log(f"{step.name} FAILED : timeout / {elapsed} sec")
+        return "FAILED" if step.required else "WARNING"
 
     if return_code != 0:
         log(f"{step.name} FAILED : return_code={return_code} / {elapsed} sec")
@@ -527,5 +613,9 @@ def main() -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
+
+
+
+
 
 

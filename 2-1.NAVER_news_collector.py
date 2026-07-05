@@ -473,6 +473,7 @@ def collect_naver(keyword_df):
                 results.append({
                     "date": date,
                     "title": title,
+                    "headline": title,
                     "url": url,
                     "source": source,
                     "keyword": kw,
@@ -515,6 +516,7 @@ def deduplicate_keep_highest_priority(df):
     agg_map = {
         "date": "max",
         "title": "first",
+        "headline": "first",
         "url": "first",
         "source": "first",
         "keyword": merge_unique,
@@ -545,7 +547,7 @@ def main():
     print(f"📊 TOTAL BALANCED RAW: {len(df)}")
 
     save_cols = [
-        "date", "title", "url", "source",
+        "date", "title", "headline", "url", "source",
         "keyword", "priority", "relevance_score",
         "description", "filter_reason", "collected_at",
     ]

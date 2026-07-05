@@ -1,10 +1,10 @@
-# -*- coding: utf-8 -*-
-# GTI FINAL CORE v5 - News merge, URL candidates preserved
+﻿# -*- coding: utf-8 -*-
+# GTI FINAL CORE v9 - News merge, title-keyword priority + URL quality guard
 """
 STEP3-2 : news_merge.py
 
 Input:
-- C:\\Temp\\1-2.site_news_raw.xlsx   # STEP1 non-LAW1 rows only; treated as news
+- C:\\Temp\\1-2.site_news_raw.xlsx   # STEP1 non-LAW1 official/news rows
 - C:\\Temp\\2-1.naver_news_raw.xlsx
 - C:\\Temp\\2-2.google_news_raw.xlsx
 - C:\\Temp\\2-3.rss_news_raw.xlsx
@@ -30,6 +30,7 @@ from __future__ import annotations
 import argparse
 import os
 import re
+import shutil
 from difflib import SequenceMatcher
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -44,6 +45,7 @@ from openpyxl.utils import get_column_letter
 BASE_DIR = Path(os.getenv("STEP3_BASE_DIR", r"C:\Temp"))
 
 INPUT_FILES = [
+    # STEP1에서 LAW1(공인 법규)로 확정되지 않은 공식기관 공지/보도/정책자료도 뉴스 후보로 병합
     BASE_DIR / "1-2.site_news_raw.xlsx",
     BASE_DIR / "2-1.naver_news_raw.xlsx",
     BASE_DIR / "2-2.google_news_raw.xlsx",
@@ -139,6 +141,10 @@ FINAL_COLS = [
     "RegulationRelated",
     "RegulationTransferType",
     "KeywordMatches",
+    "TitleKeywordFlag",
+    "TitleKeywordMatches",
+    "OriginalURLVerified",
+    "URLQuality",
     "IssueClusterKey",
     "ClusterSize",
     "DuplicateCount",
@@ -221,6 +227,20 @@ FALLBACK_TRADE_KEYWORDS = [
     "restriction", "classification", "hs", "hs code", "cbam",
     "carbon border", "trade agreement",
 ]
+
+# 제목 keyword는 GTI 관세/통상 핵심어만 사용한다.
+# 삼성/반도체/시총/주가 같은 일반 기업·시장 키워드는 제목 keyword로 인정하지 않는다.
+TITLE_KEYWORD_TERMS = sorted(set(FALLBACK_TRADE_KEYWORDS + [
+    "section 301", "section 232", "301조", "232조", "ieepa",
+    "reciprocal tariff", "additional tariff", "customs duty", "import duty",
+    "anti dumping", "anti-dumping", "antidumping", "countervailing duty", "ad/cvd", "cvd",
+    "trade remedy", "export controls", "entity list", "uflpa", "forced labor",
+    "free trade agreement", "rules of origin", "origin rule", "preference",
+    "classification", "hs classification", "quota", "safeguard",
+    "관세법", "관세청", "상호관세", "추가관세", "덤핑방지관세", "무역구제",
+    "자유무역협정", "협정세율", "특혜관세", "원산지증명", "원산지 기준",
+    "수출관리", "전략물자", "강제노동", "품목번호", "품목분류", "탄소국경",
+]), key=lambda x: x.lower())
 
 POLICY_RULES = [
     ("AD_CVD", [
@@ -660,8 +680,8 @@ def choose_article_url(
             return candidate, status
 
     for candidate, status in [
-        (google, "GOOGLE_ARTICLE_REDIRECT"),
-        (raw, "GOOGLE_ARTICLE_REDIRECT"),
+        (google, "NEEDS_SELENIUM_RESOLVE"),
+        (raw, "NEEDS_SELENIUM_RESOLVE"),
     ]:
         if is_google_article_redirect_url(candidate):
             return clean(candidate), status
@@ -774,6 +794,46 @@ def keyword_matches(text: str, keywords: list[str]) -> list[str]:
     lowered = text.lower()
     matches = [keyword for keyword in keywords if keyword.lower() in lowered]
     return sorted(set(matches), key=lambda x: x.lower())
+
+
+def title_keyword_matches(headline: object) -> list[str]:
+    """Return GTI trade/customs keywords that appear in the original headline.
+
+    This is intentionally stricter than the general keyword match.  A title with
+    only Samsung/semiconductor/market terms should not become CORE/Top3 material.
+    """
+    title = clean(headline).lower()
+    if not title:
+        return []
+    return sorted({term for term in TITLE_KEYWORD_TERMS if clean(term) and clean(term).lower() in title}, key=lambda x: x.lower())
+
+
+def has_title_keyword(row: pd.Series) -> bool:
+    if clean(row.get("TitleKeywordFlag", "")).upper() == "Y":
+        return True
+    if clean(row.get("TitleKeywordMatches", "")):
+        return True
+    return bool(title_keyword_matches(row.get("Headline", "")))
+
+
+def url_quality_from_status(status: object, url: object) -> tuple[str, str]:
+    """Return (OriginalURLVerified, URLQuality).
+
+    Google article redirect links are useful for follow-up, but they are not
+    treated as confirmed original URLs.  STEP3 keeps them as candidates and lets
+    STEP3-1/STEP4 perform Selenium recovery.
+    """
+    status_text = clean(status).upper()
+    raw = clean(url)
+    if not raw:
+        return "N", "EMPTY_URL"
+    if status_text in {"RESTORED_ORIGINAL_CANDIDATE", "RESTORED_CANONICAL_CANDIDATE", "RESTORED_GOOGLE_QUERY", "ORIGINAL_INPUT"} and not is_google_unresolved_url(raw):
+        return "Y", "ORIGINAL_VERIFIED"
+    if status_text == "NEEDS_SELENIUM_RESOLVE" or is_google_article_redirect_url(raw):
+        return "N", "NEEDS_SELENIUM_RESOLVE"
+    if is_google_unresolved_url(raw):
+        return "N", "GOOGLE_UNRESOLVED"
+    return "Y", "ORIGINAL_VERIFIED"
 
 
 def load_one_file(path: Path) -> pd.DataFrame:
@@ -976,6 +1036,7 @@ def add_signals(df: pd.DataFrame, keywords: list[str]) -> pd.DataFrame:
     for _, row in df.iterrows():
         text = analysis_text(row)
         matches = keyword_matches(text, keywords)
+        title_matches = title_keyword_matches(row.get("Headline", ""))
         policy_signals = [label for label, terms in POLICY_RULES if contains_any(text, terms)]
         samsung_signals = [label for label, terms in SAMSUNG_RULES if contains_any(text, terms)]
 
@@ -984,6 +1045,8 @@ def add_signals(df: pd.DataFrame, keywords: list[str]) -> pd.DataFrame:
 
         item = row.to_dict()
         item["KeywordMatches"] = "; ".join(matches)
+        item["TitleKeywordMatches"] = "; ".join(title_matches)
+        item["TitleKeywordFlag"] = "Y" if title_matches else "N"
         item["PolicySignals"] = "; ".join(policy_signals)
         item["SamsungSignal"] = "; ".join(samsung_signals) if samsung_signals else "None"
         item["IssueKey"] = policy_signals[0] if policy_signals else "TRADE_GENERAL"
@@ -1138,7 +1201,12 @@ def calculate_final_score(row: pd.Series) -> int:
     samsung = int(row.get("SamsungImpactScore", 0) or 0)
     risk = int(row.get("RiskScore", 0) or 0)
     score = int(round(topic * 0.50 + samsung * 0.30 + risk * 0.20))
-    return max(0, min(score + step3_score_adjustment(row), 100))
+    adjusted = score + step3_score_adjustment(row)
+    if has_title_keyword(row):
+        adjusted += 8
+    else:
+        adjusted -= 12
+    return max(0, min(adjusted, 100))
 
 
 def has_step4_review_signal(row: pd.Series) -> bool:
@@ -1163,7 +1231,7 @@ def has_standalone_noise_signal(row: pd.Series) -> bool:
 
 def google_url_penalty(row: pd.Series) -> int:
     status = clean(row.get("URLRestoreStatus", ""))
-    if status == "GOOGLE_UNRESOLVED":
+    if status in {"GOOGLE_UNRESOLVED", "NEEDS_SELENIUM_RESOLVE", "GOOGLE_ARTICLE_REDIRECT"}:
         return -8
     return 0
 
@@ -1185,8 +1253,10 @@ def step3_score_adjustment(row: pd.Series) -> int:
 
 def step4_hint(row: pd.Series) -> str:
     hints = []
-    if clean(row.get("URLRestoreStatus", "")) == "GOOGLE_UNRESOLVED":
-        hints.append("google_url_unresolved_step4_discount")
+    if clean(row.get("URLRestoreStatus", "")) in {"GOOGLE_UNRESOLVED", "NEEDS_SELENIUM_RESOLVE", "GOOGLE_ARTICLE_REDIRECT"}:
+        hints.append("google_url_needs_selenium_resolve")
+    if not has_title_keyword(row):
+        hints.append("no_title_keyword_core_blocked")
     if contains_any(analysis_text(row), AD_CVD_FORCE_TERMS):
         hints.append("force_ad_cvd_review")
     if has_step4_review_signal(row):
@@ -1236,6 +1306,14 @@ def calculate_score(row: pd.Series) -> int:
 
     score += min(keyword_count * 4, 24)
 
+    # 제목에 관세/통상 핵심 keyword가 있으면 우선권을 주고,
+    # 제목 keyword가 없으면 삼성/반도체/시장 기사 과대 선정을 방지한다.
+    title_kw = has_title_keyword(row)
+    if title_kw:
+        score += 18
+    else:
+        score -= 25
+
     if samsung != "None":
         signals = samsung_signal_parts(samsung)
         product_signals = [x for x in signals if x != "PRODUCTION_COUNTRY"]
@@ -1264,7 +1342,11 @@ def calculate_score(row: pd.Series) -> int:
     elif issue == "CUSTOMS" and not has_product_samsung_signal(samsung):
         score = min(score, 58)
 
-    return min(score, 100)
+    if not title_kw:
+        # 제목에 관세/통상 keyword가 없으면 STEP3 후보에는 남길 수 있으나 CORE급으로 올리지 않는다.
+        score = min(score, 68)
+
+    return min(max(score, 0), 100)
 
 
 def add_analysis_fields(df: pd.DataFrame) -> pd.DataFrame:
@@ -1282,6 +1364,12 @@ def add_analysis_fields(df: pd.DataFrame) -> pd.DataFrame:
     result["RiskScore"] = result.apply(calculate_risk_score, axis=1)
     result["FinalScore"] = result.apply(calculate_final_score, axis=1)
     result["Score"] = result["FinalScore"]
+    if "TitleKeywordMatches" not in result.columns:
+        result["TitleKeywordMatches"] = result["Headline"].apply(lambda v: "; ".join(title_keyword_matches(v)))
+    result["TitleKeywordFlag"] = result["TitleKeywordMatches"].apply(lambda v: "Y" if clean(v) else "N")
+    url_quality_pairs = [url_quality_from_status(status, url) for status, url in zip(result.get("URLRestoreStatus", ""), result.get("URL", ""))]
+    result["OriginalURLVerified"] = [p[0] for p in url_quality_pairs]
+    result["URLQuality"] = [p[1] for p in url_quality_pairs]
     result["Step4Hint"] = result.apply(step4_hint, axis=1)
     result["NewsType"] = "NEWS"
     result["RegulationRelated"] = result.apply(regulation_related_flag, axis=1)
@@ -1458,30 +1546,20 @@ def cluster_policy_events(df: pd.DataFrame) -> pd.DataFrame:
     result["IssueClusterKey"] = result.apply(make_issue_cluster_key, axis=1)
     result = result.sort_values(["FinalScore", "FilterDate"], ascending=[False, False]).reset_index(drop=True)
 
-    clusters: list[list[int]] = []
-    representatives: list[int] = []
-
-    for idx, row in result.iterrows():
-        assigned = False
-        for cluster_idx, rep_idx in enumerate(representatives):
-            rep = result.loc[rep_idx]
-            if same_policy_issue(row, rep):
-                clusters[cluster_idx].append(idx)
-                assigned = True
-                break
-        if not assigned:
-            clusters.append([idx])
-            representatives.append(idx)
-
+    # Previous near-similarity clustering compared each row with many representatives.
+    # With large daily candidate pools this can run for hours.  Use the deterministic
+    # issue key as the primary grouping key; title-level dedup already ran earlier.
     compressed_rows = []
-    for cluster in clusters:
-        group = result.loc[cluster].copy()
-        compressed_rows.append(compress_cluster(group))
+    for _, group in result.groupby("IssueClusterKey", sort=False, dropna=False):
+        compressed_rows.append(compress_cluster(group.copy()))
 
     compressed = pd.DataFrame(compressed_rows)
-    compressed = compressed.sort_values(["FinalScore", "FilterDate"], ascending=[False, False]).reset_index(drop=True)
+    if compressed.empty:
+        log(f"정책 이슈 clustering 제거: {before} / 대표기사=0")
+        return compressed
 
-    log(f"정책 이슈 clustering 제거: {before - len(compressed)} / 대표기사={len(compressed)}")
+    compressed = compressed.sort_values(["FinalScore", "FilterDate"], ascending=[False, False]).reset_index(drop=True)
+    log(f"정책 이슈 clustering 제거: {before - len(compressed)} / 대표기사={len(compressed)} / mode=fast_key")
     return compressed
 
 def limit_trade_general(df: pd.DataFrame) -> pd.DataFrame:
@@ -1513,7 +1591,8 @@ def assign_tier_and_reasons(df: pd.DataFrame) -> pd.DataFrame:
         samsung = clean(row.get("SamsungSignal", ""))
         product_samsung = has_product_samsung_signal(samsung)
         major_notice_policy = is_major_tariff_regulation_news(row)
-        unresolved_google = clean(row.get("URLRestoreStatus", "")) == "GOOGLE_UNRESOLVED"
+        title_keyword = has_title_keyword(row)
+        unresolved_google = clean(row.get("URLRestoreStatus", "")) in {"GOOGLE_UNRESOLVED", "NEEDS_SELENIUM_RESOLVE", "GOOGLE_ARTICLE_REDIRECT"}
         standalone_noise = has_standalone_noise_signal(row)
         review_signal = has_step4_review_signal(row)
         ad_cvd_forced = contains_any(analysis_text(row), AD_CVD_FORCE_TERMS)
@@ -1527,6 +1606,10 @@ def assign_tier_and_reasons(df: pd.DataFrame) -> pd.DataFrame:
             reasons.append(f"samsung={samsung}")
         if clean(row.get("KeywordMatches", "")):
             reasons.append("keyword_match")
+        if title_keyword:
+            reasons.append("title_keyword_match")
+        else:
+            reasons.append("no_title_keyword_core_blocked")
         if major_notice_policy:
             reasons.append("notice_news_tariff_regulation")
         if unresolved_google:
@@ -1546,6 +1629,7 @@ def assign_tier_and_reasons(df: pd.DataFrame) -> pd.DataFrame:
             score >= 70
             and (product_samsung or score >= 80)
             and issue in ["TARIFF", "AD_CVD", "EXPORT_CONTROL", "CBAM_CARBON", "ORIGIN_FTA"]
+            and title_keyword
             and not unresolved_google
             and not standalone_noise
         ):
@@ -1605,9 +1689,10 @@ def enforce_tier_buckets(df: pd.DataFrame) -> pd.DataFrame:
 
     result["risk_order"] = result["Risk"].map(risk_order).fillna(0)
     result["tier_order"] = result["Tier"].map(preliminary_tier_order).fillna(0)
+    result["title_keyword_order"] = result.apply(lambda r: 1 if has_title_keyword(r) else 0, axis=1)
 
-    sort_cols = ["tier_order", "risk_order", "FinalScore", "TopicScore", "SamsungImpactScore", "FilterDate"]
-    result = result.sort_values(sort_cols, ascending=[False, False, False, False, False, False]).reset_index(drop=True)
+    sort_cols = ["title_keyword_order", "tier_order", "risk_order", "FinalScore", "TopicScore", "SamsungImpactScore", "FilterDate"]
+    result = result.sort_values(sort_cols, ascending=[False, False, False, False, False, False, False]).reset_index(drop=True)
 
     core_end = min(TIER_CORE_LIMIT, len(result))
     usable_end = min(core_end + TIER_USABLE_LIMIT, len(result))
@@ -1620,7 +1705,8 @@ def enforce_tier_buckets(df: pd.DataFrame) -> pd.DataFrame:
     core_candidates = [
         idx for idx, row in result.iterrows()
         if clean(row.get("TierOriginal", "")) == "CORE"
-        and clean(row.get("URLRestoreStatus", "")) != "GOOGLE_UNRESOLVED"
+        and has_title_keyword(row)
+        and clean(row.get("URLRestoreStatus", "")) not in {"GOOGLE_UNRESOLVED", "NEEDS_SELENIUM_RESOLVE", "GOOGLE_ARTICLE_REDIRECT"}
         and not has_standalone_noise_signal(row)
     ]
     core_selected = core_candidates[:core_end]
@@ -1693,6 +1779,10 @@ def finalize(df: pd.DataFrame) -> pd.DataFrame:
     final["RegulationRelated"] = result["RegulationRelated"]
     final["RegulationTransferType"] = result["RegulationTransferType"]
     final["KeywordMatches"] = result["KeywordMatches"]
+    final["TitleKeywordFlag"] = result.get("TitleKeywordFlag", "")
+    final["TitleKeywordMatches"] = result.get("TitleKeywordMatches", "")
+    final["OriginalURLVerified"] = result.get("OriginalURLVerified", "")
+    final["URLQuality"] = result.get("URLQuality", "")
     final["IssueClusterKey"] = result.get("IssueClusterKey", "")
     final["ClusterSize"] = result.get("ClusterSize", 1)
     final["DuplicateCount"] = result.get("DuplicateCount", 0)
@@ -1707,8 +1797,24 @@ def finalize(df: pd.DataFrame) -> pd.DataFrame:
     final["Importance"] = result["Importance"]
     final["Category"] = result["Category"]
     final["URLRestoreStatus"] = result.get("URLRestoreStatus", "")
+    # FINAL CORE v6: Step2 sources use mixed naming (url_decode_status / URLDecodeStatus).
+    # Always create URLDecodeStatus before slicing FINAL_COLS to prevent KeyError.
+    if "URLDecodeStatus" in result.columns:
+        final["URLDecodeStatus"] = result["URLDecodeStatus"]
+    elif "url_decode_status" in result.columns:
+        final["URLDecodeStatus"] = result["url_decode_status"]
+    elif "URLRestoreStatus" in final.columns:
+        final["URLDecodeStatus"] = final["URLRestoreStatus"]
+    else:
+        final["URLDecodeStatus"] = ""
     final["Step4Hint"] = result.get("Step4Hint", "")
     final["SourceScoreReason"] = result.get("SourceScoreReason", "")
+
+    # Safety net: if future schema columns are added, create missing output columns as blank
+    # instead of failing the pipeline after a long collection run.
+    for _col in FINAL_COLS:
+        if _col not in final.columns:
+            final[_col] = ""
 
     return final[FINAL_COLS].reset_index(drop=True)
 
@@ -1769,6 +1875,14 @@ def standardize_cumulative_columns(df: pd.DataFrame) -> pd.DataFrame:
             rename_map[col] = "RepresentativeReason"
         elif lower in ["keywordmatches", "keyword_matches", "keyword"]:
             rename_map[col] = "KeywordMatches"
+        elif lower in ["titlekeywordflag", "title_keyword_flag"]:
+            rename_map[col] = "TitleKeywordFlag"
+        elif lower in ["titlekeywordmatches", "title_keyword_matches"]:
+            rename_map[col] = "TitleKeywordMatches"
+        elif lower in ["originalurlverified", "original_url_verified"]:
+            rename_map[col] = "OriginalURLVerified"
+        elif lower in ["urlquality", "url_quality"]:
+            rename_map[col] = "URLQuality"
         elif lower in ["selectreason", "select_reason"]:
             rename_map[col] = "SelectReason"
         elif lower in ["rejectreason", "reject_reason"]:
@@ -1815,11 +1929,56 @@ def make_merge_key(row: pd.Series) -> str:
     return ""
 
 
+def make_title_source_key(row: pd.Series) -> str:
+    headline = clean(row.get("Headline", "")).lower()
+    source = clean(row.get("Source", "") or row.get("Publisher", "") or row.get("Agency", "")).lower()
+    if not headline:
+        return ""
+    normalized_headline = re.sub(
+        r"\s+",
+        " ",
+        re.sub(r"[^0-9a-z가-힣一-龥ぁ-ゔァ-ヴー\s]", " ", headline),
+    ).strip()
+    normalized_source = re.sub(
+        r"\s+",
+        " ",
+        re.sub(r"[^0-9a-z가-힣一-龥ぁ-ゔァ-ヴー\s]", " ", source),
+    ).strip()
+    return f"{normalized_source}|{normalized_headline}" if normalized_headline else ""
+
+
+def has_headline_and_link(row: pd.Series) -> bool:
+    if not clean(row.get("Headline", "")):
+        return False
+    for col in ["OriginalURLCandidate", "BestLinkURL", "URL", "GoogleURL"]:
+        if clean(row.get(col, "")).startswith("http"):
+            return True
+    return False
+
+
 def update_cumulative(final_df: pd.DataFrame, cumulative_file: Path) -> pd.DataFrame:
     new_df = standardize_cumulative_columns(final_df)
+    before_required = len(new_df)
+    if before_required:
+        new_df = new_df[new_df.apply(has_headline_and_link, axis=1)].copy()
+        removed_required = before_required - len(new_df)
+        if removed_required:
+            log(f"cumulative required fields removed: {removed_required} rows without headline/url")
 
     if cumulative_file.exists():
-        old = standardize_cumulative_columns(pd.read_excel(cumulative_file))
+        try:
+            old = standardize_cumulative_columns(pd.read_excel(cumulative_file, engine="openpyxl"))
+        except Exception as exc:
+            old = pd.DataFrame(columns=FINAL_COLS)
+            backup = cumulative_file.with_name(
+                f"{cumulative_file.stem}_read_error_{datetime.now().strftime('%Y%m%d_%H%M%S')}{cumulative_file.suffix}"
+            )
+            try:
+                shutil.copy2(cumulative_file, backup)
+                log(f"WARN cumulative read failed; backup saved: {backup.name}")
+            except Exception as backup_exc:
+                log(f"WARN cumulative backup failed: {type(backup_exc).__name__}: {backup_exc}")
+            log(f"WARN cumulative read failed -> new create: {cumulative_file} / {type(exc).__name__}: {exc}")
         old_count = len(old)
         log(f"cumulative 기존파일 로드: {old_count} rows")
     else:
@@ -1833,21 +1992,31 @@ def update_cumulative(final_df: pd.DataFrame, cumulative_file: Path) -> pd.DataF
 
     # URL 기준 누적 비교만 수행한다. 빈 URL은 cumulative 중복 비교 대상에서 제외한다.
     old_keys = set()
+    old_title_source_keys = set()
     if not old.empty:
         old_keys = {key for key in old.apply(make_merge_key, axis=1).astype(str) if key}
+        old_title_source_keys = {key for key in old.apply(make_title_source_key, axis=1).astype(str) if key}
 
     new_df = new_df.copy()
     new_df["_merge_key"] = new_df.apply(make_merge_key, axis=1)
+    new_df["_title_source_key"] = new_df.apply(make_title_source_key, axis=1)
 
     additions = new_df[
         (new_df["_merge_key"].astype(str).eq(""))
         | (~new_df["_merge_key"].astype(str).isin(old_keys))
-    ].drop(columns=["_merge_key"])
+    ].copy()
+    additions = additions[
+        (additions["_title_source_key"].astype(str).eq(""))
+        | (~additions["_title_source_key"].astype(str).isin(old_title_source_keys))
+    ].drop(columns=["_merge_key", "_title_source_key"])
     combined = pd.concat([old, additions], ignore_index=True, sort=False)
 
     if len(combined) < old_count:
         raise RuntimeError(f"cumulative row count decreased: old={old_count}, new={len(combined)}")
 
+    for _col in FINAL_COLS:
+        if _col not in combined.columns:
+            combined[_col] = ""
     log(f"cumulative update complete: {old_count} + {len(additions)} → {len(combined)} rows")
     return combined[FINAL_COLS]
 
@@ -1934,6 +2103,16 @@ def main() -> None:
     df = cluster_policy_events(df)
 
     final_df = finalize(df)
+    if not final_df.empty:
+        title_kw_count = int(final_df["TitleKeywordFlag"].astype(str).str.upper().eq("Y").sum()) if "TitleKeywordFlag" in final_df.columns else 0
+        original_verified_count = int(final_df["OriginalURLVerified"].astype(str).str.upper().eq("Y").sum()) if "OriginalURLVerified" in final_df.columns else 0
+        needs_selenium_count = int(final_df["URLQuality"].astype(str).eq("NEEDS_SELENIUM_RESOLVE").sum()) if "URLQuality" in final_df.columns else 0
+        log(
+            "STEP3 quality: "
+            f"title_keyword={title_kw_count}/{len(final_df)}, "
+            f"original_verified={original_verified_count}/{len(final_df)}, "
+            f"needs_selenium={needs_selenium_count}"
+        )
     cumulative_df = update_cumulative(final_df, args.cumulative)
 
     write_excel(args.output, final_df, "news_summary")
@@ -1946,3 +2125,5 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
+
+

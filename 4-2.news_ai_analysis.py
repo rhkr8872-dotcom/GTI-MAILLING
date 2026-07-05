@@ -4457,9 +4457,11 @@ def _strict_is_bad_url(row: pd.Series) -> bool:
 
 
 def _strict_recalibrate_impact(row: pd.Series) -> str:
-    blob = _strict_blob(row)
+    # Use only original article/title/source signals for impact recalibration.
+    # Generated Summary/AI Analysis often contains generic "Samsung" wording and should not
+    # create Direct/Indirect impact or hard policy signal by itself.
     original_blob = _strict_original_signal_blob(row)
-    strong_policy = _strict_has_any(blob, STRICT_STRONG_POLICY_TERMS)
+    strong_policy = _strict_has_any(original_blob, STRICT_STRONG_POLICY_TERMS)
     samsung_exact = _strict_has_any(original_blob, SAMSUNG_EXACT_TERMS)
     product = _strict_has_any(original_blob, STRICT_PRODUCT_TERMS)
     official = is_official_source(row)
@@ -4508,15 +4510,32 @@ def _strict_apply_final_guard(daily: pd.DataFrame, audit: pd.DataFrame, excluded
 
     reject_idx = []
     for idx, row in audit.iterrows():
-        blob = _strict_blob(row)
+        # Reject decisions must be based on original article signals, not Gemini-generated prose.
+        blob = _strict_original_signal_blob(row)
         rr = _strict_reject_reason_set(row)
         reasons = []
         if _strict_is_bad_url(row):
             reasons.append("strict_bad_or_unresolved_url")
         if rr and any(h in rr for h in STRICT_HARD_REJECT_REASONS):
-            # Some older v12 reasons are too broad. Keep only if the row lacks concrete policy signal.
-            broad_only = rr <= {"v12_hard_reference_or_noise", "v12_no_customs_trade_action_signal", "weighted_v18_not_topN_or_noise", "weak_samsung_relevance", "report_issue_duplicate_compressed"}
-            if (not broad_only) or (not _strict_has_any(blob, STRICT_STRONG_POLICY_TERMS)):
+            # Older ranking/weak-Samsung reasons are broad screening hints, not final hard rejects.
+            # Keep rows when the article still has concrete customs/trade law signal and a reportable
+            # Samsung impact class (Direct/Indirect/Watch). This preserves Samsung customs-work impact
+            # sensing without mailing pure Reference/noise items.
+            broad_prior_reasons = {
+                "v12_hard_reference_or_noise",
+                "v12_no_customs_trade_action_signal",
+                "weighted_v18_not_topN_or_noise",
+                "v20_major_title_or_weighted_below_topN_or_noise",
+                "weak_samsung_relevance",
+                "report_issue_duplicate_compressed",
+                "expanded_policy_watch",
+                "strict_existing_hard_reject",
+            }
+            reportable_trade_signal = (
+                _strict_has_any(blob, STRICT_STRONG_POLICY_TERMS)
+                and clean(row.get("samsung_impact")) in {"Direct", "Indirect", "Watch"}
+            )
+            if (not rr <= broad_prior_reasons) or (not reportable_trade_signal):
                 reasons.append("strict_existing_hard_reject")
         if _strict_has_any(blob, STRICT_DIGEST_OR_LOWVALUE_TITLES):
             reasons.append("strict_digest_politics_market_noise")
@@ -4648,6 +4667,74 @@ def _strict_apply_final_guard(daily: pd.DataFrame, audit: pd.DataFrame, excluded
         audit.loc[drop_idx, "mail_section"] = "Excluded"
         audit.loc[drop_idx, "RejectReason"] = audit.loc[drop_idx, "RejectReason"].apply(lambda v: append_reason(v, "v23_no_title_keyword"))
         log(f"Title keyword strict guard v23 removed selected news without title keyword: {len(drop_idx)}")
+
+    # If strict filtering leaves too few items, backfill with reportable Samsung customs-impact
+    # candidates. Backfill still enforces original URL quality, title keyword, original article
+    # customs/trade signal, and excludes event/finance/general-noise rows.
+    current_selected = audit["selected"].astype(str).str.upper().eq("Y")
+    if current_selected.sum() < GTI_STRICT_NEWS_TARGET_MAX:
+        hard_backfill_tokens = (
+            "event_training_tender_noise",
+            "financial_industry_noise_without_trade_policy",
+            "samsung_general_business_noise",
+            "general_economy_without_samsung_policy",
+            "low_value_general_news",
+            "strict_digest_politics_market_noise",
+            "strict_no_concrete_customs_trade_signal",
+            "strict_reference_not_reportable",
+            "strict_bad_or_unresolved_url",
+            "google_news_original_url_unresolved",
+            "no_valid_url",
+            "old_news>",
+        )
+
+        def _v23_backfill_keep(row: pd.Series) -> bool:
+            rr_low = clean(row.get("RejectReason")).lower()
+            if any(tok in rr_low for tok in hard_backfill_tokens):
+                return False
+            if _strict_is_bad_url(row):
+                return False
+            if GTI_NEWS_TITLE_KEYWORD_REQUIRED and not _v23_title_has_keyword(row):
+                return False
+            blob = _strict_original_signal_blob(row)
+            if not _strict_has_any(blob, STRICT_STRONG_POLICY_TERMS):
+                return False
+            impact = clean(row.get("samsung_impact")) or _strict_recalibrate_impact(row)
+            return impact in {"Direct", "Indirect", "Watch"}
+
+        fill = audit[~current_selected].copy()
+        if not fill.empty:
+            fill = fill[fill.apply(_v23_backfill_keep, axis=1)].copy()
+        if not fill.empty:
+            if "WeightedScore" not in fill.columns:
+                fill["WeightedScore"] = 0
+
+            def _strict_num(value: object) -> float:
+                try:
+                    if pd.isna(value):
+                        return 0.0
+                    return float(value)
+                except Exception:
+                    return 0.0
+
+            fill["_strict_backfill_score"] = fill.apply(
+                lambda r: _strict_num(r.get("samsung_impact_score")) * 1000
+                + _strict_num(r.get("WeightedScore")) * 10
+                + _strict_num(r.get("final_score"))
+                + _strict_num(r.get("topic_score")),
+                axis=1,
+            )
+            sort_cols = ["_strict_backfill_score"] + [c for c in ["Date"] if c in fill.columns]
+            fill = fill.sort_values(sort_cols, ascending=[False] * len(sort_cols))
+            need = max(0, GTI_STRICT_NEWS_TARGET_MAX - int(current_selected.sum()))
+            fill_idx = fill.head(need).index
+            if len(fill_idx):
+                audit.loc[fill_idx, "selected"] = "Y"
+                audit.loc[fill_idx, "Risk"] = audit.loc[fill_idx, "Risk"].replace({"?": "?", "": "?"})
+                audit.loc[fill_idx, "priority_group"] = audit.loc[fill_idx, "samsung_impact"].apply(lambda x: "CORE" if x == "Direct" else "POLICY_WATCH" if x == "Watch" else "USABLE")
+                audit.loc[fill_idx, "mail_section"] = audit.loc[fill_idx, "samsung_impact"].apply(lambda x: "News Core" if x == "Direct" else "Policy Watch" if x == "Watch" else "News Usable")
+                audit.loc[fill_idx, "RejectReason"] = audit.loc[fill_idx, "RejectReason"].apply(lambda v: append_reason(v, "strict_backfill_reportable_policy"))
+                log(f"Title keyword strict guard v23 backfilled reportable news: {len(fill_idx)}")
 
     daily = audit[audit["selected"].astype(str).str.upper().eq("Y")].copy()
     if not daily.empty:
