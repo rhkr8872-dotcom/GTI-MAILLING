@@ -8,6 +8,7 @@ on:
   workflow_dispatch:
 
 env:
+  # Node.js 24 강제 환경 변수는 액션 버전 업데이트로 더 이상 필요하지 않으나 원본 유지를 위해 남겨둡니다.
   FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
   PYTHONIOENCODING: utf-8
   PYTHONUTF8: "1"
@@ -43,10 +44,10 @@ jobs:
 
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6 # 🔄 v4 -> v6 업데이트 (Node 24 내장 지원)
 
       - name: Set up Python
-        uses: actions/setup-python@v5
+        uses: actions/setup-python@v6 # 🔄 v5 -> v6 업데이트 (Node 24 내장 지원)
         with:
           python-version: "3.12"
 
@@ -101,7 +102,7 @@ jobs:
 
       - name: Upload Artifacts
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7 # 🔄 v4 -> v7 업데이트 (Node 24 내장 지원)
         with:
           name: gti-radar-output
           path: outputs
