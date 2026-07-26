@@ -752,10 +752,16 @@ TRADE_NEWS_CONTEXT_TERMS = [
     "anti-dumping", "antidumping", "countervailing", "safeguard", "section 301",
     "section 232", "export control", "entity list", "uflpa", "forced labor",
     "cbam", "carbon border", "quota", "sanction",
+    "de minimis", "low value consignment", "small parcel", "parcel duty",
+    "customs valuation", "manifestacion de valor", "manifestación de valor",
+    "mve", "bonded warehouse", "free zone", "transshipment", "circumvention",
     "\uad00\uc138", "\ud1b5\uad00", "\ud1b5\uc0c1", "\ubb34\uc5ed", "\uc218\uc785", "\uc218\ucd9c",
     "\uc6d0\uc0b0\uc9c0", "\ud488\ubaa9\ubd84\ub958", "\uc138\uc728", "\ud658\uae09", "\ubcf4\uc138",
     "\ubc18\ub364\ud551", "\uc0c1\uacc4\uad00\uc138", "\ub364\ud551\ubc29\uc9c0\uad00\uc138",
     "\uc218\ucd9c\ud1b5\uc81c", "\uac15\uc81c\ub178\ub3d9", "\ud560\ub2f9\uad00\uc138",
+    "\uc18c\uc561", "\uc18c\ud3ec\uc7a5", "\uc9c1\uad6c", "\uba74\uc138", "\uac00\uce58\uc2e0\uace0",
+    "\uac00\uce58\uc120\uc5b8", "\ubcf4\uc138\ucc3d\uace0", "\uc6b0\ud68c\uc218\ucd9c",
+    "\ubd88\ubc95\uc218\ucd9c", "\uc804\ub7b5\ubb3c\uc790",
 ]
 
 NEWS_NOISE_TERMS = [
@@ -769,9 +775,13 @@ NEWS_NOISE_TERMS = [
 
 NEWS_FORCE_KEEP_TERMS = [
     "tariff", "customs", "anti-dumping", "countervailing", "export control",
-    "section 301", "section 232", "fta", "cbam",
+    "section 301", "section 232", "fta", "cbam", "de minimis", "customs valuation",
+    "manifestacion de valor", "manifestación de valor", "mve", "bonded warehouse",
+    "transshipment", "circumvention",
     "\uad00\uc138", "\ud1b5\uad00", "\ubc18\ub364\ud551", "\uc0c1\uacc4\uad00\uc138",
     "\uc218\ucd9c\ud1b5\uc81c", "\uc6d0\uc0b0\uc9c0", "\ud488\ubaa9\ubd84\ub958",
+    "\uc18c\uc561", "\uc18c\ud3ec\uc7a5", "\uc9c1\uad6c", "\uba74\uc138", "\uac00\uce58\uc2e0\uace0",
+    "\ubcf4\uc138\ucc3d\uace0", "\uc6b0\ud68c\uc218\ucd9c", "\ubd88\ubc95\uc218\ucd9c", "\uc804\ub7b5\ubb3c\uc790",
 ]
 
 

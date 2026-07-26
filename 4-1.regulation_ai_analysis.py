@@ -30,6 +30,7 @@ KEYWORD_FILE = BASE_DIR / "keyword.xlsx"
 OUT_SUMMARY = BASE_DIR / "4-1.regulation_ai_summary.xlsx"
 OUT_CUMULATIVE = BASE_DIR / "4-1.regulation_ai_cumulative.xlsx"
 OUT_EXCLUDED = BASE_DIR / "4-1.regulation_ai_excluded.xlsx"
+OUT_DIAGNOSTIC = BASE_DIR / "4-1.regulation_ai_diagnostic.xlsx"
 
 MAX_AGE_DAYS = int(os.getenv("GTI_STEP4_REG_MAX_AGE_DAYS", "90"))
 TOP_N_MAX = int(os.getenv("GTI_STEP4_REG_TOP_N_MAX", "9999"))
@@ -834,6 +835,53 @@ def write_excel(df,path):
     try: df.to_excel(path,index=False)
     except PermissionError:
         alt=path.with_name(path.stem+f"_{datetime.now():%Y%m%d_%H%M%S}"+path.suffix); df.to_excel(alt,index=False); log(f"SAVE fallback: {alt}")
+
+
+def write_regulation_diagnostic(input_df, raw_daily, daily, excluded):
+    rows = [
+        {"metric": "input_rows", "value": 0 if input_df is None else len(input_df), "note": "Rows loaded from STEP3 regulation article summary"},
+        {"metric": "pre_final_selected_rows", "value": 0 if raw_daily is None else len(raw_daily), "note": "Rows selected before final Samsung customs regulation gate"},
+        {"metric": "final_daily_rows", "value": 0 if daily is None else len(daily), "note": "Rows written to 4-1.regulation_ai_summary.xlsx"},
+        {"metric": "excluded_rows", "value": 0 if excluded is None else len(excluded), "note": "Rows written to 4-1.regulation_ai_excluded.xlsx"},
+    ]
+
+    reason_df = pd.DataFrame(columns=["RejectReason", "count"])
+    if excluded is not None and not excluded.empty and "RejectReason" in excluded.columns:
+        reason_df = (
+            excluded["RejectReason"]
+            .fillna("")
+            .astype(str)
+            .str.split(";")
+            .explode()
+            .str.strip()
+            .replace("", pd.NA)
+            .dropna()
+            .value_counts()
+            .reset_index()
+        )
+        reason_df.columns = ["RejectReason", "count"]
+
+    sample_cols = [
+        c for c in [
+            "Date", "Headline", "Issue", "Samsung Impact", "Importance Score",
+            "RejectReason", "KeywordMatches", "URL", "article_extract_status",
+        ]
+        if excluded is not None and c in excluded.columns
+    ]
+    sample_df = excluded[sample_cols].head(50).copy() if sample_cols else pd.DataFrame()
+
+    try:
+        with pd.ExcelWriter(OUT_DIAGNOSTIC, engine="openpyxl") as writer:
+            pd.DataFrame(rows).to_excel(writer, index=False, sheet_name="summary")
+            reason_df.to_excel(writer, index=False, sheet_name="reject_reasons")
+            sample_df.to_excel(writer, index=False, sheet_name="excluded_sample")
+    except PermissionError:
+        alt = OUT_DIAGNOSTIC.with_name(OUT_DIAGNOSTIC.stem + f"_{datetime.now():%Y%m%d_%H%M%S}" + OUT_DIAGNOSTIC.suffix)
+        with pd.ExcelWriter(alt, engine="openpyxl") as writer:
+            pd.DataFrame(rows).to_excel(writer, index=False, sheet_name="summary")
+            reason_df.to_excel(writer, index=False, sheet_name="reject_reasons")
+            sample_df.to_excel(writer, index=False, sheet_name="excluded_sample")
+        log(f"SAVE fallback: {alt}")
 
 
 # ======================================================================
@@ -2850,8 +2898,10 @@ def main():
         excluded = pd.concat([excluded, removed_daily], ignore_index=True, sort=False)
     cumulative=merge_cumulative(daily)
     write_excel(daily, OUT_SUMMARY); write_excel(cumulative, OUT_CUMULATIVE); write_excel(excluded, OUT_EXCLUDED)
+    write_regulation_diagnostic(df, raw_daily, daily, excluded)
     print(f"[DONE] Daily: {OUT_SUMMARY}")
     print(f"[DONE] Cumulative: {OUT_CUMULATIVE}")
     print(f"[DONE] Excluded: {OUT_EXCLUDED}")
+    print(f"[DONE] Diagnostic: {OUT_DIAGNOSTIC}")
     print(f"[ROWS] daily={len(daily)}, cumulative={len(cumulative)}, excluded={len(excluded)}")
 if __name__ == "__main__": main()

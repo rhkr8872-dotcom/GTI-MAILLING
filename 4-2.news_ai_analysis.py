@@ -4457,11 +4457,9 @@ def _strict_is_bad_url(row: pd.Series) -> bool:
 
 
 def _strict_recalibrate_impact(row: pd.Series) -> str:
-    # Use only original article/title/source signals for impact recalibration.
-    # Generated Summary/AI Analysis often contains generic "Samsung" wording and should not
-    # create Direct/Indirect impact or hard policy signal by itself.
+    blob = _strict_blob(row)
     original_blob = _strict_original_signal_blob(row)
-    strong_policy = _strict_has_any(original_blob, STRICT_STRONG_POLICY_TERMS)
+    strong_policy = _strict_has_any(blob, STRICT_STRONG_POLICY_TERMS)
     samsung_exact = _strict_has_any(original_blob, SAMSUNG_EXACT_TERMS)
     product = _strict_has_any(original_blob, STRICT_PRODUCT_TERMS)
     official = is_official_source(row)
@@ -4510,32 +4508,15 @@ def _strict_apply_final_guard(daily: pd.DataFrame, audit: pd.DataFrame, excluded
 
     reject_idx = []
     for idx, row in audit.iterrows():
-        # Reject decisions must be based on original article signals, not Gemini-generated prose.
-        blob = _strict_original_signal_blob(row)
+        blob = _strict_blob(row)
         rr = _strict_reject_reason_set(row)
         reasons = []
         if _strict_is_bad_url(row):
             reasons.append("strict_bad_or_unresolved_url")
         if rr and any(h in rr for h in STRICT_HARD_REJECT_REASONS):
-            # Older ranking/weak-Samsung reasons are broad screening hints, not final hard rejects.
-            # Keep rows when the article still has concrete customs/trade law signal and a reportable
-            # Samsung impact class (Direct/Indirect/Watch). This preserves Samsung customs-work impact
-            # sensing without mailing pure Reference/noise items.
-            broad_prior_reasons = {
-                "v12_hard_reference_or_noise",
-                "v12_no_customs_trade_action_signal",
-                "weighted_v18_not_topN_or_noise",
-                "v20_major_title_or_weighted_below_topN_or_noise",
-                "weak_samsung_relevance",
-                "report_issue_duplicate_compressed",
-                "expanded_policy_watch",
-                "strict_existing_hard_reject",
-            }
-            reportable_trade_signal = (
-                _strict_has_any(blob, STRICT_STRONG_POLICY_TERMS)
-                and clean(row.get("samsung_impact")) in {"Direct", "Indirect", "Watch"}
-            )
-            if (not rr <= broad_prior_reasons) or (not reportable_trade_signal):
+            # Some older v12 reasons are too broad. Keep only if the row lacks concrete policy signal.
+            broad_only = rr <= {"v12_hard_reference_or_noise", "v12_no_customs_trade_action_signal", "weighted_v18_not_topN_or_noise", "weak_samsung_relevance", "report_issue_duplicate_compressed"}
+            if (not broad_only) or (not _strict_has_any(blob, STRICT_STRONG_POLICY_TERMS)):
                 reasons.append("strict_existing_hard_reject")
         if _strict_has_any(blob, STRICT_DIGEST_OR_LOWVALUE_TITLES):
             reasons.append("strict_digest_politics_market_noise")
@@ -4605,7 +4586,26 @@ def _strict_apply_final_guard(daily: pd.DataFrame, audit: pd.DataFrame, excluded
     out_cols = list(dict.fromkeys(OUTPUT_COLS + extra_cols))
     return daily[out_cols], audit[out_cols], excluded[out_cols]
 
-
+# [AI 판정 강화 섹션]
+def _strict_apply_final_guard(daily, audit, excluded):
+    """
+    삼성전자 실무 영향도가 낮은 기사(NO)를 과감히 필터링
+    """
+    # 삼성 영향도 판정 열이 없는 경우 제외
+    if "Samsung Impact" not in daily.columns:
+        return daily, audit, excluded
+    
+    # 실제 삼성전자 실무에 영향을 주는 이슈만 유지
+    # 영향도가 'NO'인 경우 excluded로 이동
+    mask_to_exclude = daily["Samsung Impact"].astype(str).str.upper() == "NO"
+    
+    to_move = daily[mask_to_exclude]
+    daily = daily[~mask_to_exclude]
+    
+    excluded = pd.concat([excluded, to_move], ignore_index=True)
+    
+    print(f"[GUARDRAIL] Filtered out {len(to_move)} items with NO impact.")
+    return daily, audit, excluded
 
 # ======================================================================
 # GTI STEP4-2 TITLE KEYWORD STRICT GUARD v23
@@ -4668,74 +4668,6 @@ def _strict_apply_final_guard(daily: pd.DataFrame, audit: pd.DataFrame, excluded
         audit.loc[drop_idx, "RejectReason"] = audit.loc[drop_idx, "RejectReason"].apply(lambda v: append_reason(v, "v23_no_title_keyword"))
         log(f"Title keyword strict guard v23 removed selected news without title keyword: {len(drop_idx)}")
 
-    # If strict filtering leaves too few items, backfill with reportable Samsung customs-impact
-    # candidates. Backfill still enforces original URL quality, title keyword, original article
-    # customs/trade signal, and excludes event/finance/general-noise rows.
-    current_selected = audit["selected"].astype(str).str.upper().eq("Y")
-    if current_selected.sum() < GTI_STRICT_NEWS_TARGET_MAX:
-        hard_backfill_tokens = (
-            "event_training_tender_noise",
-            "financial_industry_noise_without_trade_policy",
-            "samsung_general_business_noise",
-            "general_economy_without_samsung_policy",
-            "low_value_general_news",
-            "strict_digest_politics_market_noise",
-            "strict_no_concrete_customs_trade_signal",
-            "strict_reference_not_reportable",
-            "strict_bad_or_unresolved_url",
-            "google_news_original_url_unresolved",
-            "no_valid_url",
-            "old_news>",
-        )
-
-        def _v23_backfill_keep(row: pd.Series) -> bool:
-            rr_low = clean(row.get("RejectReason")).lower()
-            if any(tok in rr_low for tok in hard_backfill_tokens):
-                return False
-            if _strict_is_bad_url(row):
-                return False
-            if GTI_NEWS_TITLE_KEYWORD_REQUIRED and not _v23_title_has_keyword(row):
-                return False
-            blob = _strict_original_signal_blob(row)
-            if not _strict_has_any(blob, STRICT_STRONG_POLICY_TERMS):
-                return False
-            impact = clean(row.get("samsung_impact")) or _strict_recalibrate_impact(row)
-            return impact in {"Direct", "Indirect", "Watch"}
-
-        fill = audit[~current_selected].copy()
-        if not fill.empty:
-            fill = fill[fill.apply(_v23_backfill_keep, axis=1)].copy()
-        if not fill.empty:
-            if "WeightedScore" not in fill.columns:
-                fill["WeightedScore"] = 0
-
-            def _strict_num(value: object) -> float:
-                try:
-                    if pd.isna(value):
-                        return 0.0
-                    return float(value)
-                except Exception:
-                    return 0.0
-
-            fill["_strict_backfill_score"] = fill.apply(
-                lambda r: _strict_num(r.get("samsung_impact_score")) * 1000
-                + _strict_num(r.get("WeightedScore")) * 10
-                + _strict_num(r.get("final_score"))
-                + _strict_num(r.get("topic_score")),
-                axis=1,
-            )
-            sort_cols = ["_strict_backfill_score"] + [c for c in ["Date"] if c in fill.columns]
-            fill = fill.sort_values(sort_cols, ascending=[False] * len(sort_cols))
-            need = max(0, GTI_STRICT_NEWS_TARGET_MAX - int(current_selected.sum()))
-            fill_idx = fill.head(need).index
-            if len(fill_idx):
-                audit.loc[fill_idx, "selected"] = "Y"
-                audit.loc[fill_idx, "Risk"] = audit.loc[fill_idx, "Risk"].replace({"?": "?", "": "?"})
-                audit.loc[fill_idx, "priority_group"] = audit.loc[fill_idx, "samsung_impact"].apply(lambda x: "CORE" if x == "Direct" else "POLICY_WATCH" if x == "Watch" else "USABLE")
-                audit.loc[fill_idx, "mail_section"] = audit.loc[fill_idx, "samsung_impact"].apply(lambda x: "News Core" if x == "Direct" else "Policy Watch" if x == "Watch" else "News Usable")
-                audit.loc[fill_idx, "RejectReason"] = audit.loc[fill_idx, "RejectReason"].apply(lambda v: append_reason(v, "strict_backfill_reportable_policy"))
-                log(f"Title keyword strict guard v23 backfilled reportable news: {len(fill_idx)}")
-
     daily = audit[audit["selected"].astype(str).str.upper().eq("Y")].copy()
     if not daily.empty:
         sort_cols = [c for c in ["samsung_impact_score", "WeightedScore", "final_score", "topic_score", "Date"] if c in daily.columns]
@@ -4756,6 +4688,108 @@ def _strict_apply_final_guard(daily: pd.DataFrame, audit: pd.DataFrame, excluded
 # ======================================================================
 # End of GTI STEP4-2 Strict Final Guard v22
 # ======================================================================
+
+# ======================================================================
+# GTI STEP4-2 OFFICIAL TRADE NEWS RESCUE v24
+# ----------------------------------------------------------------------
+# User operating rule:
+# - Main news 후보: customs/trade 업무 관련이면 삼성 직접 영향이 없어도 후보.
+# - Korea Customs press releases and official trade notices with critical terms
+#   must not be excluded merely because Samsung relevance is weak.
+# - Top3 relevance is handled later by Step5; Step4-2 should preserve the news.
+# ======================================================================
+
+print("[INFO] STEP4-2 OFFICIAL TRADE NEWS RESCUE v24 loaded")
+
+_V24_OFFICIAL_TRADE_NEWS_TERMS = [
+    "관세청", "korea customs", "customs.go.kr", "보도자료", "press release", "공지", "공고",
+    "멤브레인", "membrane", "무관세", "duty-free", "duty free", "관세면제", "면세",
+    "cbam", "carbon border", "탄소국경", "탄소국경조정",
+    "사후관리", "post-clearance", "post clearance", "post audit", "사후심사",
+    "관세", "통관", "세관", "수입신고", "수출신고", "보세", "환급",
+    "원산지", "fta", "cepa", "품목분류", "hs code", "hs코드", "수출통제", "전략물자",
+    "반덤핑", "상계관세", "anti-dumping", "countervailing", "safeguard",
+]
+
+_V24_KCS_SOURCE_TERMS = ["관세청", "korea customs", "customs.go.kr", "kcs", "ftaportalkor"]
+
+
+def _v24_row_blob(row) -> str:
+    cols = [
+        "Headline", "Title", "Summary", "AI Analysis", "Action Plan", "URL", "BestLinkURL", "GoogleURL",
+        "OriginalURLCandidate", "Source", "Agency", "Publisher", "KeywordMatches", "Issue", "IssueKey",
+        "Category", "SourceFile", "article_body", "body", "content", "SelectReason", "Step4Hint",
+    ]
+    parts=[]
+    for c in cols:
+        try:
+            parts.append(str(row.get(c, "") or ""))
+        except Exception:
+            pass
+    return " ".join(parts).lower()
+
+
+def _v24_is_official_trade_news(row) -> bool:
+    blob = _v24_row_blob(row)
+    has_trade = any(t.lower() in blob for t in _V24_OFFICIAL_TRADE_NEWS_TERMS)
+    has_kcs = any(t.lower() in blob for t in _V24_KCS_SOURCE_TERMS)
+    critical = any(t in blob for t in ["cbam", "탄소국경", "멤브레인", "membrane", "무관세", "duty-free", "duty free", "사후관리"])
+    return bool((has_trade and has_kcs) or critical)
+
+
+def _v24_dedup_append_daily(daily: pd.DataFrame, rescue: pd.DataFrame) -> pd.DataFrame:
+    if rescue is None or rescue.empty:
+        return daily
+    d = daily.copy() if daily is not None else pd.DataFrame()
+    r = rescue.copy()
+    r["selected"] = "Y"
+    for col in ["priority_group", "Priority Group"]:
+        if col in r.columns:
+            r[col] = r[col].replace({"EXCLUDED":"POLICY_WATCH", "REJECT":"POLICY_WATCH", "REFERENCE":"USABLE", "":"USABLE"}).fillna("USABLE")
+    for col in ["samsung_impact", "Samsung Impact"]:
+        if col in r.columns:
+            r[col] = r[col].replace({"Reference":"Watch", "":"Watch"}).fillna("Watch")
+    if "RejectReason" in r.columns:
+        r["RejectReason"] = ""
+    if "final_score" in r.columns:
+        try:
+            r["final_score"] = pd.to_numeric(r["final_score"], errors="coerce").fillna(70).clip(lower=70)
+        except Exception:
+            pass
+    combined = pd.concat([d, r], ignore_index=True, sort=False)
+    # Keep original title fixed; only de-duplicate by URL then Headline.
+    for keycol in ["BestLinkURL", "URL", "Headline"]:
+        if keycol in combined.columns:
+            combined = combined.drop_duplicates(subset=[keycol], keep="first")
+    if "rank" in combined.columns:
+        combined["rank"] = range(1, len(combined)+1)
+    return combined.reset_index(drop=True)
+
+try:
+    _v24_base_strict_apply_final_guard = _strict_apply_final_guard
+    def _strict_apply_final_guard(daily, audit, excluded):
+        daily2, audit2, excluded2 = _v24_base_strict_apply_final_guard(daily, audit, excluded)
+        frames=[]
+        for src in [audit, audit2, excluded, excluded2]:
+            if src is not None and not src.empty:
+                try:
+                    frames.append(src[src.apply(_v24_is_official_trade_news, axis=1)].copy())
+                except Exception:
+                    pass
+        if frames:
+            rescue = pd.concat(frames, ignore_index=True, sort=False).drop_duplicates(subset=[c for c in ["BestLinkURL", "URL", "Headline"] if c in frames[0].columns], keep="first")
+            before = len(daily2) if daily2 is not None else 0
+            daily2 = _v24_dedup_append_daily(daily2, rescue)
+            added = max(0, len(daily2)-before)
+            if added:
+                print(f"[INFO] v24 official trade news rescue added={added} candidates={len(rescue)}")
+            # Reflect selected flag in audit if possible
+            if audit2 is not None and not audit2.empty and "Headline" in audit2.columns:
+                keys = set(daily2.get("Headline", pd.Series(dtype=str)).astype(str))
+                audit2.loc[audit2["Headline"].astype(str).isin(keys), "selected"] = "Y"
+        return daily2, audit2, excluded2
+except Exception:
+    pass
 
 def main() -> None:
     print("[STEP4-2] News analysis start - GUARDRAIL v4.1")

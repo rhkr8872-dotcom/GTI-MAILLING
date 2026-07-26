@@ -237,9 +237,14 @@ TITLE_KEYWORD_TERMS = sorted(set(FALLBACK_TRADE_KEYWORDS + [
     "trade remedy", "export controls", "entity list", "uflpa", "forced labor",
     "free trade agreement", "rules of origin", "origin rule", "preference",
     "classification", "hs classification", "quota", "safeguard",
+    "de minimis", "small parcel", "low value consignment", "parcel duty",
+    "customs valuation", "manifestacion de valor", "manifestación de valor",
+    "mve", "bonded warehouse", "transshipment", "circumvention",
     "관세법", "관세청", "상호관세", "추가관세", "덤핑방지관세", "무역구제",
     "자유무역협정", "협정세율", "특혜관세", "원산지증명", "원산지 기준",
     "수출관리", "전략물자", "강제노동", "품목번호", "품목분류", "탄소국경",
+    "소액", "소포장", "직구", "면세", "가치신고", "가치선언",
+    "보세창고", "우회수출", "불법수출",
 ]), key=lambda x: x.lower())
 
 POLICY_RULES = [
@@ -252,7 +257,14 @@ POLICY_RULES = [
     ("ORIGIN_FTA", ["fta", "cepa", "usmca", "rules of origin", "origin", "원산지", "자유무역협정"]),
     ("EXPORT_CONTROL", ["export control", "export controls", "sanction", "restriction", "수출통제", "제재"]),
     ("CBAM_CARBON", ["cbam", "carbon border", "carbon tariff", "탄소국경"]),
-    ("CUSTOMS", ["customs", "clearance", "declaration", "통관", "세관"]),
+    ("CUSTOMS", [
+        "customs", "clearance", "declaration", "customs valuation",
+        "manifestacion de valor", "manifestación de valor", "mve",
+        "de minimis", "small parcel", "low value consignment", "bonded warehouse",
+        "transshipment", "circumvention",
+        "통관", "세관", "가치신고", "가치선언", "소액", "소포장", "직구",
+        "면세", "보세창고", "우회수출", "불법수출",
+    ]),
     ("HS_CLASSIFICATION", ["hs code", "classification", "품목분류", "hs코드"]),
 ]
 

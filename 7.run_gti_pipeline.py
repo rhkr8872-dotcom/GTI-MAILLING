@@ -79,6 +79,7 @@ class Step:
     expected_outputs: tuple[str, ...] = field(default_factory=tuple)
     args: tuple[str, ...] = field(default_factory=tuple)
     timeout_sec: int | None = None
+    min_rows: dict[str, int] = field(default_factory=dict)
 
 
 STAGE_1 = [
@@ -92,9 +93,9 @@ STAGE_1 = [
 ]
 
 STAGE_2 = [
-    Step("STEP2_NAVER", "2-1.NAVER_news_collector.py", required=False, expected_outputs=("2-1.naver_news_raw.xlsx",), timeout_sec=900),
-    Step("STEP2_GOOGLE", "2-2.google_news_collector.py", required=False, expected_outputs=("2-2.google_news_raw.xlsx",), timeout_sec=1200),
-    Step("STEP2_RSS", "2-3.rss_news_raw.py", required=False, expected_outputs=("2-3.rss_news_raw.xlsx",), timeout_sec=900),
+Step("STEP2_NAVER", "2-1.NAVER_news_collector.py", required=False, expected_outputs=("2-1.naver_news_raw.xlsx",), timeout_sec=900),
+Step("STEP2_GOOGLE", "2-2.google_news_collector.py", required=False, expected_outputs=("2-2.google_news_raw.xlsx",), timeout_sec=1200),
+Step("STEP2_RSS", "2-3.rss_news_raw.py", required=False, expected_outputs=("2-3.rss_news_raw.xlsx",), timeout_sec=900),
 ]
 
 STAGE_3 = [
@@ -103,6 +104,7 @@ STAGE_3 = [
         "3-2.news_merge.py",
         required=True,
         expected_outputs=("3-2.news_summary.xlsx", "3-2.news_cumulative.xlsx"),
+        min_rows={"3-2.news_summary.xlsx": 1},
         timeout_sec=1800,
     ),
 ]
@@ -117,6 +119,7 @@ STAGE_3_ARTICLE = [
             "3-2.news_article_summary.xlsx",
             "3-2.news_article_cluster_audit.xlsx",
         ),
+        min_rows={"3-2.news_article_summary.xlsx": 1},
         timeout_sec=14400,
     ),
 ]
@@ -134,6 +137,7 @@ STAGE_4 = [
         "4-2.news_ai_analysis.py",
         required=True,
         expected_outputs=("4-2.news_ai_summary.xlsx", "4-2.news_ai_cumulative.xlsx"),
+        min_rows={"4-2.news_ai_summary.xlsx": 1},
         timeout_sec=1800,
     ),
 ]
@@ -238,6 +242,17 @@ def file_has_rows(path: Path) -> bool:
         return False
 
 
+def excel_row_count(path: Path) -> int:
+    if not path.exists() or path.stat().st_size == 0:
+        return -1
+    if path.suffix.lower() not in {".xlsx", ".xls"}:
+        return 1
+    try:
+        return len(pd.read_excel(path))
+    except Exception:
+        return -1
+
+
 def mail_run_date() -> str:
     return os.getenv("GTI_RUN_DATE", datetime.now().strftime("%Y-%m-%d"))
 
@@ -252,7 +267,7 @@ def validate_mail_outputs() -> tuple[bool, list[str]]:
     return not missing_or_empty, missing_or_empty
 
 
-def validate_outputs(step: Step) -> tuple[bool, list[str]]:
+def validate_outputs(step: Step, started_at: float | None = None) -> tuple[bool, list[str]]:
     if step.name == "STEP5_MAIL_ENGINE":
         return validate_mail_outputs()
 
@@ -261,6 +276,15 @@ def validate_outputs(step: Step) -> tuple[bool, list[str]]:
         path = BASE_DIR / filename
         if not file_has_rows(path):
             missing_or_empty.append(filename)
+            continue
+        if started_at is not None and path.stat().st_mtime + 1 < started_at:
+            missing_or_empty.append(f"{filename} not refreshed")
+            continue
+        min_rows = step.min_rows.get(filename)
+        if min_rows is not None:
+            row_count = excel_row_count(path)
+            if row_count < min_rows:
+                missing_or_empty.append(f"{filename} rows={row_count} < min_rows={min_rows}")
     return not missing_or_empty, missing_or_empty
 
 
@@ -367,7 +391,7 @@ def run_script(step: Step, python_exe: str, dry_run: bool = False) -> str:
         log(f"{step.name} FAILED : return_code={return_code} / {elapsed} sec")
         return "FAILED" if step.required else "WARNING"
 
-    ok, bad_outputs = validate_outputs(step)
+    ok, bad_outputs = validate_outputs(step, started_at=start)
     if not ok:
         log(f"{step.name} OUTPUT CHECK FAILED : {', '.join(bad_outputs)}")
         return "FAILED" if step.required else "WARNING"
@@ -474,8 +498,14 @@ def build_mail_input() -> bool:
         try:
             df = pd.read_excel(path)
             df = normalize_mail_columns(df, category)
+            before = len(df)
+            df = df.dropna(how="all")
+            df = df[
+                (df["Headline"].fillna("").astype(str).str.strip() != "")
+                & (df["URL"].fillna("").astype(str).str.strip() != "")
+            ].copy()
             frames.append(df)
-            log(f"MAIL INPUT SOURCE OK : {path.name} / rows={len(df)}")
+            log(f"MAIL INPUT SOURCE OK : {path.name} / rows={len(df)} valid / raw={before}")
         except Exception as exc:
             log(f"MAIL INPUT SOURCE FAIL : {path.name} / {exc}")
 
@@ -484,11 +514,6 @@ def build_mail_input() -> bool:
         return False
 
     combined = pd.concat(frames, ignore_index=True)
-    combined = combined.dropna(how="all")
-    combined = combined[
-        (combined["Headline"].fillna("").astype(str).str.strip() != "")
-        & (combined["URL"].fillna("").astype(str).str.strip() != "")
-    ]
 
     if combined.empty:
         log("MAIL INPUT BUILD FAILED : combined file has no valid rows")
@@ -500,7 +525,8 @@ def build_mail_input() -> bool:
         combined = combined.sort_values(sort_cols, ascending=ascending, kind="stable")
 
     combined.to_excel(MAIL_INPUT_FILE, index=False)
-    log(f"MAIL INPUT CREATED : {MAIL_INPUT_FILE} / rows={len(combined)}")
+    category_counts = combined["pipeline_category"].value_counts().to_dict()
+    log(f"MAIL INPUT CREATED : {MAIL_INPUT_FILE} / rows={len(combined)} / {category_counts}")
     return True
 
 
