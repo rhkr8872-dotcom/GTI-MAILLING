@@ -1,4 +1,4 @@
-﻿
+
 # 7.run_gti_pipeline.py
 # -*- coding: utf-8 -*-
 # GTI FINAL CORE v6 - Full pipeline
@@ -639,9 +639,4 @@ def main() -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
-
-
-
-
-
 
