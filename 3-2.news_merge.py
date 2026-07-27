@@ -1,4 +1,4 @@
-﻿# -*- coding: utf-8 -*-
+# -*- coding: utf-8 -*-
 # GTI FINAL CORE v9 - News merge, title-keyword priority + URL quality guard
 """
 STEP3-2 : news_merge.py
