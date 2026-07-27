@@ -2,6 +2,7 @@
 # GTI FINAL CORE v6 - LAW1 official regulation, rest news
 r"""
 GTI STEP1 LAW1-ONLY + NEWS-REST CLEAN v6 - official regulation sensing
+"""
 
 Input:
 - C:\temp\sites.xlsx
