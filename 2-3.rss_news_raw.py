@@ -1,4 +1,4 @@
-﻿# GTI FINAL CORE v6 - RSS/Site News with Selenium Google URL recovery
+# GTI FINAL CORE v6 - RSS/Site News with Selenium Google URL recovery
 # =========================================================
 # GTI STEP2-3 - RSS NEWS RAW MASTER VERSION v3.4
 # Purpose
