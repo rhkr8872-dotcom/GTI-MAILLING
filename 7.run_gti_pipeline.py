@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-GTI PIPELINE v42 - REGULATION / NEWS FULLY SEPARATED
+GTI PIPELINE v43 - REGULATION / NEWS FULLY SEPARATED
 ====================================================
 
 REGULATION BRANCH
@@ -71,7 +71,7 @@ PYTHON_EXE = Path(
 
 LOG_DIR = BASE_DIR / "logs"
 ARCHIVE_DIR = BASE_DIR / "archive"
-LOG_FILE = LOG_DIR / "gti_pipeline_v42_split.log"
+LOG_FILE = LOG_DIR / "gti_pipeline_v43_split.log"
 
 MAIL_OUTPUT_DIR = BASE_DIR / "12345" / "c_type_outputs"
 
@@ -503,6 +503,28 @@ def run_regulation_branch(
     return True
 
 
+
+NEWS_RAW_BY_STEP = {
+    "NEWS_2_1_NAVER": BASE_DIR / "2-1.naver_news_raw.xlsx",
+    "NEWS_2_2_GOOGLE": BASE_DIR / "2-2.google_news_raw.xlsx",
+    "NEWS_2_3_RSS_SITE": BASE_DIR / "2-3.rss_news_raw.xlsx",
+}
+
+def purge_news_raw_before_collectors() -> None:
+    """
+    Remove previous-run raw files after archiving.
+    This prevents a missing/failed collector from leaking yesterday's raw data
+    into today's 3-2 merge.
+    """
+    for path in NEWS_RAW_BY_STEP.values():
+        if path.exists():
+            try:
+                path.unlink()
+                log(f"STALE RAW PURGED : {path.name}")
+            except Exception as exc:
+                log(f"STALE RAW PURGE FAILED : {path.name} / {exc}")
+
+
 def run_news_branch(
     python_exe: str,
     dry_run: bool,
@@ -513,6 +535,9 @@ def run_news_branch(
     log("NEWS BRANCH START")
     log("#" * 80)
 
+    if not dry_run:
+        purge_news_raw_before_collectors()
+
     collector_ok = 0
 
     for step in NEWS_COLLECTOR_STEPS:
@@ -521,6 +546,14 @@ def run_news_branch(
 
         if status in {"OK", "DRY_RUN"}:
             collector_ok += 1
+        elif not dry_run:
+            stale = NEWS_RAW_BY_STEP.get(step.name)
+            if stale and stale.exists():
+                try:
+                    stale.unlink()
+                    log(f"FAILED COLLECTOR RAW REMOVED : {stale.name}")
+                except Exception as exc:
+                    log(f"FAILED COLLECTOR RAW REMOVE WARN : {stale.name} / {exc}")
 
     if collector_ok == 0:
         log("NEWS BRANCH STOP : no collector available")
@@ -604,7 +637,7 @@ def run_mail(
 def print_result(results: list[tuple[str, str, str]]) -> None:
     log("")
     log("#" * 80)
-    log("GTI PIPELINE v42 SPLIT RESULT")
+    log("GTI PIPELINE v43 SPLIT RESULT")
     log("#" * 80)
 
     counts = {}
@@ -640,7 +673,7 @@ def main() -> int:
     python_exe = get_python()
 
     log("#" * 80)
-    log("GTI PIPELINE v42 - REGULATION / NEWS FULLY SEPARATED START")
+    log("GTI PIPELINE v43 - REGULATION / NEWS FULLY SEPARATED START")
     log("#" * 80)
     log(f"BASE_DIR : {BASE_DIR}")
     log(f"PYTHON   : {python_exe}")
@@ -693,10 +726,10 @@ def main() -> int:
         and (args.news_only or news_ok)
         and mail_ok
     ):
-        log("GTI PIPELINE v42 FINISHED")
+        log("GTI PIPELINE v43 FINISHED")
         return 0
 
-    log("GTI PIPELINE v42 FINISHED WITH ERROR")
+    log("GTI PIPELINE v43 FINISHED WITH ERROR")
     return 1
 
 

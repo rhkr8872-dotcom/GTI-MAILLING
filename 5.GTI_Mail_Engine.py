@@ -3323,6 +3323,9 @@ def read_step4_results() -> pd.DataFrame:
         raise FileNotFoundError(f"STEP4 outputs not found: {REGULATION_INPUT_FILE}, {NEWS_INPUT_FILE}")
     rows = pd.concat(frames, ignore_index=True)
     rows = rows[rows["Headline"].astype(str).str.strip().ne("")].copy()
+    # Source-file contract is authoritative.
+    rows.loc[rows["Source File"].astype(str).eq(str(REGULATION_INPUT_FILE)), "Content Type"] = "Regulation"
+    rows.loc[rows["Source File"].astype(str).eq(str(NEWS_INPUT_FILE)), "Content Type"] = "News"
 
     # Re-clean URLs one more time. Bad URLs become blank, not row deletion.
     rows["URL"] = rows.apply(lambda r: best_url_from_values([
@@ -5160,6 +5163,13 @@ def final_order(rows: pd.DataFrame, top3: pd.DataFrame) -> pd.DataFrame:
     ordered = _PREV_FINAL_ORDER_V316(rows, top3)
     ordered = _apply_mail_24h_guard_v316(ordered)
 
+    # v3.18 hard type/group contract:
+    # Regulation input can never become News Core/Usable due to Samsung Impact overrides.
+    reg_mask = ordered["Content Type"].astype(str).str.strip().str.lower().eq("regulation")
+    news_mask = ordered["Content Type"].astype(str).str.strip().str.lower().eq("news")
+    ordered.loc[reg_mask & ~ordered["Mail Group"].eq("Filtered Noise"), "Mail Group"] = "Regulation"
+    ordered.loc[news_mask & ordered["Mail Group"].eq("Regulation"), "Mail Group"] = "News - 주요/참고"
+
     visible = ordered[~ordered["Mail Group"].eq("Filtered Noise")].copy()
     filtered = ordered[ordered["Mail Group"].eq("Filtered Noise")].copy()
 
@@ -5349,7 +5359,7 @@ def build_html(rows: pd.DataFrame, top3: pd.DataFrame) -> str:
 
 
 # ============================================================================
-# End GTI STEP5 FINAL MAIL GUARD v3.17
+# End GTI STEP5 FINAL MAIL GUARD v3.18
 # ============================================================================
 
 
