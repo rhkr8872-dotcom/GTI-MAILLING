@@ -9,7 +9,7 @@ GTI STEP4-2 NEWS AI v25 CLEAN
 """
 
 from __future__ import annotations
-import os, re, json, time
+import os, re, json, time, html as html_lib
 from pathlib import Path
 from datetime import datetime
 from urllib.parse import urlparse
@@ -25,8 +25,10 @@ OUT_EXCLUDED = BASE_DIR / "4-2.news_ai_excluded.xlsx"
 OUT_LEGACY = BASE_DIR / "4.news_ai_analysis.xlsx"
 
 MAX_AGE_HOURS = int(os.getenv("GTI_STEP4_NEWS_MAX_AGE_HOURS", "24"))
-TARGET_MAX = min(int(os.getenv("GTI_STEP4_NEWS_TARGET_MAX", "30")), 30)
-AI_REVIEW_MAX = int(os.getenv("GTI_STEP4_AI_REVIEW_MAX", "80"))
+TARGET_MAX = int(os.getenv("GTI_STEP4_NEWS_TARGET_MAX", "0"))  # 0 = quality-based, no fixed count
+AI_REVIEW_MAX = int(os.getenv("GTI_STEP4_AI_REVIEW_MAX", "120"))
+REPORT_TARGET = int(os.getenv("GTI_STEP4_NEWS_REPORT_TARGET", "30"))
+WATCH_MIN_RELEVANCE = int(os.getenv("GTI_STEP4_WATCH_MIN_RELEVANCE", "5"))
 GEMINI_MODEL = os.getenv("GTI_GEMINI_MODEL", "gemini-2.5-flash-lite").strip()
 GEMINI_TIMEOUT = int(os.getenv("GTI_GEMINI_TIMEOUT", "20"))
 GEMINI_API_KEY = (
@@ -58,6 +60,8 @@ OUTPUT_COLS = [
     "Action Plan", "Country", "Agency", "Risk", "Importance Score",
     "Priority Group", "Issue", "Cluster", "URL", "Source", "Source File",
     "RejectReason", "AIRelevant", "AIRelevanceScore", "AIReason",
+    "Top3 Eligible", "Body Verified", "Direct Evidence", "Missing Facts",
+    "Policy Event", "Official Evidence",
 ]
 
 
@@ -74,6 +78,12 @@ def clean(v) -> str:
     except Exception:
         pass
     return re.sub(r"\s+", " ", str(v)).strip()
+
+
+def as_bool(value) -> bool:
+    if isinstance(value, bool):
+        return value
+    return clean(value).lower() in {"1", "true", "yes", "y"}
 
 
 def unique_columns(df: pd.DataFrame) -> pd.DataFrame:
@@ -177,24 +187,53 @@ def gemini_json(prompt: str) -> dict:
         return {}
     endpoint = (
         f"https://generativelanguage.googleapis.com/v1beta/models/"
-        f"{GEMINI_MODEL}:generateContent?key={GEMINI_API_KEY}"
+        f"{GEMINI_MODEL}:generateContent"
     )
     payload = {
         "contents": [{"parts": [{"text": prompt}]}],
         "generationConfig": {
             "temperature": 0.15,
-            "maxOutputTokens": 1500,
+            "maxOutputTokens": 4096,
             "responseMimeType": "application/json",
         },
     }
     try:
-        r = requests.post(endpoint, json=payload, timeout=GEMINI_TIMEOUT)
-        r.raise_for_status()
+        r = requests.post(
+            endpoint,
+            headers={"x-goog-api-key": GEMINI_API_KEY},
+            json=payload,
+            timeout=GEMINI_TIMEOUT,
+        )
+        if r.status_code >= 400:
+            return {"_error": f"HTTP_{r.status_code}: {clean(r.text)[:500]}"}
         data = r.json()
         txt = data["candidates"][0]["content"]["parts"][0]["text"]
         return json.loads(txt)
     except Exception as exc:
-        return {"_error": f"{type(exc).__name__}:{clean(exc)[:180]}"}
+        message = clean(exc)
+        if GEMINI_API_KEY:
+            message = message.replace(GEMINI_API_KEY, "***REDACTED***")
+        message = re.sub(r"([?&]key=)[^&\s]+", r"\1***REDACTED***", message, flags=re.I)
+        return {"_error": f"{type(exc).__name__}:{message[:180]}"}
+
+
+def fetch_article_text(url: str) -> tuple[str, str]:
+    """Best-effort original body fetch. Short/blocked pages never qualify for Top3."""
+    if not url.startswith(("http://", "https://")):
+        return "", "NO_URL"
+    try:
+        r = requests.get(url, headers={"User-Agent": "Mozilla/5.0 Chrome/124 Safari/537.36"}, timeout=12, allow_redirects=True)
+        if r.status_code >= 400:
+            return "", f"HTTP_{r.status_code}"
+        text = r.text
+        text = re.sub(r"(?is)<(script|style|nav|footer|header).*?>.*?</\1>", " ", text)
+        text = re.sub(r"(?s)<[^>]+>", " ", text)
+        text = clean(html_lib.unescape(text))
+        if len(text) < 350:
+            return text, "BODY_TOO_SHORT"
+        return text[:12000], "BODY_OK"
+    except Exception as exc:
+        return "", f"FETCH_{type(exc).__name__}"
 
 
 def fallback_relevant(row: pd.Series) -> tuple[bool, int, str]:
@@ -208,60 +247,215 @@ def fallback_relevant(row: pd.Series) -> tuple[bool, int, str]:
     return relevant, min(100, max(50 if relevant else 0, score - 35)), "RULE_FALLBACK"
 
 
+def concrete_customs_signal(text: str) -> bool:
+    t = clean(text).lower()
+    subject = any(x in t for x in [
+        "관세율", "추가관세", "반덤핑", "상계관세", "세이프가드", "원산지 규정",
+        "수입신고", "수출신고", "품목분류", "전략물자", "수출통제", "제재 대상",
+        "tariff rate", "additional tariff", "anti-dumping", "countervailing duty",
+        "rules of origin", "customs declaration", "hs code", "export control", "sanctions",
+        "section 232", "section 301", "cbam"
+    ])
+    action = any(x in t for x in [
+        "시행", "발효", "개정", "공포", "고시", "공고", "조사 개시", "예비판정", "최종판정",
+        "법원", "판결", "행정명령", "적용", "유예", "철회", "면제", "환급",
+        "effective", "entered into force", "amend", "notice", "investigation", "determination",
+        "court", "ruling", "executive order", "exemption", "refund"
+    ])
+    return subject and action
+
+
 def analyze_row(row: pd.Series) -> dict:
     title = clean(row.get("Headline"))
-    summary = clean(row.get("Summary"))
+    source_summary = clean(row.get("Summary"))
     issue = clean(row.get("Issue"))
     url = clean(row.get("URL"))
+    body, body_status = fetch_article_text(url)
+    evidence_text = body if len(body) >= 350 else source_summary
+    body_verified = body_status == "BODY_OK" and len(body) >= 350
 
     prompt = f"""
-당신은 삼성전자 본사 관세/통상 담당자입니다.
-아래 기사가 삼성전자 관세업무 관점에서 보고할 가치가 있는지 판정하고 분석하십시오.
+당신은 삼성전자 본사 관세·통상 및 관세컴플라이언스 책임자입니다.
+아래 기사 원문을 근거로 먼저 보고 대상 여부를 판정한 뒤 의사결정용 분석을 작성하십시오.
 
-판정 기준:
-- YES: 관세, 통관, HS/품목분류, FTA/원산지, AD/CVD/세이프가드,
-  수출통제/제재, CBAM, 무역장벽/수입규제처럼 관세·통상 실무에 영향을 주는 기사.
-- NO: 환율, 일반 수출실적, 주가, 고용, 산업동향, 행사, 지역경제 등 일반 뉴스.
-- 제목에 '수입/수출/무역' 단어가 있다는 이유만으로 YES 금지.
-- 삼성전자에 직접 영향이 없어도 주요 글로벌 관세정책이면 YES 가능.
+1단계 관련성 판정:
+- YES: 관세율·Section 232/301·AD/CVD·세이프가드·통관·HS·과세가격·FTA/원산지·수출통제·제재·CBAM·수입규제의 구체적 조치가 핵심인 기사.
+- NO: 단순 산업동향, 정치 발언, 행사/세미나, 기업실적, 주가, 일반 공급망, 관세 단어가 부수적으로만 등장하는 기사.
+- 주요 글로벌 관세정책은 삼성 직접영향이 없어도 YES/Watch 가능.
+
+2단계 분석 순서(반드시 준수):
+- [사실관계] 발표 주체·국가, 조치 단계, 발표/시행일, 대상 품목·HS, 세율/쿼터, 원산지·신고·증빙 요건.
+- [삼성전자 관세업무 직접영향] 영향 법인·제품·거래흐름과 수입/수출통관, HS, 과세가격, FTA/원산지, 관세비용, 조사대응 중 바뀌는 업무.
+- [대응] 즉시(오늘~3영업일), 1개월 내, 상시 모니터링, Owner.
+
+Direct/Top3 조건:
+- 삼성전자가 직접 언급되고 구체적 관세조치가 연결되면 Direct 후보.
+- 삼성전자 명칭이 없으면 원칙적으로 Indirect/Watch. 단, 한국 반도체(HS 854239 포함)가 중국산 제품의 환적·원산지 위험 경로로 공식 지목된 사건은 Direct 후보.
+- 생산국·제품명·관세 단어가 각각 등장하는 것만으로 연결관계를 추정하지 말 것.
+- 국가명, 삼성/반도체 단어, 일반 공급망 언급만으로 Direct 금지.
+- 원문 본문을 확보하지 못했으면 body_verified=false, Direct 금지, Top3 Eligible=false.
+- 사실이 불명확하면 추정하지 말고 missing_facts에 기록.
 
 JSON만 출력:
 {{
  "relevant": true,
  "relevance_score": 0,
- "reason": "판정 근거",
+ "reason": "YES/NO의 원문 근거",
  "samsung_impact": "Direct|Indirect|Watch|None",
+ "top3_eligible": false,
+ "body_verified": {str(body_verified).lower()},
+ "direct_evidence": ["Direct 판정 원문 근거"],
  "affected_subsidiary": "영향 법인/지역 또는 관련 법인 검토",
  "risk": "상|중|하",
- "summary_ko": "기사 핵심 요약 2~3문장",
- "analysis_ko": "삼성전자 관세업무 영향 분석 2~4문장",
- "action_ko": "즉시/1주내/1개월내 조치와 담당",
- "country": "국가/지역",
- "agency": "기관/매체"
+ "summary_ko": "[사실관계] 원문 근거 3~5문장",
+ "analysis_ko": "[삼성전자 관세업무 직접영향] 영향 경로와 업무를 4~7문장",
+ "action_ko": "[즉시] ... | [1개월 내] ... | [상시] ... | [Owner] ...",
+ "country": "발표국/영향국",
+ "agency": "발표기관/매체",
+ "issue": "TARIFF|AD_CVD|EXPORT_CONTROL|SANCTIONS|CUSTOMS|HS_CLASSIFICATION|ORIGIN_FTA|CBAM_CARBON|OTHER",
+ "policy_event": true,
+ "official_evidence": "정부·세관·법원·공식문서와 구체적 조치 근거",
+ "missing_facts": ["확인되지 않은 HS·세율·시행일 등"]
 }}
 
 Issue: {issue}
 Headline: {title}
-Source summary: {summary}
 URL: {url}
+Body status: {body_status}
+원문/본문:
+{evidence_text[:12000]}
 """.strip()
 
     result = gemini_json(prompt)
     if not result or result.get("_error"):
-        rel, rs, reason = fallback_relevant(row)
         return {
-            "relevant": rel,
-            "relevance_score": rs,
-            "reason": reason + (f"; {result.get('_error')}" if result else ""),
-            "samsung_impact": "Watch" if rel else "None",
+            "relevant": False,
+            "relevance_score": 0,
+            "reason": "AI_ERROR_FAIL_CLOSED" + (f"; {result.get('_error')}" if result else ""),
+            "analysis_ok": False,
+            "samsung_impact": "None",
+            "top3_eligible": False,
+            "body_verified": body_verified,
+            "direct_evidence": [],
             "affected_subsidiary": "관련 법인 검토",
-            "risk": "중" if rel else "하",
-            "summary_ko": summary or title,
-            "analysis_ko": f"{issue or '관세·통상'} 관련성 확인 대상입니다." if rel else "",
-            "action_ko": "대상국·품목·HS·시행일 및 법인 실적 영향을 확인하십시오." if rel else "",
+            "risk": "하",
+            "summary_ko": source_summary or title,
+            "analysis_ko": "",
+            "action_ko": "",
             "country": "",
             "agency": clean(row.get("Publisher")) or clean(row.get("Source")),
+            "missing_facts": ["Gemini 분석 실패 또는 원문 근거 부족"],
+            "policy_event": False,
+            "official_evidence": "",
         }
+
+    impact = clean(result.get("samsung_impact"))
+    if impact not in {"Direct", "Indirect", "Watch", "None"}:
+        impact = "Watch" if as_bool(result.get("relevant")) else "None"
+    verified = as_bool(result.get("body_verified")) and body_verified
+    evidence = [clean(x) for x in result.get("direct_evidence", []) if clean(x)]
+    policy_event = (
+        as_bool(result.get("policy_event"))
+        and concrete_customs_signal(evidence_text)
+    )
+    issue_out = clean(result.get("issue")).upper()
+    allowed_issues = {
+        "TARIFF", "AD_CVD", "EXPORT_CONTROL", "SANCTIONS",
+        "CUSTOMS", "HS_CLASSIFICATION", "ORIGIN_FTA",
+        "CBAM_CARBON",
+    }
+    if issue_out not in allowed_issues:
+        policy_event = False
+        issue_out = "OTHER"
+
+    country = clean(result.get("country"))
+
+    # HQ customs decision rule (fail closed): do not promote an article merely
+    # because product/country/customs words occur somewhere in the body.
+    # Direct requires either explicit Samsung evidence, or the narrowly defined
+    # Korea-semiconductor transshipment/origin route requested by the business.
+    route_text = f"{title} {evidence_text} {country}".lower()
+    product_terms = [
+        "반도체", "semiconductor", "memory chip", "메모리칩", "스마트폰",
+        "smartphone", "display", "디스플레이", "television", "tv", "가전",
+        "appliance", "network equipment", "배터리", "battery",
+    ]
+    route_customs_terms = [
+        "관세", "tariff", "환적", "transshipment", "원산지", "origin",
+        "section 232", "section 301", "반덤핑", "anti-dumping", "통관",
+        "customs", "수출통제", "export control", "제재", "sanction", "fta",
+    ]
+    samsung_named = any(term in route_text for term in [
+        "삼성전자", "삼성 전자", "samsung electronics", "samsung semiconductor",
+    ])
+    explicit_samsung_direct = (
+        verified
+        and policy_event
+        and samsung_named
+        and any(term in route_text for term in product_terms)
+        and any(term in route_text for term in route_customs_terms)
+    )
+    korea_semicon_transshipment_direct = (
+        verified
+        and policy_event
+        and any(term in route_text for term in ["환적", "transshipment", "원산지 세탁", "origin laundering", "관세 회피"])
+        and any(term in route_text for term in ["한국", "korea", "경기", "반도체벨트", "semiconductor belt"])
+        and any(term in route_text for term in ["반도체", "semiconductor", "854239", "8542.39"])
+        and any(term in route_text for term in ["중국", "china", "중국산"])
+    )
+    route_direct = explicit_samsung_direct or korea_semicon_transshipment_direct
+
+    # AI prose that explicitly denies direct impact takes precedence over a
+    # broad categorical label. It may still be retained as Indirect/Watch.
+    analysis_lower = clean(result.get("analysis_ko")).lower()
+    denies_direct = any(term in analysis_lower for term in [
+        "직접적인 영향은 없", "직접 영향은 없", "직접적인 관련성은 없",
+        "직접 관련성은 없", "직접적인 관세 업무 영향은 없", "미치는 영향은 없",
+        "no direct impact", "not directly related",
+    ])
+    if denies_direct and not korea_semicon_transshipment_direct:
+        if impact == "Direct":
+            impact = "Watch"
+        route_direct = False
+    if route_direct:
+        impact = "Direct"
+        try:
+            result["relevance_score"] = max(8, int(float(result.get("relevance_score", 0) or 0)))
+        except Exception:
+            result["relevance_score"] = 8
+        if not evidence and korea_semicon_transshipment_direct:
+            evidence = [
+                "한국 반도체(HS 854239 포함)의 중국 연계 환적·원산지 위험 경로를 원문에서 확인"
+            ]
+
+    # Enforce the same evidence gate on Gemini's original Direct label. A
+    # concrete global measure without a proven Samsung route is Indirect; an
+    # article explicitly denying impact is Watch.
+    if impact == "Direct" and not route_direct:
+        impact = "Watch" if denies_direct else "Indirect"
+
+    relevant = (as_bool(result.get("relevant")) or route_direct) and verified and policy_event and bool(country)
+    top3 = (
+        (as_bool(result.get("top3_eligible")) or route_direct)
+        and verified and impact == "Direct" and len(evidence) >= 1
+    )
+    if not relevant:
+        impact = "None"
+        top3 = False
+    if not verified and impact == "Direct":
+        impact = "Watch"
+    result.update({
+        "samsung_impact": impact,
+        "top3_eligible": top3,
+        "body_verified": verified,
+        "direct_evidence": evidence,
+        "missing_facts": [clean(x) for x in result.get("missing_facts", []) if clean(x)],
+        "relevant": relevant,
+        "analysis_ok": True,
+        "policy_event": policy_event,
+        "country": country,
+        "issue": issue_out,
+    })
     return result
 
 
@@ -279,20 +473,31 @@ def build() -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
     audited = []
     for i, (_, row) in enumerate(review.iterrows(), 1):
         a = analyze_row(row)
+        if i == 1 and "AI_ERROR_FAIL_CLOSED" in clean(a.get("reason")):
+            raise RuntimeError(
+                "Gemini first request failed: " + clean(a.get("reason")))
         r = row.to_dict()
-        r["AIRelevant"] = "Y" if bool(a.get("relevant")) else "N"
+        r["AIRelevant"] = "Y" if as_bool(a.get("relevant")) else "N"
         try:
             r["AIRelevanceScore"] = int(float(a.get("relevance_score", 0) or 0))
         except Exception:
             r["AIRelevanceScore"] = 0
         r["AIReason"] = clean(a.get("reason"))
         r["Samsung Impact"] = clean(a.get("samsung_impact")) or ("Watch" if r["AIRelevant"] == "Y" else "None")
+        r["Top3 Eligible"] = "Y" if as_bool(a.get("top3_eligible")) else "N"
+        r["Body Verified"] = "Y" if as_bool(a.get("body_verified")) else "N"
+        r["Direct Evidence"] = " | ".join(clean(x) for x in a.get("direct_evidence", []) if clean(x))
+        r["Missing Facts"] = " | ".join(clean(x) for x in a.get("missing_facts", []) if clean(x))
+        r["Policy Event"] = "Y" if as_bool(a.get("policy_event")) else "N"
+        r["Official Evidence"] = clean(a.get("official_evidence"))
+        r["Analysis OK"] = "Y" if as_bool(a.get("analysis_ok")) else "N"
         r["Affected Subsidiary"] = clean(a.get("affected_subsidiary")) or "관련 법인 검토"
         r["Risk"] = clean(a.get("risk")) or "중"
         r["SummaryAI"] = clean(a.get("summary_ko")) or clean(row.get("Summary"))
         r["AnalysisAI"] = clean(a.get("analysis_ko"))
         r["ActionAI"] = clean(a.get("action_ko"))
         r["Country"] = clean(a.get("country"))
+        r["Issue"] = clean(a.get("issue")) or "OTHER"
         r["Agency"] = clean(a.get("agency")) or clean(row.get("Publisher"))
         audited.append(r)
         if i % 10 == 0 or i == len(review):
@@ -310,14 +515,104 @@ def build() -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
             + pd.to_numeric(audit["AIRelevanceScore"], errors="coerce").fillna(0) * 0.55
         ).round(1)
 
-    selected = audit[audit["AIRelevant"].eq("Y")].copy()
+    ai_failures = int((audit.get("Analysis OK", pd.Series(index=audit.index, dtype=str)) != "Y").sum())
+    if len(audit) and ai_failures / len(audit) >= 0.20:
+        raise RuntimeError(
+            f"Gemini analysis failed for {ai_failures}/{len(audit)} rows. "
+            "Fail-closed: existing summary/mail inputs were not overwritten. Check API key, quota and model access."
+        )
+
+    # 메일 후보는 원문·정책사건·AI 관련성 최소기준을 모두 충족해야 한다.
+    min_relevance = int(os.getenv("GTI_STEP4_MIN_RELEVANCE", "3"))
+    selected = audit[
+        audit["AIRelevant"].eq("Y")
+        & audit["Body Verified"].eq("Y")
+        & audit["Policy Event"].eq("Y")
+        & pd.to_numeric(audit["AIRelevanceScore"], errors="coerce").fillna(0).ge(min_relevance)
+    ].copy()
     selected = selected.sort_values(
         ["SelectionScore", "PreScore", "Date"], ascending=[False, False, False], kind="stable"
-    ).head(TARGET_MAX).reset_index(drop=True)
+    )
+    selected["_supplemental_watch"] = False
+
+    # Quality-preserving minimum report size. Items that are verified and
+    # clearly belong to a customs issue, but lack a finalized measure or a
+    # proven Samsung route, may fill the report only as Watch. They can never
+    # become Direct or Top3 through this supplement path.
+    if REPORT_TARGET > 0 and len(selected) < REPORT_TARGET:
+        used_idx = set(selected.index)
+        watch_pool = audit[
+            ~audit.index.isin(used_idx)
+            & audit["Body Verified"].eq("Y")
+            & audit["Analysis OK"].eq("Y")
+            & audit["Issue"].ne("OTHER")
+            & pd.to_numeric(audit["AIRelevanceScore"], errors="coerce").fillna(0).ge(WATCH_MIN_RELEVANCE)
+        ].copy()
+        watch_pool = watch_pool.sort_values(
+            ["SelectionScore", "PreScore", "Date"], ascending=[False, False, False], kind="stable"
+        )
+        watch_pool["Samsung Impact"] = "Watch"
+        watch_pool["Top3 Eligible"] = "N"
+        watch_pool["_supplemental_watch"] = True
+        selected = pd.concat(
+            [selected, watch_pool.head(max(0, REPORT_TARGET - len(selected)))],
+            axis=0, sort=False,
+        )
+
+    def semantic_event_key(row: pd.Series) -> str:
+        text = " ".join([
+            clean(row.get("Headline")), clean(row.get("SummaryAI")),
+            clean(row.get("Country")), clean(row.get("Issue")),
+        ]).lower()
+        rules = [
+            ("US_SECTION232_DRONE_COMPONENTS_TARIFF", [["드론", "drone", "무인기", "uas"], ["section 232", "무역확장법 232", "232조"], ["관세", "tariff"]]),
+            ("US_CHINA_TRANSSHIPMENT_KOREA_SEMICON", [["환적", "transshipment", "원산지 세탁", "관세 회피"], ["한국", "korea", "경기", "반도체벨트"], ["중국", "china", "중국산"]]),
+            ("US_CHINA_AUTO_TARIFF_BLOCK", [["중국차", "중국산 자동차", "chinese car", "chinese vehicle"], ["127.5%", "딜러", "dealer", "봉쇄", "진입 반대"]]),
+            ("KR_STEEL_TRADE_REMEDY", [["철강", "steel"], ["반덤핑", "anti-dumping", "232", "쿼터"]]),
+            ("BUSAN_EXPORT_ECONOMY", [["부산"], ["제조업", "실물경제", "수출 중심"]]),
+            ("EU_CHINA_AUTO_SUPPLY_CHAIN", [["유럽", "europe", "eu"], ["중국차", "chinese car", "부품망", "공급망"]]),
+        ]
+        for name, groups in rules:
+            if all(any(term in text for term in group) for group in groups):
+                return name
+        words = re.findall(r"[a-z0-9가-힣]+", clean(row.get("Headline")).lower())
+        stop = {"속보", "종합", "단독", "오늘", "뉴스", "the", "a", "an", "and", "of", "to", "in"}
+        return clean(row.get("Issue")) + "|" + " ".join(w for w in words if w not in stop)[:90]
+
+    selected["SemanticEventKey"] = selected.apply(semantic_event_key, axis=1)
+    selected = selected.drop_duplicates("SemanticEventKey", keep="first")
+    # Dedup may reduce the count; refill once from the remaining verified Watch
+    # pool using a different semantic event.
+    if REPORT_TARGET > 0 and len(selected) < REPORT_TARGET:
+        existing_keys = set(selected["SemanticEventKey"].astype(str))
+        refill = audit[
+            ~audit.index.isin(set(selected.index))
+            & audit["Body Verified"].eq("Y")
+            & audit["Analysis OK"].eq("Y")
+            & audit["Issue"].ne("OTHER")
+            & pd.to_numeric(audit["AIRelevanceScore"], errors="coerce").fillna(0).ge(WATCH_MIN_RELEVANCE)
+        ].copy()
+        if not refill.empty:
+            refill["Samsung Impact"] = "Watch"
+            refill["Top3 Eligible"] = "N"
+            refill["_supplemental_watch"] = True
+            refill["SemanticEventKey"] = refill.apply(semantic_event_key, axis=1)
+            refill = refill[~refill["SemanticEventKey"].isin(existing_keys)]
+            refill = refill.drop_duplicates("SemanticEventKey", keep="first").sort_values(
+                ["SelectionScore", "PreScore", "Date"], ascending=[False, False, False], kind="stable"
+            )
+            selected = pd.concat([selected, refill.head(REPORT_TARGET-len(selected))], axis=0, sort=False)
+    if TARGET_MAX > 0:
+        selected = selected.head(TARGET_MAX)
+    selected_audit_indices = set(selected.index)
+    selected = selected.reset_index(drop=True)
 
     selected_rows = []
     for i, r in selected.iterrows():
-        impact = clean(r.get("Samsung Impact"))
+        supplemental_watch = bool(r.get("_supplemental_watch", False))
+        impact = "Watch" if supplemental_watch else clean(r.get("Samsung Impact"))
+        risk_map = {"High": "상", "Medium": "중", "Low": "하", "HIGH": "상", "MEDIUM": "중", "LOW": "하"}
+        normalized_risk = risk_map.get(clean(r.get("Risk")), clean(r.get("Risk")) or "중")
         mail_group = "News - 핵심" if impact == "Direct" else "News - 주요/참고"
         selected_rows.append({
             "No": i + 1,
@@ -334,22 +629,28 @@ def build() -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
             "Action Plan": clean(r.get("ActionAI")),
             "Country": clean(r.get("Country")),
             "Agency": clean(r.get("Agency")),
-            "Risk": clean(r.get("Risk")) or "중",
+            "Risk": normalized_risk,
             "Importance Score": int(round(float(r.get("SelectionScore", 0) or 0))),
             "Priority Group": "CORE" if mail_group == "News - 핵심" else "USABLE",
             "Issue": clean(r.get("Issue")),
-            "Cluster": clean(r.get("Cluster")),
+            "Cluster": clean(r.get("SemanticEventKey")) or clean(r.get("Cluster")),
             "URL": clean(r.get("URL")),
             "Source": clean(r.get("Source")),
             "Source File": str(INPUT_FILE),
             "RejectReason": "",
-            "AIRelevant": "Y",
+            "AIRelevant": clean(r.get("AIRelevant")) or "N",
             "AIRelevanceScore": int(float(r.get("AIRelevanceScore", 0) or 0)),
             "AIReason": clean(r.get("AIReason")),
+            "Top3 Eligible": "N" if supplemental_watch else (clean(r.get("Top3 Eligible")) or "N"),
+            "Body Verified": clean(r.get("Body Verified")) or "N",
+            "Direct Evidence": clean(r.get("Direct Evidence")),
+            "Missing Facts": clean(r.get("Missing Facts")),
+            "Policy Event": clean(r.get("Policy Event")) or "N",
+            "Official Evidence": clean(r.get("Official Evidence")),
         })
     daily = pd.DataFrame(selected_rows, columns=OUTPUT_COLS)
 
-    rejected_ai = audit[~audit["AIRelevant"].eq("Y")].copy()
+    rejected_ai = audit[~audit.index.isin(selected_audit_indices) & ~audit["AIRelevant"].eq("Y")].copy()
     if not rejected_ai.empty:
         rejected_ai["RejectReason"] = "AI_NOT_CUSTOMS_TRADE"
     excluded = pd.concat([stale, tail, rejected_ai], ignore_index=True, sort=False)
@@ -384,7 +685,7 @@ def safe_write(path: Path, df: pd.DataFrame) -> None:
 
 
 def main() -> int:
-    log("GTI STEP4-2 NEWS AI v25 CLEAN START")
+    log("GTI STEP4-2 NEWS AI v29 ISSUE-VERIFIED START")
     log(f"MODEL={GEMINI_MODEL} / Gemini={'Y' if USE_GEMINI else 'N'} / 24h / max={TARGET_MAX}")
     daily, audit, excluded = build()
     cumulative = merge_cumulative(daily)

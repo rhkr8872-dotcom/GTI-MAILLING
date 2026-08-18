@@ -6,6 +6,7 @@ Input:
 - C:\temp\sites.xlsx
 
 Output:
+- C:\temp\1.site_news_raw.xlsx        : 최종 유효 게시물
 - C:\temp\1.site_news_audit.xlsx      : 전체 수집/진단 원본
 - C:\temp\1-1.regulation_raw.xlsx     : 법규 / 공식 정부문서
 
@@ -14,6 +15,7 @@ date / title / url / source / collected_at / agency / site_type / date_status
 
 Classification rule:
 - site_type = regulation → 정부/공식기관 원문 문서
+- site_type = news       → 보도자료/뉴스/기관소식/예외 포함
 
 Search period:
 - HOURS_BACK = 72
@@ -48,10 +50,12 @@ except Exception:
 BASE_DIR = Path(r"C:\temp")
 SITE_FILE = BASE_DIR / "sites.xlsx"
 
-OUT_REG_FILE = BASE_DIR / "1-1.regulation_raw.xlsx"
+OUT_ALL_FILE = BASE_DIR / "1.site_news_raw.xlsx"
 OUT_AUDIT_FILE = BASE_DIR / "1.site_news_audit.xlsx"
+OUT_REG_FILE = BASE_DIR / "1-1.regulation_raw.xlsx"
 REJECT_FILE = BASE_DIR / "1.site_news_reject_debug.xlsx"
 FINAL_EXCLUDED_FILE = BASE_DIR / "1.site_news_final_excluded.xlsx"
+CRAWL_HEALTH_FILE = BASE_DIR / "1.site_crawl_health.xlsx"
 
 HOURS_BACK = 72
 MAX_PER_SITE = 30
@@ -60,6 +64,8 @@ SLEEP_SEC = 0.5
 
 results = []
 rejects = []
+crawl_health = []
+site_run_status = {}
 
 BAD_TITLE_CONTAINS = [
     "로그인", "회원가입", "사이트맵", "skip", "menu", "home",
@@ -97,6 +103,7 @@ BAD_TITLE_EXACT = {
     "공지사항", "보도자료", "고시", "공고", "훈령", "예규",
     "뉴스", "news", "home", "menu", "목록", "english", "한국어",
     "media releases", "announcements", "spotlights", "press officers",
+    "directorates", "helpdesk", "feedback", "website policy",
 }
 
 TRADE_WORDS = [
@@ -357,6 +364,10 @@ def is_menu_or_category_link(title, url, source=""):
         "industry and security bureau",
         "business & industry",
         "회원맞춤형서비스",
+        "directorates",
+        "helpdesk",
+        "feedback",
+        "website policy",
     }
     if low in menu_titles:
         return True
@@ -637,6 +648,90 @@ def crawl_fallback_links(source_url, agency, site_type, allow_keywords=None, blo
             break
 
     return len(results) - before
+
+
+def discover_feed_urls(source_url, soup):
+    feeds = []
+    for tag in soup.find_all("link", href=True):
+        typ = clean_text(tag.get("type", "")).lower()
+        rel = " ".join(tag.get("rel", [])).lower()
+        if "rss" in typ or "atom" in typ or "alternate" in rel and "xml" in typ:
+            feeds.append(urljoin(source_url, tag.get("href")))
+    parsed = urlparse(source_url)
+    root = f"{parsed.scheme}://{parsed.netloc}"
+    feeds.extend([urljoin(root, x) for x in ["/rss", "/rss.xml", "/feed", "/feed.xml", "/atom.xml"]])
+    return list(dict.fromkeys(x for x in feeds if x.startswith("http")))[:8]
+
+
+def detail_page_date(url):
+    """Read published date from an article detail page when the list has no date."""
+    res = fetch_html(url)
+    if not res:
+        return None
+    soup = BeautifulSoup(res.text, "html.parser")
+    for key in [
+        ("property", "article:published_time"), ("name", "date"),
+        ("name", "pubdate"), ("name", "publishdate"),
+        ("itemprop", "datePublished"),
+    ]:
+        tag = soup.find("meta", attrs={key[0]: key[1]})
+        if tag and tag.get("content"):
+            dt = normalize_date(tag.get("content"))
+            if dt:
+                return dt
+    time_tag = soup.find("time")
+    if time_tag:
+        dt = normalize_date(time_tag.get("datetime")) or extract_date_from_text(time_tag.get_text(" ", strip=True))
+        if dt:
+            return dt
+    return extract_date_from_text(soup.get_text(" ", strip=True)[:8000])
+
+
+def crawl_resilient_new_posts(source_url, agency, site_type):
+    """Final real-post probe: static HTML -> discovered feeds -> dynamic HTML -> detail dates."""
+    before = len(results)
+    strategies = []
+    static = fetch_html(source_url)
+    soups = []
+    if static and static.text:
+        soups.append(("static", BeautifulSoup(static.text, "html.parser")))
+    if soups:
+        for feed in discover_feed_urls(source_url, soups[0][1]):
+            n0 = len(results)
+            try:
+                crawl_rss(feed, agency, site_type)
+            except Exception:
+                pass
+            if len(results) > n0:
+                strategies.append(f"feed:{feed}")
+    dynamic = fetch_selenium_html(source_url, wait_sec=5)
+    if dynamic:
+        soups.append(("selenium", BeautifulSoup(dynamic, "html.parser")))
+
+    probed = 0
+    seen_links = set()
+    for strategy, soup in soups:
+        for a in soup.find_all("a", href=True):
+            title = clean_text(a.get_text(" ", strip=True) or a.get("title", ""))
+            href = clean_text(a.get("href", ""))
+            if not is_valid_title(title) or href.lower().startswith(("javascript:", "#", "mailto:")):
+                continue
+            link = urljoin(source_url, href)
+            if link in seen_links or urlparse(link).netloc != urlparse(source_url).netloc:
+                continue
+            seen_links.add(link)
+            dt = find_date_near_anchor(a) or extract_date_from_tag(a.parent or a)
+            if not dt and probed < 12:
+                dt = detail_page_date(link)
+                probed += 1
+            if dt and is_recent(dt):
+                if add_result(dt, title, link, source_url, agency, site_type):
+                    strategies.append(strategy + ":detail_date")
+            if len(results) - before >= MAX_PER_SITE:
+                break
+        if len(results) - before >= MAX_PER_SITE:
+            break
+    return len(results) - before, ";".join(dict.fromkeys(strategies)) or "NO_REAL_POST_FOUND"
 
 
 def crawl_site_hint(row, source_url, agency, site_type):
@@ -1191,6 +1286,46 @@ def parse_gwanbo_text(text, source_url, agency, site_type, page_date):
                 break
 
     return len(results) - before
+
+
+GWANBO_NOTICE_START_RE = re.compile(
+    r"(?:법률|대통령령|총리령)제\s*\d+호|"
+    r"[가-힣]{2,30}(?:부령|고시|공고|훈령|예규)제?\s*\d{4}(?:[-–]\d+)?호"
+)
+
+
+def split_joined_notices(title):
+    """Split a gazette row containing two or more independent legal notices."""
+    value = clean_text(title)
+    starts = [m.start() for m in GWANBO_NOTICE_START_RE.finditer(value)]
+    if len(starts) < 2:
+        return [value] if value else []
+    parts = []
+    for pos, end in zip(starts, starts[1:] + [len(value)]):
+        part = clean_text(value[pos:end]).strip(" ·,;/")
+        if len(part) >= 10 and part not in parts:
+            parts.append(part)
+    return parts or [value]
+
+
+def explode_joined_gwanbo_rows(df):
+    """Final safety net: rescue parsers must not reintroduce joined gazette titles."""
+    if df.empty:
+        return df
+    out = []
+    for _, row in df.iterrows():
+        is_gwanbo = "관보" in clean_text(row.get("agency", ""))
+        parts = split_joined_notices(row.get("title", "")) if is_gwanbo else [row.get("title", "")]
+        for part in parts:
+            copied = row.copy()
+            copied["title"] = part
+            if is_gwanbo:
+                base_url = clean_text(row.get("source", "")) or clean_text(row.get("url", "")).split("?", 1)[0]
+                dt = pd.to_datetime(row.get("date"), errors="coerce")
+                day = dt.strftime("%Y%m%d") if pd.notna(dt) else datetime.now().strftime("%Y%m%d")
+                copied["url"] = f"{base_url}?gwanboDate={day}&gwanboTitle={quote(part[:120])}"
+            out.append(copied)
+    return pd.DataFrame(out, columns=df.columns)
 
 
 def crawl_gwanbo_requests(source_url, agency, site_type):
@@ -2070,7 +2205,7 @@ def normalize_source_config(source_url, type_value, parser, site_type):
 
 def get_status(count):
     if count == 0:
-        return "FAIL"
+        return "NO_NEW"
     if count <= 2:
         return "CHECK"
     return "OK"
@@ -2079,7 +2214,7 @@ def get_status(count):
 def save_split_files(df):
     """STEP1 is regulation-only. Never create 1-2.site_news_raw.xlsx."""
     regulation_df = df[df["site_type"] == "regulation"].copy()
-    regulation_df.to_excel(OUT_REG_FILE, index=False)
+    regulation_df.to_excel(OUT_ALL_FILE, index=False)
     regulation_df.to_excel(OUT_REG_FILE, index=False)
 
 
@@ -2247,7 +2382,15 @@ def apply_final_sites_status(sites, final_df, checked_indices):
         sites.at[idx, "collected_count"] = int(count)
         sites.at[idx, "total_collected"] = int(prev_total) + int(count)
         sites.at[idx, "last_checked"] = now_str()
-        sites.at[idx, "status"] = get_status(count)
+        run_state = site_run_status.get(idx, {})
+        # A successful fetch with zero new/valid posts is normal. FAIL is
+        # reserved for transport/parser failure after rescue also failed.
+        sites.at[idx, "status"] = (
+            "FAIL" if run_state.get("failed") else get_status(count)
+        )
+        if "status_detail" not in sites.columns:
+            sites["status_detail"] = ""
+        sites.at[idx, "status_detail"] = run_state.get("detail", "")
 
         if recent_col and latest_dt is not None:
             sites.at[idx, recent_col] = latest_dt.strftime("%Y-%m-%d %H:%M:%S")
@@ -2325,6 +2468,8 @@ def main():
         crawl_start_idx = len(results)
         site_recent_dt = parse_site_recent_date(row.get(recent_post_col, "")) if recent_post_col else None
 
+        primary_failed = False
+        primary_error = ""
         try:
             if parser == "customs_board":
                 count = crawl_korea(source_url, agency, site_type)
@@ -2375,12 +2520,34 @@ def main():
         except Exception as e:
             print(f"   ERROR: {e}")
             count = 0
+            primary_failed = True
+            primary_error = f"{type(e).__name__}: {e}"
 
+        rescue_strategy = "PRIMARY_PARSER"
         if count == 0:
-            hint_count = crawl_site_hint(row, source_url, agency, site_type)
-            if hint_count > 0:
-                print(f"   [HINT FALLBACK] 최근게시일 기준 {hint_count}건")
-                count = hint_count
+            try:
+                count, rescue_strategy = crawl_resilient_new_posts(source_url, agency, site_type)
+                print(f"   [NEW POST RESCUE] {rescue_strategy} / {count}건")
+            except Exception as rescue_exc:
+                count = 0
+                rescue_strategy = "RESCUE_FAILED"
+                primary_failed = True
+                primary_error = (primary_error + " | " if primary_error else "") + f"RESCUE:{type(rescue_exc).__name__}: {rescue_exc}"
+
+        run_failed = primary_failed and count == 0 and rescue_strategy == "RESCUE_FAILED"
+        site_run_status[idx] = {
+            "failed": run_failed,
+            "detail": primary_error if run_failed else ("NO_NEW" if count == 0 else rescue_strategy),
+        }
+
+        crawl_health.append({
+            "checked_at": now_str(), "site": site_name, "url": source_url,
+            "parser": parser, "primary_or_rescue": rescue_strategy,
+            "real_posts_found": count,
+            "status": "FAIL" if run_failed else ("OK" if count > 0 else "NO_NEW"),
+            "error": primary_error if run_failed else "",
+            "latest_date_hint": clean_text(row.get(recent_post_col, "")) if recent_post_col else "",
+        })
 
         print(f" → {count}건")
 
@@ -2425,6 +2592,7 @@ def main():
 
         return
 
+    df = explode_joined_gwanbo_rows(df)
     df = df.drop_duplicates(subset=["url", "title"])
     dedup_count = len(df)
     dup_removed = raw_count - dedup_count
@@ -2463,6 +2631,11 @@ def main():
         except PermissionError:
             pass
 
+    try:
+        pd.DataFrame(crawl_health).to_excel(CRAWL_HEALTH_FILE, index=False)
+    except PermissionError:
+        print(f"⚠ crawl health 파일 열림: {CRAWL_HEALTH_FILE}")
+
     apply_final_sites_status(sites, final_df, checked_indices)
     save_sites_status(sites)
 
@@ -2473,12 +2646,13 @@ def main():
     print(f"🧹 중복 제거: {dup_removed}")
     print(f"🧹 최종 필터 제외: {final_filter_removed}")
     print(f"✅ 최종 저장: {final_count}")
-    print(f"📁 전체 파일: {OUT_REG_FILE}")
+    print(f"📁 전체 파일: {OUT_ALL_FILE}")
     print(f"📁 감사 파일: {OUT_AUDIT_FILE}")
     print(f"📁 법규 파일: {OUT_REG_FILE}")
     print(f"📁 최종 제외 파일: {FINAL_EXCLUDED_FILE}")
     print("📌 sites.xlsx 업데이트 기준 = 최종 유효 법규: collected_count / total_collected / last_checked / 최근게시일")
     print(f"🧾 제외 로그: {REJECT_FILE}")
+    print(f"🩺 사이트 탐지 진단: {CRAWL_HEALTH_FILE}")
     print(f"📊 RAW 증가: {len(results) - total_before}")
 
 

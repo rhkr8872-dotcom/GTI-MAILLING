@@ -41,6 +41,48 @@ CORE_TERMS = [
     'export control','sanctions','customs valuation','de minimis','trade remedy'
 ]
 
+# HQ + overseas subsidiary regulation scope. General customs procedures in
+# these jurisdictions affect the local Samsung entity even without a product.
+SAMSUNG_ENTITY_COUNTRIES = {
+    '대한민국','한국','korea','united states','usa','미국','china','중국','vietnam','베트남',
+    'india','인도','mexico','멕시코','brazil','브라질','poland','폴란드','hungary','헝가리',
+    'slovakia','슬로바키아','malaysia','말레이시아','indonesia','인도네시아','thailand','태국',
+    'philippines','필리핀','canada','캐나다','united kingdom','uk','영국','germany','독일',
+    'france','프랑스','spain','스페인','italy','이탈리아','netherlands','네덜란드',
+    'european union','eu','유럽연합','turkiye','turkey','튀르키예','칠레','chile',
+}
+GENERAL_CUSTOMS_PROCEDURE_TERMS = [
+    '통관절차','수입신고','수출신고','전자신고','세관신고','신고서','제출서류','증빙서류',
+    '과세가격','관세평가','관세납부','납부기한','보세','특송','de minimis','사후심사','세관조사',
+    '심판청구','심사청구','이의신청','행정심판','불복절차','사전심사','사전판정','관세환급',
+    'customs procedure','customs declaration','import declaration','export declaration',
+    'customs valuation','customs audit','administrative appeal','appeal procedure','advance ruling',
+    'binding ruling','duty drawback','customs refund','bonded warehouse','record keeping',
+]
+ITEM_SPECIFIC_TERMS = [
+    'hs code','hs코드','품목분류','tariff classification','반덤핑','anti-dumping','antidumping',
+    '상계관세','countervailing','세이프가드','safeguard','쿼터','quota','대상품목','특정품목',
+    '덤핑사실','국내산업피해','조사개시결정','무역위원회공고',
+    '수출통제','export control','entity list','전략물자','cbam','탄소국경',
+]
+
+def regulation_mapping_type(row: pd.Series, title: str) -> tuple[str, str, str]:
+    text = norm(' '.join([title, clean(row.get('Country','')), clean(row.get('Agency','')), clean(row.get('Source',''))]))
+    country = clean(row.get('Country',''))
+    entity_country = any(term in text for term in SAMSUNG_ENTITY_COUNTRIES)
+    procedure = any(term in text for term in GENERAL_CUSTOMS_PROCEDURE_TERMS)
+    item_specific = any(term in text for term in ITEM_SPECIFIC_TERMS)
+    samsung_named = any(term in text for term in ['삼성전자', 'samsung electronics', '삼성디스플레이', 'samsung display'])
+    if samsung_named:
+        return 'ENTITY_DIRECT', 'ENTITY_CONFIRMED', 'Y'
+    if item_specific:
+        return 'PRODUCT_1TO1', 'MAPPING_REQUIRED', 'N'
+    if procedure and entity_country:
+        return 'POLICY_GENERAL', 'GENERAL_APPLICABILITY', 'N'
+    if procedure:
+        return 'POLICY_GENERAL', 'COUNTRY_CONFIRM', 'N'
+    return 'POLICY_GENERAL', 'POLICY_REVIEW', 'N'
+
 NOISE_TERMS = [
     '채용','합격자','인사','승진','교육','세미나','웨비나','행사','입찰','공모','마약','밀수','범죄',
     'recruitment','webinar','seminar','conference','tender','drug seizure','smuggling','ceremony'
@@ -149,6 +191,7 @@ NEGATIVE_GUARD_TERMS = [
     '채용','인사발령','조직개편','복무','청렴','윤리','개인정보 보호',
     'urban policy','urban planning','whistleblower protection','recruitment',
     'personnel appointment','privacy policy'
+    ,'와인제품','포도주','denominação de origem','denomination of origin','geographical indication'
 ]
 
 def obvious_non_customs_guard(title: str) -> bool:
@@ -162,6 +205,21 @@ def keyword_hits_effective(title: str, keywords: list[str]) -> list[str]:
     cleaned = []
     for h in hits:
         nh = norm(h)
+        customs_context = any(x in t for x in [
+            '관세','통관','세관','수입신고','수출신고','보세','환급','tariff','customs','duty','clearance'
+        ])
+        origin_context = any(x in t for x in [
+            'fta','cepa','epa','rcep','협정세율','특혜관세','원산지증명','rules of origin','certificate of origin'
+        ])
+        sanctions_context = any(x in t for x in [
+            '수출통제','전략물자','경제제재','금융제재','제재대상','entity list','export control','economic sanctions','sanctions list'
+        ])
+        if nh in {'수입','수출','import','export'} and not customs_context:
+            continue
+        if nh in {'원산지','origin'} and not (customs_context or origin_context):
+            continue
+        if nh in {'제재','sanctions','sanction'} and not sanctions_context:
+            continue
         # '통상'이 '산업통상부' 기관명에만 존재하는 경우는 키워드 적중으로 보지 않음
         if nh == '통상':
             residual = t.replace('산업통상부', ' ').replace('산업통상자원부', ' ')
@@ -184,7 +242,8 @@ STRONG_CUSTOMS_TERMS = [
     '품목분류','hs code','hs코드','tariff classification','harmonized system',
     'fta','cepa','epa','rcep','원산지','원산지증명','협정세율','특혜관세',
     'rules of origin','certificate of origin','preferential tariff',
-    '반덤핑','덤핑방지관세','상계관세','세이프가드','무역구제',
+    '반덤핑','덤핑방지관세','덤핑사실','국내산업피해','조사개시결정',
+    '상계관세','세이프가드','무역구제',
     'anti-dumping','anti dumping','antidumping','countervailing','countervailing duty','safeguard',
     '수출통제','전략물자','제재','entity list','export control','export controls','sanctions','uflpa',
     'cbam','탄소국경','carbon border adjustment',
@@ -194,6 +253,20 @@ STRONG_CUSTOMS_TERMS = [
 def strong_customs_rule(title: str) -> tuple[bool, list[str]]:
     t = norm(title)
     hits = [term for term in STRONG_CUSTOMS_TERMS if term in t]
+    customs_context = any(x in t for x in [
+        '관세','통관','세관','수입신고','수출신고','보세','환급','tariff','customs','duty','clearance'
+    ])
+    origin_context = any(x in t for x in [
+        'fta','cepa','epa','rcep','협정세율','특혜관세','원산지증명','rules of origin','certificate of origin'
+    ])
+    sanctions_context = any(x in t for x in [
+        '수출통제','전략물자','경제제재','금융제재','제재대상','entity list','export control','economic sanctions','sanctions list'
+    ])
+    hits = [h for h in hits if not (
+        (h in {'수입','수출','import','export'} and not customs_context)
+        or (h in {'원산지','origin'} and not (customs_context or origin_context))
+        or (h in {'제재','sanctions','sanction'} and not sanctions_context)
+    )]
     # 관세청 조직/직제 개정은 customs compliance 법규가 아니므로 strong hard-keep 금지
     if ('직제 시행규칙' in t or '조직개편' in t) and '관세청' in t:
         substantive = [h for h in hits if h not in {'관세'}]
@@ -261,9 +334,45 @@ def canonical_regulation_title(v) -> str:
     title = re.sub(r'\s+', ' ', title).strip()
     return title
 
+
+def regulation_number(v) -> str:
+    """관세청고시제2026-50호와 같은 법규번호를 안정적으로 추출한다."""
+    t = clean(v).replace(" ", "")
+    m = re.search(
+        r"(관세청(?:고시|공고|훈령|예규)제?20\d{2}[-–]\d+호)",
+        t,
+    )
+    if m:
+        return re.sub(r"[-–]", "-", m.group(1)).lower()
+
+    m = re.search(
+        r"([가-힣]{2,20}(?:고시|공고|훈령|예규)제?20\d{2}[-–]\d+호)",
+        t,
+    )
+    return re.sub(r"[-–]", "-", m.group(1)).lower() if m else ""
+
+
+def clean_gazette_headline(v) -> str:
+    """한 관보 제목에 붙은 다른 기관 고시를 제거한다."""
+    title = clean(v)
+    if "관세청" not in title:
+        return title
+
+    m = re.search(
+        r"(관세청(?:고시|공고|훈령|예규)제?\s*20\d{2}[-–]\d+호"
+        r"\s*\([^)]{3,300}\))",
+        title,
+    )
+    if m:
+        return m.group(1)
+    return title
+
 def legal_fingerprint(row: pd.Series) -> str:
-    # Agency-independent: same regulation reposted by another official site is one item.
-    return canonical_regulation_title(row.get('Headline',''))
+    # 기관이나 URL이 달라도 동일 법규번호는 하나의 법규로 처리한다.
+    return (
+        regulation_number(row.get('Headline', ''))
+        or canonical_regulation_title(row.get('Headline', ''))
+    )
 
 
 
@@ -323,6 +432,7 @@ def same_day_dedup(df: pd.DataFrame) -> pd.DataFrame:
     if df.empty:
         return df
     work = df.sort_values(['Date','Headline'], ascending=[False,True]).copy()
+    work['Headline'] = work['Headline'].apply(clean_gazette_headline)
     keep = []
     for idx, row in work.iterrows():
         day = row['Date'].date() if pd.notna(row['Date']) else None
@@ -342,6 +452,11 @@ def same_day_dedup(df: pd.DataFrame) -> pd.DataFrame:
 
             canonical_a = canonical_regulation_title(row.get('Headline',''))
             canonical_b = canonical_regulation_title(kr.get('Headline',''))
+            number_a = regulation_number(row.get('Headline', ''))
+            number_b = regulation_number(kr.get('Headline', ''))
+            if number_a and number_a == number_b:
+                dup = True
+                break
             if canonical_a and canonical_a == canonical_b:
                 dup = True
                 break
@@ -402,6 +517,18 @@ def clean_cumulative(old_raw: pd.DataFrame, keywords: list[str]) -> tuple[pd.Dat
     kept = work[work['_keep']].copy()
 
     if not kept.empty:
+        mapping = kept.apply(
+            lambda r: regulation_mapping_type(r, clean(r.get('Headline', ''))), axis=1
+        )
+        kept['RegulationMappingType'] = [x[0] for x in mapping]
+        kept['MappingStatus'] = [x[1] for x in mapping]
+        kept['EntityDirectFlag'] = [x[2] for x in mapping]
+        kept['RequiredMappingKeys'] = [
+            'SamsungEntity; Transaction' if x[0] == 'ENTITY_DIRECT'
+            else 'Product; HSCode; OriginCountry; Supplier; SamsungEntity; ImportHistory' if x[0] == 'PRODUCT_1TO1'
+            else 'Country; SamsungEntity'
+            for x in mapping
+        ]
         kept['EventType'] = kept['Headline'].apply(regulation_event_type)
         kept['EventKey'] = kept.apply(regulation_event_key, axis=1)
         kept['_date_sort'] = pd.to_datetime(kept['Date'], errors='coerce')
@@ -505,6 +632,15 @@ def main():
                   else ('TITLE_KEYWORD' if hits else ('AI_CUSTOMS_YES' if ai_rel else 'REJECT')))
         )
         r['CheckedAt'] = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+        mapping_type, mapping_status, entity_direct = regulation_mapping_type(r, title)
+        r['RegulationMappingType'] = mapping_type
+        r['MappingStatus'] = mapping_status
+        r['EntityDirectFlag'] = entity_direct
+        r['RequiredMappingKeys'] = (
+            'SamsungEntity; Transaction' if mapping_type == 'ENTITY_DIRECT'
+            else 'Product; HSCode; OriginCountry; Supplier; SamsungEntity; ImportHistory' if mapping_type == 'PRODUCT_1TO1'
+            else 'Country; SamsungEntity'
+        )
         audit.append(r)
 
         if keep:
