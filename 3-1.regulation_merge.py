@@ -474,6 +474,19 @@ def cumulative_row_is_valid(row: pd.Series, keywords: list[str]) -> tuple[bool, 
     if not title:
         return False, 'EMPTY_TITLE'
 
+    low = norm(title)
+    if low in {'feedback', 'directorates', 'helpdesk', 'website policy'}:
+        return False, 'LEGACY_MENU_TITLE'
+    if re.fullmatch(r'법률\s*제?\s*\d+호', title):
+        return False, 'UNIDENTIFIABLE_LEGAL_TITLE'
+    notice_markers = re.findall(
+        r'(?:법률|대통령령|총리령)제\s*\d+호|'
+        r'[가-힣]{2,30}(?:부령|고시|공고|훈령|예규)제?\s*\d{4}(?:[-–]\d+)?호',
+        title,
+    )
+    if len(notice_markers) >= 2:
+        return False, 'COMPOUND_GAZETTE_TITLE'
+
     noise = any(x in norm(title) for x in NOISE_TERMS)
     negative_guard = obvious_non_customs_guard(title)
     strong_rel, _ = strong_customs_rule(title)
@@ -492,8 +505,11 @@ def cumulative_row_is_valid(row: pd.Series, keywords: list[str]) -> tuple[bool, 
         return True, 'STRONG_CUSTOMS_RULE'
     if kw_hits:
         return True, 'TITLE_KEYWORD'
+    # Old AI-only decisions were produced before the current context guards.
+    # They must not survive cumulative cleanup without a current deterministic
+    # customs/trade signal.
     if ai_confirmed:
-        return True, 'AI_CUSTOMS_YES'
+        return False, 'LEGACY_AI_ONLY_RECHECK_REQUIRED'
     return False, 'NO_CUSTOMS_TRADE_SIGNAL'
 
 
@@ -549,14 +565,14 @@ def historical_keys(report_day, cumulative_df: pd.DataFrame | None = None):
     """
     if cumulative_df is None:
         if not OUT_CUMULATIVE.exists():
-            return set(), set()
+            return set(), set(), set()
         try:
             cumulative_df = pd.read_excel(OUT_CUMULATIVE)
         except Exception:
-            return set(), set()
+            return set(), set(), set()
 
     if cumulative_df is None or cumulative_df.empty:
-        return set(), set()
+        return set(), set(), set()
 
     old = standardize(cumulative_df)
     old_dates = pd.to_datetime(old['Date'], errors='coerce')
@@ -568,7 +584,12 @@ def historical_keys(report_day, cumulative_df: pd.DataFrame | None = None):
         for _, r in prior.iterrows()
         if regulation_event_key(r)
     }
-    return urls, event_keys
+    fingerprints = {
+        legal_fingerprint(r)
+        for _, r in prior.iterrows()
+        if legal_fingerprint(r)
+    }
+    return urls, event_keys, fingerprints
 
 
 def safe_write(path: Path, df: pd.DataFrame):
@@ -672,14 +693,15 @@ def main():
     if not sel.empty:
         sel = same_day_dedup(sel)
         report_day = datetime.now().date()
-        old_urls, old_event_keys = historical_keys(report_day, clean_old)
+        old_urls, old_event_keys, old_fingerprints = historical_keys(report_day, clean_old)
         sel['EventType'] = sel['Headline'].apply(regulation_event_type)
         sel['EventKey'] = sel.apply(regulation_event_key, axis=1)
         sel['HistoricalDuplicateReason'] = sel.apply(
             lambda r: (
                 'PRIOR_URL'
                 if norm_url(r.get('URL','')) in old_urls
-                else ('PRIOR_EVENT' if regulation_event_key(r) in old_event_keys else '')
+                else ('PRIOR_EVENT' if regulation_event_key(r) in old_event_keys
+                      else ('PRIOR_FINGERPRINT' if legal_fingerprint(r) in old_fingerprints else ''))
             ),
             axis=1,
         )

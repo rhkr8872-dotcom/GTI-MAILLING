@@ -29,6 +29,7 @@ FALLBACK_INPUT_FILE = BASE_DIR / "3-1.regulation_summary.xlsx"
 KEYWORD_FILE = BASE_DIR / "keyword.xlsx"
 OUT_SUMMARY = BASE_DIR / "4-1.regulation_ai_summary.xlsx"
 OUT_CUMULATIVE = BASE_DIR / "4-1.regulation_ai_cumulative.xlsx"
+OUT_CUMULATIVE_REMOVED = BASE_DIR / "4-1.regulation_ai_cumulative_removed.xlsx"
 OUT_EXCLUDED = BASE_DIR / "4-1.regulation_ai_excluded.xlsx"
 
 MAX_AGE_DAYS = int(os.getenv("GTI_STEP4_REG_MAX_AGE_DAYS", "90"))
@@ -148,6 +149,7 @@ BIS_VALID_CONTEXT = [
 OUTPUT_COLS = [
     "No", "Content Type", "Mail Group", "Samsung Impact", "Affected Subsidiary", "Impact Reason", "Date", "Headline", "Summary", "AI Analysis", "Action Plan", "Country", "Agency", "Risk", "Importance Score", "Priority Group", "Issue", "Cluster", "URL", "Source", "Source File", "RejectReason", "KeywordMatches", "effective_date_hint", "hs_hint", "tariff_rate_hint"
 ]
+CUMULATIVE_REMOVED_DF = pd.DataFrame()
 for _quality_col in [
     "Top3 Eligible", "Body Verified", "Change Type", "Evidence", "Missing Facts",
     "RegulationMappingType", "MappingStatus", "RequiredMappingKeys", "EntityDirectFlag",
@@ -890,10 +892,117 @@ def normalize_cum_cols(df):
         if c not in df.columns: df[c]=""
     return df[OUTPUT_COLS]
 
+def _legacy_compound_title(title):
+    markers = re.findall(
+        r'(?:법률|대통령령|총리령)제\s*\d+호|'
+        r'[가-힣]{2,30}(?:부령|고시|공고|훈령|예규)제?\s*\d{4}(?:[-–]\d+)?호',
+        clean(title),
+    )
+    return len(markers) >= 2
+
+def _clean_legacy_cumulative(df):
+    """Migrate legacy STEP4 rows to the current evidence/mapping contract."""
+    old = normalize_cum_cols(df)
+    if old.empty:
+        return old
+    keep_rows = []
+    for _, row in old.iterrows():
+        r = row.copy()
+        headline = clean(r.get("Headline"))
+        url = clean(r.get("URL"))
+        low = headline.lower()
+        if not headline or not url:
+            continue
+        if low in {"feedback", "directorates", "helpdesk", "website policy"}:
+            continue
+        if re.fullmatch(r"법률\s*제?\s*\d+호", headline):
+            continue
+        if _legacy_compound_title(headline):
+            continue
+        if contains_terms(low, ["와인제품", "포도주", "denominação de origem", "denomination of origin", "geographical indication"]):
+            continue
+        if contains_terms(low, ["직제 시행규칙", "직제 일부개정", "조직개편", "정원 일부개정"]):
+            continue
+        if contains_terms(low, [
+            "전체 관세청 유관기관", "시스템 작업 안내", "오프라인 작업 안내",
+            "시범운영 시행 안내", "서비스 일시중단", "점검 작업 안내",
+        ]):
+            continue
+
+        text = row_text(r)
+        topic = detect_topic(text)
+        strict = has_strict_trade_reg_signal(text, r)
+        if topic == "TRADE_GENERAL" and not strict:
+            continue
+
+        body_ok = clean(r.get("Body Verified")).upper() == "Y"
+        samsung_named = contains_terms(text, [
+            "삼성전자", "samsung electronics", "삼성디스플레이", "samsung display"
+        ])
+        product_specific = topic in {"AD_CVD", "HS_CLASSIFICATION", "EXPORT_CONTROL", "CBAM_CARBON"}
+        prior_mapping_status = clean(r.get("MappingStatus"))
+        item_mapped = body_ok and prior_mapping_status in {"MAPPED", "ITEM_1TO1_MAPPED"}
+
+        if samsung_named and body_ok:
+            mapping_type, mapping_status, impact = "ENTITY_DIRECT", "ENTITY_CONFIRMED", "Direct"
+            required = "SamsungEntity; Transaction"
+        elif product_specific:
+            mapping_type = "PRODUCT_1TO1"
+            mapping_status = "MAPPED" if item_mapped else ("MAPPING_REQUIRED" if body_ok else "VERIFICATION_PENDING")
+            impact = "Direct" if item_mapped else "Watch"
+            required = "Product; HSCode; OriginCountry; Supplier; SamsungEntity; ImportHistory"
+        else:
+            mapping_type = "POLICY_GENERAL"
+            mapping_status = "VERIFIED_GENERAL" if body_ok else "VERIFICATION_PENDING"
+            impact = "Watch"
+            required = "Country; SamsungEntity"
+
+        r["RegulationMappingType"] = mapping_type
+        r["MappingStatus"] = mapping_status
+        r["RequiredMappingKeys"] = required
+        r["EntityDirectFlag"] = "Y" if mapping_type == "ENTITY_DIRECT" else "N"
+        r["Samsung Impact"] = impact
+        r["Top3 Eligible"] = "Y" if impact == "Direct" and body_ok else "N"
+        r["SamsungRelevanceScore"] = 100 if impact == "Direct" else 50
+        r["DirectImpactScore"] = 100 if impact == "Direct" else 35
+        score_value = pd.to_numeric(
+            pd.Series([r.get("CustomsTradePolicyScore", 0), r.get("Importance Score", 0)]),
+            errors="coerce",
+        ).fillna(0)
+        policy_score = max(0, min(100, int(score_value.max())))
+        r["CustomsTradePolicyScore"] = policy_score
+        r["WeightedScore"] = round(policy_score * 0.4 + int(r["DirectImpactScore"]) * 0.4 + int(r["SamsungRelevanceScore"]) * 0.2)
+        keep_rows.append(r)
+
+    cleaned = pd.DataFrame(keep_rows, columns=OUTPUT_COLS)
+    if cleaned.empty:
+        return normalize_cum_cols(cleaned)
+    cleaned["_date_key"] = pd.to_datetime(cleaned["Date"], errors="coerce").dt.strftime("%Y-%m-%d").fillna("")
+    cleaned["_title_key"] = cleaned["Headline"].fillna("").astype(str).str.lower().str.replace(r"\s+", " ", regex=True).str.strip()
+    cleaned = cleaned.drop_duplicates(["_title_key", "_date_key"], keep="last")
+    return normalize_cum_cols(cleaned.drop(columns=["_title_key", "_date_key"], errors="ignore"))
+
 def merge_cumulative(daily):
+    global CUMULATIVE_REMOVED_DF
     if OUT_CUMULATIVE.exists():
         try:
-            old=normalize_cum_cols(pd.read_excel(OUT_CUMULATIVE)); log(f"cumulative existing load: {len(old)} rows")
+            old_raw = pd.read_excel(OUT_CUMULATIVE)
+            old = _clean_legacy_cumulative(old_raw)
+            log(f"cumulative existing load: {len(old_raw)} -> cleaned={len(old)} rows")
+            raw_norm = normalize_cum_cols(old_raw)
+            kept_keys = set(
+                old["URL"].fillna("").astype(str).str.lower().str.strip()
+                + "|" + old["Headline"].fillna("").astype(str).str.lower().str.strip()
+                + "|" + old["Date"].fillna("").astype(str).str[:10]
+            )
+            raw_keys = (
+                raw_norm["URL"].fillna("").astype(str).str.lower().str.strip()
+                + "|" + raw_norm["Headline"].fillna("").astype(str).str.lower().str.strip()
+                + "|" + raw_norm["Date"].fillna("").astype(str).str[:10]
+            )
+            CUMULATIVE_REMOVED_DF = raw_norm.loc[~raw_keys.isin(kept_keys)].copy()
+            if not CUMULATIVE_REMOVED_DF.empty:
+                CUMULATIVE_REMOVED_DF["RejectReason"] = "LEGACY_CUMULATIVE_REVALIDATION"
         except Exception: old=pd.DataFrame(columns=OUTPUT_COLS)
     else:
         old=pd.DataFrame(columns=OUTPUT_COLS); log("cumulative file missing -> new create")
@@ -1470,6 +1579,8 @@ def main():
     excluded=to_output(excluded_raw)
     cumulative=merge_cumulative(daily)
     write_excel(daily, OUT_SUMMARY); write_excel(cumulative, OUT_CUMULATIVE); write_excel(excluded, OUT_EXCLUDED)
+    if not CUMULATIVE_REMOVED_DF.empty:
+        write_excel(CUMULATIVE_REMOVED_DF, OUT_CUMULATIVE_REMOVED)
     print(f"[DONE] Daily: {OUT_SUMMARY}")
     print(f"[DONE] Cumulative: {OUT_CUMULATIVE}")
     print(f"[DONE] Excluded: {OUT_EXCLUDED}")
