@@ -926,6 +926,7 @@ def _clean_legacy_cumulative(df):
         if contains_terms(low, [
             "전체 관세청 유관기관", "시스템 작업 안내", "오프라인 작업 안내",
             "시범운영 시행 안내", "서비스 일시중단", "점검 작업 안내",
+            "공휴일법", "hari kelepasan", "holiday act", "국세기본법",
         ]):
             continue
 
@@ -970,6 +971,8 @@ def _clean_legacy_cumulative(df):
             errors="coerce",
         ).fillna(0)
         policy_score = max(0, min(100, int(score_value.max())))
+        importance_raw = pd.to_numeric(r.get("Importance Score", 0), errors="coerce")
+        r["Importance Score"] = max(0, min(100, int(importance_raw if pd.notna(importance_raw) else 0)))
         r["CustomsTradePolicyScore"] = policy_score
         r["WeightedScore"] = round(policy_score * 0.4 + int(r["DirectImpactScore"]) * 0.4 + int(r["SamsungRelevanceScore"]) * 0.2)
         keep_rows.append(r)

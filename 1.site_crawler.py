@@ -58,6 +58,7 @@ FINAL_EXCLUDED_FILE = BASE_DIR / "1.site_news_final_excluded.xlsx"
 CRAWL_HEALTH_FILE = BASE_DIR / "1.site_crawl_health.xlsx"
 
 HOURS_BACK = 72
+OVERSEAS_HOURS_BACK = 168
 MAX_PER_SITE = 30
 MAX_GWANBO_ITEMS = 250
 SLEEP_SEC = 0.5
@@ -167,6 +168,24 @@ def normalize_date(value):
     s = str(value).strip()
     if not s:
         return None
+    m = re.search(r"令和\s*(\d{1,2})\s*年\s*(\d{1,2})\s*月\s*(\d{1,2})\s*日", s)
+    if m:
+        try:
+            return datetime(int(m.group(1)) + 2018, int(m.group(2)), int(m.group(3)))
+        except ValueError:
+            return None
+    m = re.search(r"(20\d{2})\s*[年년]\s*(\d{1,2})\s*[月월]\s*(\d{1,2})\s*[日일]", s)
+    if m:
+        try:
+            return datetime(int(m.group(1)), int(m.group(2)), int(m.group(3)))
+        except ValueError:
+            return None
+    m = re.fullmatch(r"\s*(\d{1,2})[./-](\d{1,2})[./-](20\d{2})(?:\s+.*)?\s*", s)
+    if m:
+        try:
+            return datetime(int(m.group(3)), int(m.group(2)), int(m.group(1)))
+        except ValueError:
+            return None
     try:
         dt = pd.to_datetime(s, errors="coerce")
         if pd.isna(dt):
@@ -209,6 +228,9 @@ def extract_date_from_text(text):
         r"(20\d{2}[-/.]\s*\d{1,2}[-/.]\s*\d{1,2})",
         r"(20\d{2}\.\s*\d{1,2}\.\s*\d{1,2}\.?)",
         r"(20\d{2}년\s*\d{1,2}월\s*\d{1,2}일)",
+        r"(20\d{2}年\s*\d{1,2}月\s*\d{1,2}日)",
+        r"(令和\s*\d{1,2}年\s*\d{1,2}月\s*\d{1,2}日)",
+        r"(\d{1,2}[./-]\d{1,2}[./-]20\d{2})",
         r"([A-Z][a-z]{2,9}\s+\d{1,2},\s*20\d{2})",
         r"([A-Z][a-z]{2,9}\s+\d{1,2}\s+20\d{2})",
         r"(\d{1,2}\s+[A-Z][a-z]{2,9}\s+20\d{2})",
@@ -292,7 +314,17 @@ def find_date_near_anchor(a):
     return None
 
 
-def is_recent(dt):
+def is_overseas_agency(agency):
+    t = clean_text(agency).lower()
+    overseas_hints = [
+        "india", "dgft", "cbic", "japan", "customs(일본)", "vietnam",
+        "mofcom", "gacc", "taxud", "eu ", "federal register", "ustr",
+        "us cbp", "usitc", "brazil", "receita", "eec", "eurasian",
+    ]
+    return any(x in t for x in overseas_hints)
+
+
+def is_recent(dt, agency=""):
     if dt is None:
         return False
     if isinstance(dt, date) and not isinstance(dt, datetime):
@@ -301,7 +333,8 @@ def is_recent(dt):
     # Most government boards expose only a calendar date, not a posting time.
     # Treat HOURS_BACK as an inclusive day window so a 72-hour setting includes
     # the whole day 3 days ago, e.g. May 29 run includes all of May 26.
-    days_back = max(0, int(HOURS_BACK // 24))
+    hours_back = OVERSEAS_HOURS_BACK if is_overseas_agency(agency) else HOURS_BACK
+    days_back = max(0, int(hours_back // 24))
     start_date = (now.date() - timedelta(days=days_back))
     return start_date <= dt.date() <= now.date()
 
@@ -452,7 +485,7 @@ def add_result(date_value, title, url, source, agency, site_type):
         date_status = "no_date"
     else:
         date_out = dt.strftime("%Y-%m-%d %H:%M:%S")
-        date_status = "recent" if is_recent(dt) else "old_date"
+        date_status = "recent" if is_recent(dt, agency) else "old_date"
 
     results.append({
         "date": date_out,
@@ -2615,6 +2648,24 @@ def main():
     final_count = len(final_df)
     final_filter_removed = len(excluded_df)
 
+    if crawl_health:
+        final_by_agency = final_df.groupby("agency").size().to_dict() if not final_df.empty else {}
+        excluded_by_agency = excluded_df.groupby("agency").size().to_dict() if not excluded_df.empty else {}
+        for health in crawl_health:
+            agency_name = health.get("site", "")
+            valid_n = int(final_by_agency.get(agency_name, 0))
+            excluded_n = int(excluded_by_agency.get(agency_name, 0))
+            health["final_valid_count"] = valid_n
+            health["final_excluded_count"] = excluded_n
+            if health.get("status") == "FAIL":
+                health["final_status"] = "FAIL"
+            elif valid_n > 0:
+                health["final_status"] = "VALID_REGULATION"
+            elif int(health.get("real_posts_found", 0) or 0) > 0:
+                health["final_status"] = "NO_RECENT_VALID"
+            else:
+                health["final_status"] = "NO_NEW"
+
     try:
         audit_df.to_excel(OUT_AUDIT_FILE, index=False)
         save_split_files(final_df)
@@ -2646,6 +2697,9 @@ def main():
     print(f"🧹 중복 제거: {dup_removed}")
     print(f"🧹 최종 필터 제외: {final_filter_removed}")
     print(f"✅ 최종 저장: {final_count}")
+    if not final_df.empty:
+        overseas_final = final_df[final_df["agency"].map(is_overseas_agency)]
+        print(f"🌏 해외 법규 최종 저장: {len(overseas_final)}건 / {overseas_final['agency'].nunique()}개 기관")
     print(f"📁 전체 파일: {OUT_ALL_FILE}")
     print(f"📁 감사 파일: {OUT_AUDIT_FILE}")
     print(f"📁 법규 파일: {OUT_REG_FILE}")

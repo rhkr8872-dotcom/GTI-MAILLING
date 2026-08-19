@@ -191,6 +191,7 @@ NEGATIVE_GUARD_TERMS = [
     '채용','인사발령','조직개편','복무','청렴','윤리','개인정보 보호',
     'urban policy','urban planning','whistleblower protection','recruitment',
     'personnel appointment','privacy policy'
+    ,'공휴일법','hari kelepasan','holiday act','국세기본법','전체 관세청 유관기관'
     ,'와인제품','포도주','denominação de origem','denomination of origin','geographical indication'
 ]
 
@@ -546,6 +547,7 @@ def clean_cumulative(old_raw: pd.DataFrame, keywords: list[str]) -> tuple[pd.Dat
             for x in mapping
         ]
         kept['EventType'] = kept['Headline'].apply(regulation_event_type)
+        kept = same_day_dedup(kept)
         kept['EventKey'] = kept.apply(regulation_event_key, axis=1)
         kept['_date_sort'] = pd.to_datetime(kept['Date'], errors='coerce')
         kept = kept.sort_values('_date_sort', ascending=False, kind='stable')
