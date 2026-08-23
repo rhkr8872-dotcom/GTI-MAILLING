@@ -43,6 +43,9 @@ EVENT_NOISE_TERMS = [
     "registration", "tender", "call for tender", "rfp", "expo", "opening ceremony", "ceremony", "join the upcoming",
     "live streaming",
     "웨비나", "세미나", "컨퍼런스", "서밋", "워크숍", "교육", "강의", "설명회", "포럼", "입찰", "공모", "행사", "참가신청",
+    "마약", "밀수", "특별검사팀", "현장 점검",
+    "thúc đẩy hợp tác hải quan", "đối thoại hải quan", "phiên đối thoại",
+    "sơ bộ tình hình xuất nhập khẩu", "bắt giữ", "giả nhãn hiệu", "lịch bảo trì hệ thống",
 ]
 TOPIC_RULES = [
     ("AD_CVD", ["anti-dumping", "anti dumping", "antidumping", "countervailing", "countervailing duty", "countervailing duties", "ad/cvd", "cvd", "dumping duties", "반덤핑", "덤핑방지관세", "덤핑사실", "국내산업피해", "조사개시결정", "상계관세", "무역구제"]),
@@ -808,6 +811,13 @@ def score_row(row):
     route_value = clean(row.get("ImportExportRoute", row.get("TradeRoute", "")))
     item_mapped = all(v and "확인 불가" not in v for v in [hs_value, product_value, entity_value, route_value])
 
+    # HS/AD-CVD/product measures always require product-level mapping even when
+    # STEP3 supplied a legacy POLICY_GENERAL value.
+    if topic in {"AD_CVD", "HS_CLASSIFICATION", "EXPORT_CONTROL", "CBAM_CARBON"}:
+        mapping_type = "PRODUCT_1TO1"
+    if hs_value and "확인 불가" not in hs_value:
+        mapping_type = "PRODUCT_1TO1"
+
     ai_impact = clean(analysis.get("Samsung Impact", "Watch")) or "Watch"
     mapping_status = clean(row.get("MappingStatus", "POLICY_REVIEW")) or "POLICY_REVIEW"
     if mapping_type == "ENTITY_DIRECT" and body_ok:
@@ -927,6 +937,11 @@ def _clean_legacy_cumulative(df):
             "전체 관세청 유관기관", "시스템 작업 안내", "오프라인 작업 안내",
             "시범운영 시행 안내", "서비스 일시중단", "점검 작업 안내",
             "공휴일법", "hari kelepasan", "holiday act", "국세기본법",
+            "철도안전법", "음주운전", "범인도피", "상속재산가액",
+            "방송통신기자재등 시험기관", "자원순환에 관한 법률", "수출검역요령",
+            "마약", "밀수", "특별검사팀", "현장 점검",
+            "thúc đẩy hợp tác hải quan", "đối thoại hải quan", "phiên đối thoại",
+            "sơ bộ tình hình xuất nhập khẩu", "bắt giữ", "giả nhãn hiệu", "lịch bảo trì hệ thống",
         ]):
             continue
 
@@ -980,7 +995,9 @@ def _clean_legacy_cumulative(df):
     cleaned = pd.DataFrame(keep_rows, columns=OUTPUT_COLS)
     if cleaned.empty:
         return normalize_cum_cols(cleaned)
-    cleaned["_date_key"] = pd.to_datetime(cleaned["Date"], errors="coerce").dt.strftime("%Y-%m-%d").fillna("")
+    cleaned["_date_key"] = pd.to_datetime(
+        cleaned["Date"], errors="coerce", format="mixed"
+    ).dt.strftime("%Y-%m-%d").fillna("")
     cleaned["_title_key"] = cleaned["Headline"].fillna("").astype(str).str.lower().str.replace(r"\s+", " ", regex=True).str.strip()
     cleaned = cleaned.drop_duplicates(["_title_key", "_date_key"], keep="last")
     return normalize_cum_cols(cleaned.drop(columns=["_title_key", "_date_key"], errors="ignore"))

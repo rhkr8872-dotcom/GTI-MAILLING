@@ -30,7 +30,7 @@ from html import unescape
 from html.parser import HTMLParser
 from pathlib import Path
 from urllib.error import URLError
-from urllib.parse import parse_qs, quote, urlencode, urljoin, urlparse
+from urllib.parse import parse_qs, quote, unquote, urlencode, urljoin, urlparse
 from urllib.request import Request, urlopen
 
 import pandas as pd
@@ -591,6 +591,34 @@ def find_best_anchor(container, base_url, href_keyword=None):
             score += 10
         if any(k.lower() in title.lower() for k in TRADE_WORDS):
             score += 30
+
+        # Several overseas boards (notably India DGFT) expose only a generic
+        # Download label. Recover the actual document title from metadata,
+        # the row text, or finally the PDF filename.
+        if re.fullmatch(r"(?:download|view)(?:\s*\(type\s*:\s*pdf\))?", title, re.I):
+            candidates = [
+                clean_text(a.get("title", "")),
+                clean_text(a.get("aria-label", "")),
+                clean_text(container.get_text(" ", strip=True)),
+            ]
+            filename = unquote(Path(urlparse(link).path).name)
+            filename = re.sub(r"\.(?:pdf|docx?|xlsx?)$", "", filename, flags=re.I)
+            filename = re.sub(r"[_]+", " ", filename)
+            candidates.append(clean_text(filename))
+            for candidate in candidates:
+                candidate = re.sub(
+                    r"(?i)\bdownload\s*\(type\s*:\s*pdf\)\b|\bdownload\b",
+                    " ", candidate,
+                )
+                candidate = re.sub(
+                    r"\b(?:20\d{2}[-/.]\d{1,2}[-/.]\d{1,2}|\d{1,2}[-/.]\d{1,2}[-/.]20\d{2})\b",
+                    " ", candidate,
+                )
+                candidate = clean_text(candidate)
+                if len(candidate) >= 12 and not re.fullmatch(r"(?:pdf|view|notification)", candidate, re.I):
+                    title = candidate
+                    score = len(title) + 25
+                    break
 
         item = (score, title, link)
         if best is None or item[0] > best[0]:

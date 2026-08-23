@@ -71,6 +71,8 @@ MAX_OUTPUT = int(os.getenv("GTI_STEP3_TARGET_MAX", "300"))
 MIN_SCORE = 20
 MAX_PER_ISSUE_CLUSTER = int(os.getenv("GTI_STEP3_CLUSTER_KEEP", "2"))
 MAX_TRADE_GENERAL_OUTPUT = int(os.getenv("GTI_STEP3_TRADE_GENERAL_MAX", "80"))
+ALLOW_MISSING_NEWS_INPUT = os.getenv("GTI_ALLOW_MISSING_NEWS_INPUT", "N").strip().upper() in {"Y", "YES", "TRUE", "1"}
+INPUT_MAX_AGE_HOURS = float(os.getenv("GTI_NEWS_INPUT_MAX_AGE_HOURS", "18"))
 
 # STEP3 최종 Summary Tier 배분 목표
 # - STEP3는 임원보고 최종본이 아니라 STEP4 AI 분석 후보군입니다.
@@ -578,6 +580,39 @@ GTI_LOW_VALUE_CONTEXT = [
     "맛집", "축제", "관광", "도민체전", "체전", "야구", "축구", "범죄", "사기", "구속", "검거",
 ]
 
+HARD_SCOPE_EXCLUDE_TITLE_TERMS = [
+    # 범죄·마약 단속: 관세청이 등장해도 삼성전자 관세업무 보고 대상이 아님
+    "마약", "코카인", "필로폰", "합성대마", "대마초", "다크웹", "마약수사",
+    "drug bust", "drug seizure", "narcotics", "cocaine", "methamphetamine",
+    # 기술탈취·영업비밀·형사사건: 기술보호/법무 영역
+    "기술 탈취", "기술탈취", "기술 유출", "산업기술 유출", "영업비밀", "폭탄 증언",
+    "trade secret theft", "technology theft", "industrial espionage",
+]
+
+MACRO_NOISE_TITLE_TERMS = [
+    "인플레이션", "물가", "성장률", "수출 호황", "수출 증가", "일자리 전망",
+    "주가", "특징주", "실적", "경제 전망", "증시", "시황", "클라우드", "성장판",
+    "수주전", "공공 금융", "시장 점유율", "판매 호조",
+    "inflation", "economic growth", "stock price", "earnings", "market outlook",
+    "cloud growth", "market share", "sales growth",
+]
+
+CONCRETE_TITLE_ACTION_TERMS = [
+    "section 232", "section 301", "232조", "301조", "반덤핑", "상계관세",
+    "세이프가드", "예비판정", "최종판정", "조사 개시", "관세 부과", "관세 인상",
+    "수입금지", "수출통제", "원산지 규정", "통관절차 개정", "품목분류 결정",
+    "anti-dumping", "countervailing", "safeguard", "tariff imposed", "export control",
+]
+
+
+def is_hard_scope_excluded(row: pd.Series) -> bool:
+    title = clean(row.get("Headline", row.get("Title", ""))).lower()
+    if contains_any(title, HARD_SCOPE_EXCLUDE_TITLE_TERMS):
+        return True
+    if contains_any(title, MACRO_NOISE_TITLE_TERMS) and not contains_any(title, CONCRETE_TITLE_ACTION_TERMS):
+        return True
+    return False
+
 EVENT_ONLY_TERMS = [
     "경진대회", "품목분류 경진", "실력 겨루", "겨룬다", "퀴즈대회", "공모전", "시상식",
     "세미나", "웨비나", "설명회", "포럼", "컨퍼런스", "워크숍",
@@ -593,7 +628,7 @@ CONCRETE_MEASURE_TERMS = [
 
 def is_event_only_news(row: pd.Series) -> bool:
     title = clean(row.get("Headline", row.get("Title", ""))).lower()
-    text = analysis_text(row).lower()
+    text = f"{analysis_text(row)} {clean(row.get('Country', ''))}".lower()
     return (
         any(term in title for term in EVENT_ONLY_TERMS)
         and not any(term in text for term in CONCRETE_MEASURE_TERMS)
@@ -750,6 +785,43 @@ def clean(value: object) -> str:
     return str(value).strip()
 
 
+def validate_required_news_inputs(paths: list[Path]) -> None:
+    """Fail closed when any collector output is missing, empty, unreadable or stale."""
+    failures = []
+    now_ts = datetime.now().timestamp()
+    for path in paths:
+        if not path.exists():
+            failures.append(f"MISSING:{path.name}")
+            continue
+        if path.stat().st_size <= 0:
+            failures.append(f"EMPTY_FILE:{path.name}")
+            continue
+        age_hours = max(0.0, (now_ts - path.stat().st_mtime) / 3600)
+        if age_hours > INPUT_MAX_AGE_HOURS:
+            failures.append(f"STALE:{path.name}:{age_hours:.1f}h")
+            continue
+        try:
+            probe = pd.read_excel(path, nrows=1)
+            if len(probe.columns) == 0:
+                failures.append(f"NO_COLUMNS:{path.name}")
+        except Exception as exc:
+            failures.append(f"UNREADABLE:{path.name}:{type(exc).__name__}")
+
+    if not failures:
+        log(f"INPUT COMPLETENESS OK: {len(paths)}/{len(paths)} files / max_age={INPUT_MAX_AGE_HOURS:g}h")
+        return
+
+    message = "NEWS INPUT INCOMPLETE: " + " | ".join(failures)
+    if ALLOW_MISSING_NEWS_INPUT:
+        log("WARNING " + message + " / override=GTI_ALLOW_MISSING_NEWS_INPUT=Y")
+        return
+    raise RuntimeError(
+        message + ". Run 2-1, 2-2 and 2-3 successfully before STEP3-2. "
+        "STEP3-2 did not create a new summary: DO NOT run STEP4-2 until all three collectors succeed. "
+        "Emergency override only: set GTI_ALLOW_MISSING_NEWS_INPUT=Y."
+    )
+
+
 def normalize_columns(df: pd.DataFrame) -> pd.DataFrame:
     df = df.copy()
     df.columns = [str(c).strip().lower() for c in df.columns]
@@ -800,7 +872,7 @@ def is_false_positive_policy_news(row: pd.Series) -> bool:
         clean(row.get("InputKeyword", "")),
     ]).lower()
 
-    if is_event_only_news(row):
+    if is_hard_scope_excluded(row) or is_event_only_news(row):
         return True
 
     # Section 301/232, 반덤핑, FTA 등 강한 정책 신호가 있으면 보존
@@ -1585,13 +1657,15 @@ def infer_samsung_impact(row: pd.Series) -> str:
         "customs", "통관", "수출통제", "export control", "제재", "sanction",
         "fta", "certificate of origin", "cbam", "hs code", "품목분류",
     ])
-    route_signal = direct_country and product_signal and customs_action and high_policy
-
-    # 삼성 명칭만으로 Direct를 부여하지 않는다. 삼성 판매제품/핵심부품과
-    # 생산·판매국가의 실제 관세조치 또는 수출입 경로가 함께 확인되어야 한다.
-    if "SAMSUNG_MENTION" in signals and customs_action and (product_signal or direct_country):
-        return "Direct"
-    if route_signal:
+    # STEP3 Direct 후보도 4개 축을 모두 요구한다: 삼성 명시 + 제품 + 법인국가 + 조치.
+    # 국가/제품/관세 키워드의 단순 동시 출현만으로 Direct를 만들지 않는다.
+    if (
+        "SAMSUNG_MENTION" in signals
+        and product_signal
+        and direct_country
+        and customs_action
+        and high_policy
+    ):
         return "Direct"
     if product_signal or high_policy or "PRODUCTION_COUNTRY" in signals:
         return "Indirect"
@@ -1923,7 +1997,7 @@ def make_issue_cluster_key(row: pd.Series) -> str:
     Avoids collapsing unrelated tariff stories into one global cluster.
     """
     issue = clean(row.get("IssueKey", "")) or "TRADE_GENERAL"
-    text = analysis_text(row).lower()
+    text = f"{analysis_text(row)} {clean(row.get('Country', ''))}".lower()
     title_text = clean(row.get("Headline", "")).lower()
 
     if (
@@ -1942,6 +2016,14 @@ def make_issue_cluster_key(row: pd.Series) -> str:
 
     # 의미 기반 핵심 사건 앵커. 언론사·표현·번역이 달라도 동일 사건은 하나로 묶는다.
     semantic_events = [
+        ("US_CANADA_50PCT_RETALIATORY_TARIFFS", [
+            ["미국", "美", "미,", "미-", "미·", "미 캐나다", "미 관세", "usa", "us ", "u.s.", "united states"], ["캐나다", "canada"],
+            ["관세", "tariff"],
+        ]),
+        ("KR_FLOOD_CUSTOMS_RELIEF", [
+            ["호우", "침수", "수해", "flood"],
+            ["관세", "세관", "customs", "납부기한", "관세조사", "원산지검증", "신속통관", "통관 지원", "지원책"],
+        ]),
         ("US_SECTION232_DRONE_COMPONENTS_TARIFF", [
             ["드론", "drone", "무인기", "uas"],
             ["section 232", "무역확장법 232", "232조"],
@@ -2795,9 +2877,10 @@ def main() -> None:
     global MIN_SCORE
     MIN_SCORE = args.min_score
 
-    log("GTI v5.6 STEP3-2 QUALITY-FIRST NEWS CANDIDATE ENGINE START")
+    log("GTI v5.10 STEP3-2 INPUT-CHAIN GUARD + BROAD EVENT-ANCHOR START")
 
     keywords = load_keywords()
+    validate_required_news_inputs(INPUT_FILES)
     df = load_data(INPUT_FILES)
     df = remove_regulation_rows(df)
     df = remove_old_data(df, args.hours)
@@ -2869,7 +2952,7 @@ def main() -> None:
     write_excel(args.output, final_df, "news_summary")
     write_excel(args.cumulative, cumulative_df, "news_cumulative")
 
-    log(f"GTI v5.3 STEP3-2 COMPLETE: candidates={len(final_df)} / cumulative={len(cumulative_df)}")
+    log(f"GTI v5.10 STEP3-2 COMPLETE: candidates={len(final_df)} / cumulative={len(cumulative_df)}")
     log(f"SAVE: {args.output}")
     log(f"SAVE: {args.cumulative}")
 

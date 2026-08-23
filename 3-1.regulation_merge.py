@@ -61,6 +61,7 @@ GENERAL_CUSTOMS_PROCEDURE_TERMS = [
 ]
 ITEM_SPECIFIC_TERMS = [
     'hs code','hs코드','품목분류','tariff classification','반덤핑','anti-dumping','antidumping',
+    '덤핑방지관세','덤핑방지','anti dumping',
     '상계관세','countervailing','세이프가드','safeguard','쿼터','quota','대상품목','특정품목',
     '덤핑사실','국내산업피해','조사개시결정','무역위원회공고',
     '수출통제','export control','entity list','전략물자','cbam','탄소국경',
@@ -85,7 +86,12 @@ def regulation_mapping_type(row: pd.Series, title: str) -> tuple[str, str, str]:
 
 NOISE_TERMS = [
     '채용','합격자','인사','승진','교육','세미나','웨비나','행사','입찰','공모','마약','밀수','범죄',
-    'recruitment','webinar','seminar','conference','tender','drug seizure','smuggling','ceremony'
+    'recruitment','webinar','seminar','conference','tender','drug seizure','smuggling','ceremony',
+    # Vietnam Customs news/statistics/enforcement pages are official posts but
+    # not new or amended customs regulations.
+    'thúc đẩy hợp tác hải quan','đối thoại hải quan','phiên đối thoại',
+    'sơ bộ tình hình xuất nhập khẩu','tình hình xuất nhập khẩu',
+    'bắt giữ','hàng giả','giả nhãn hiệu','lịch bảo trì hệ thống'
 ]
 
 def clean(v) -> str:
@@ -177,6 +183,9 @@ def keyword_hits(title: str, keywords: list[str]) -> list[str]:
         if re.fullmatch(r'[a-z0-9]{2,4}', nk):
             if re.search(rf'(?<![a-z0-9]){re.escape(nk)}(?![a-z0-9])', t):
                 hits.append(k)
+        elif nk == '세관':
+            if re.search(r'(?<!과)세관(?!청)', t):
+                hits.append(k)
         elif nk in t:
             hits.append(k)
     return hits
@@ -192,6 +201,10 @@ NEGATIVE_GUARD_TERMS = [
     'urban policy','urban planning','whistleblower protection','recruitment',
     'personnel appointment','privacy policy'
     ,'공휴일법','hari kelepasan','holiday act','국세기본법','전체 관세청 유관기관'
+    ,'방송통신기자재등 시험기관','자원순환에 관한 법률','수출검역요령','토마토 생과실'
+    ,'thúc đẩy hợp tác hải quan','đối thoại hải quan','phiên đối thoại'
+    ,'sơ bộ tình hình xuất nhập khẩu','tình hình xuất nhập khẩu'
+    ,'bắt giữ','hàng giả','giả nhãn hiệu','lịch bảo trì hệ thống'
     ,'와인제품','포도주','denominação de origem','denomination of origin','geographical indication'
 ]
 
@@ -253,7 +266,16 @@ STRONG_CUSTOMS_TERMS = [
 
 def strong_customs_rule(title: str) -> tuple[bool, list[str]]:
     t = norm(title)
-    hits = [term for term in STRONG_CUSTOMS_TERMS if term in t]
+    hits = []
+    for term in STRONG_CUSTOMS_TERMS:
+        if term == '세관':
+            if re.search(r'(?<!과)세관(?!청)', t):
+                hits.append(term)
+        elif re.fullmatch(r'[a-z0-9]{2,4}', term):
+            if re.search(rf'(?<![a-z0-9]){re.escape(term)}(?![a-z0-9])', t):
+                hits.append(term)
+        elif term in t:
+            hits.append(term)
     customs_context = any(x in t for x in [
         '관세','통관','세관','수입신고','수출신고','보세','환급','tariff','customs','duty','clearance'
     ])
@@ -276,6 +298,8 @@ def strong_customs_rule(title: str) -> tuple[bool, list[str]]:
 
 
 def ai_judge(title: str, agency: str) -> tuple[bool,int,str]:
+    if re.fullmatch(r'\s*(?:download(?:\s*\(type\s*:\s*pdf\))?|pdf|view|notification|public notice)\s*', title, re.I):
+        return False, 0, "GENERIC_DOCUMENT_TITLE_REQUIRES_BODY"
     if client is None:
         return False, 0, "AI_OFF"
 
@@ -285,6 +309,7 @@ def ai_judge(title: str, agency: str) -> tuple[bool,int,str]:
         "Relevant means customs, tariff, clearance, HS classification, origin/FTA, AD/CVD/safeguard, "
         "export control/sanctions, CBAM or another trade-compliance obligation.\n"
         "Do NOT mark generic economy, industry, competition-law, recruitment, events, crime or statistics as relevant.\n"
+        "The agency name alone is never enough. A generic Download/PDF title must be false until the document body is read.\n"
         f"Title: {title}\nAgency: {agency}"
     )
 
@@ -633,6 +658,12 @@ def main():
 
         if not strong_rel and not keyword_rel and not noise and not negative_guard:
             ai_rel, ai_score, ai_reason = ai_judge(title, clean(r['Agency']))
+            rescue_terms = [
+                '대외경제','수출입','무역','통상','외환','trade','import','export',
+                'customs','tariff','duty','origin','sanction','export control',
+            ]
+            concrete_title = any(x in norm(title) for x in rescue_terms)
+            ai_rel = bool(ai_rel and ai_score >= 80 and concrete_title)
 
         # Strong customs terms are hard-keep; negative guard applies only to
         # keyword/AI rescue cases.

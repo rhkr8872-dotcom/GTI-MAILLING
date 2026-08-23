@@ -40,6 +40,12 @@ REGULATION_INPUT_FILE = Path(os.getenv("GTI_REGULATION_INPUT_FILE", r"C:\Temp\4-
 NEWS_INPUT_FILE = Path(os.getenv("GTI_NEWS_INPUT_FILE", r"C:\Temp\4-2.news_ai_summary.xlsx"))
 OUTPUT_DIR = Path(os.getenv("GTI_OUTPUT_DIR", r"C:\Temp\12345\c_type_outputs"))
 RUN_DATE = os.getenv("GTI_RUN_DATE", datetime.now().strftime("%Y-%m-%d"))
+LAW_ONLY_MODE = os.getenv("GTI_LAW_ONLY", "N").strip().upper() in {
+    "Y", "YES", "TRUE", "1"
+}
+REQUIRE_FRESH_NEWS = os.getenv("GTI_REQUIRE_FRESH_NEWS", "N").strip().upper() in {
+    "Y", "YES", "TRUE", "1"
+}
 
 NEWS_MAX_ROWS = int(os.getenv("GTI_NEWS_MAX_ROWS", "0"))  # 0 = no cap
 SEND_EMAIL = os.getenv("GTI_SEND_EMAIL", "Y").strip().upper() in {"Y", "YES", "TRUE", "1"}
@@ -4103,7 +4109,7 @@ def prepare_rows(rows: pd.DataFrame) -> pd.DataFrame:
     return rows
 
 def save_excel(rows: pd.DataFrame, top3: pd.DataFrame, paths: dict[str, Path]) -> None:
-    """v19 override: ensure all configured OUTPUT_COLUMNS exist before saving."""
+    """Save daily report and append event-level history without overwriting cumulative."""
     rows = ensure_output_columns_v19(rows)
     top3 = ensure_output_columns_v19(top3)
     paths["mail_xlsx"].parent.mkdir(parents=True, exist_ok=True)
@@ -4119,7 +4125,45 @@ def save_excel(rows: pd.DataFrame, top3: pd.DataFrame, paths: dict[str, Path]) -
             width = min(max(len(str(c.value or "")) for c in col_cells) + 2, 60)
             ws.column_dimensions[col_cells[0].column_letter].width = width
 
-    rows[OUTPUT_COLUMNS].to_excel(paths["cumulative"], index=False)
+    if paths["cumulative"].exists():
+        try:
+            old_cumulative = pd.read_excel(paths["cumulative"])
+        except Exception as exc:
+            raise RuntimeError(
+                f"cumulative read failed; existing history was not overwritten: "
+                f"{paths['cumulative']} / {type(exc).__name__}: {exc}"
+            )
+    else:
+        old_cumulative = pd.DataFrame(columns=OUTPUT_COLUMNS)
+
+    cumulative_parts = [frame for frame in (old_cumulative, rows) if not frame.empty]
+    combined = (
+        pd.concat(cumulative_parts, ignore_index=True, sort=False)
+        if cumulative_parts else pd.DataFrame(columns=OUTPUT_COLUMNS)
+    )
+    for col in OUTPUT_COLUMNS:
+        if col not in combined.columns:
+            combined[col] = ""
+
+    def cumulative_event_key(r: pd.Series) -> str:
+        content_type = clean(r.get("Content Type")).lower()
+        cluster = clean(r.get("Cluster")).lower()
+        url = clean(r.get("URL")).lower()
+        headline = re.sub(r"\s+", " ", clean(r.get("Headline")).lower()).strip()
+        if content_type == "news" and cluster:
+            identity = "cluster:" + cluster
+        else:
+            identity = "url:" + url if url else "headline:" + headline
+        return content_type + "|" + identity
+
+    before = len(combined)
+    combined["_cum_key"] = combined.apply(cumulative_event_key, axis=1)
+    combined = combined.drop_duplicates("_cum_key", keep="last").drop(columns="_cum_key")
+    combined[OUTPUT_COLUMNS].to_excel(paths["cumulative"], index=False)
+    print(
+        f"[STEP5 CUMULATIVE] old={len(old_cumulative)} + daily={len(rows)} "
+        f"-> {len(combined)} / duplicate_removed={before-len(combined)}"
+    )
 
 # Ensure OUTPUT_COLUMNS includes weighted columns safely.
 for _col in WEIGHTED_COLS_V19:
@@ -5386,6 +5430,7 @@ for _v27_col in _V27_AUDIT_COLUMNS:
         OUTPUT_COLUMNS.append(_v27_col)
 for _reg_map_col in [
     "RegulationMappingType", "MappingStatus", "RequiredMappingKeys", "EntityDirectFlag",
+    "MappedEntity", "MappedProduct", "MappedHS", "TradeRoute", "MappingEvidence",
     "SamsungRelevanceScore", "CustomsTradePolicyScore", "DirectImpactScore", "WeightedScore",
 ]:
     if _reg_map_col not in OUTPUT_COLUMNS:
@@ -5678,6 +5723,11 @@ def normalize_input(df: pd.DataFrame, content_type: str, source_file: Path) -> p
         "MappingStatus": ["MappingStatus", "mapping_status"],
         "RequiredMappingKeys": ["RequiredMappingKeys", "required_mapping_keys"],
         "EntityDirectFlag": ["EntityDirectFlag", "entity_direct_flag"],
+        "MappedEntity": ["MappedEntity", "mapped_entity"],
+        "MappedProduct": ["MappedProduct", "mapped_product"],
+        "MappedHS": ["MappedHS", "mapped_hs"],
+        "TradeRoute": ["TradeRoute", "trade_route"],
+        "MappingEvidence": ["MappingEvidence", "mapping_evidence"],
         "SamsungRelevanceScore": ["SamsungRelevanceScore", "samsung_relevance_score"],
         "CustomsTradePolicyScore": ["CustomsTradePolicyScore", "PolicyScore", "customs_trade_policy_score"],
         "DirectImpactScore": ["DirectImpactScore", "direct_impact_score"],
@@ -5732,7 +5782,7 @@ def choose_top3(rows: pd.DataFrame) -> pd.DataFrame:
 # Regulation remains event-based and is not subjected to the news 24h rule.
 # ======================================================================
 
-GTI_STEP5_VERSION = "v321 WATCH-SAFE HANDOFF + SEMANTIC DEDUP"
+GTI_STEP5_VERSION = "v327 UNIFIED LAW + NEWS FAIL-SAFE REPORT"
 
 
 def _v319_parse_news_date(row: pd.Series):
@@ -5801,6 +5851,17 @@ def _v321_news_semantic_key(row: pd.Series) -> str:
     if (all(any(term in text for term in group) for group in drone[:1] + drone[2:])
             and any(term in title for term in drone[1])):
         return "US_DRONE_232_TARIFF"
+    if (
+        any(x in text for x in ["미국", "美", "미,", "미-", "미·", "미 캐나다", "미 관세", "usa", "us ", "u.s.", "united states"])
+        and any(x in text for x in ["캐나다", "canada"])
+        and any(x in text for x in ["관세", "tariff"])
+    ):
+        return "US_CANADA_50PCT_RETALIATORY_TARIFFS"
+    if (
+        any(x in text for x in ["호우", "침수", "수해", "flood"])
+        and any(x in text for x in ["관세", "세관", "customs", "납부기한", "관세조사", "원산지검증", "신속통관", "통관 지원", "지원책"])
+    ):
+        return "KR_FLOOD_CUSTOMS_RELIEF"
     return clean(row.get("Cluster")) or clean(row.get("Headline")).lower()
 
 
@@ -5817,21 +5878,32 @@ def read_step4_results() -> pd.DataFrame:
     else:
         print(f"[STEP5 WARN] regulation input missing: {REGULATION_INPUT_FILE}")
 
-    if NEWS_INPUT_FILE.exists():
+    use_news = NEWS_INPUT_FILE.exists() and not LAW_ONLY_MODE
+    if use_news:
         # 실패한 STEP4-2가 남긴 과거 결과를 재사용하지 않는다.
         max_input_age_hours = int(os.getenv("GTI_STEP5_INPUT_MAX_AGE_HOURS", "8"))
         file_age_hours = (time.time() - NEWS_INPUT_FILE.stat().st_mtime) / 3600
         if file_age_hours > max_input_age_hours:
-            raise RuntimeError(
+            message = (
                 f"STEP4-2 news output is stale ({file_age_hours:.1f}h > {max_input_age_hours}h): "
-                f"{NEWS_INPUT_FILE}. Run 4-2 successfully before STEP5."
+                f"{NEWS_INPUT_FILE}"
             )
+            if REQUIRE_FRESH_NEWS:
+                raise RuntimeError(message + ". Run 4-2 successfully before STEP5.")
+            print(f"[STEP5 STALE NEWS SKIP] {message}; regulation report continues")
+            use_news = False
         step32_input = NEWS_INPUT_FILE.parent / "3-2.news_summary.xlsx"
-        if step32_input.exists() and NEWS_INPUT_FILE.stat().st_mtime < step32_input.stat().st_mtime:
-            raise RuntimeError(
+        if use_news and step32_input.exists() and NEWS_INPUT_FILE.stat().st_mtime < step32_input.stat().st_mtime:
+            message = (
                 f"STEP4-2 news output is older than STEP3-2 input: {NEWS_INPUT_FILE.name} < "
-                f"{step32_input.name}. Run 4-2 successfully before STEP5."
+                f"{step32_input.name}"
             )
+            if REQUIRE_FRESH_NEWS:
+                raise RuntimeError(message + ". Run 4-2 successfully before STEP5.")
+            print(f"[STEP5 OLD NEWS SKIP] {message}; regulation report continues")
+            use_news = False
+
+    if use_news:
         raw_news = pd.read_excel(NEWS_INPUT_FILE)
         required = {"AIRelevant", "AIRelevanceScore", "Body Verified", "Policy Event"}
         missing = sorted(required - set(raw_news.columns))
@@ -5879,12 +5951,18 @@ def read_step4_results() -> pd.DataFrame:
                 )
         frames.append(news)
     else:
-        print(f"[STEP5 WARN] news input missing: {NEWS_INPUT_FILE}")
+        if LAW_ONLY_MODE:
+            print("[STEP5 LAW-ONLY] news is intentionally excluded; regulation report continues")
+        elif NEWS_INPUT_FILE.exists():
+            print("[STEP5 INFO] news excluded from this run; regulation report continues")
+        else:
+            print(f"[STEP5 WARN] news input missing: {NEWS_INPUT_FILE}; regulation report continues")
 
     if not frames:
         raise FileNotFoundError(f"STEP4 outputs not found: {REGULATION_INPUT_FILE}, {NEWS_INPUT_FILE}")
 
-    rows = pd.concat(frames, ignore_index=True, sort=False)
+    nonempty_frames = [frame for frame in frames if not frame.empty]
+    rows = pd.concat(nonempty_frames or frames, ignore_index=True, sort=False)
     rows["_exact_key"] = rows.apply(
         lambda r: (
             clean(r.get("Content Type")),
@@ -5920,9 +5998,92 @@ def read_step4_results() -> pd.DataFrame:
     return rows.reset_index(drop=True)
 
 
+def _v322_hard_scope_excluded(row: pd.Series) -> bool:
+    if clean(row.get("Content Type")) != "News":
+        return False
+    title = clean(row.get("Headline")).lower()
+    hard = [
+        "마약", "코카인", "필로폰", "합성대마", "대마초", "다크웹", "마약수사",
+        "drug bust", "drug seizure", "narcotics", "cocaine", "methamphetamine",
+        "기술 탈취", "기술탈취", "기술 유출", "산업기술 유출", "영업비밀", "폭탄 증언",
+        "trade secret theft", "technology theft", "industrial espionage",
+    ]
+    macro = [
+        "인플레이션", "물가", "성장률", "수출 호황", "수출 증가", "일자리 전망",
+        "주가", "특징주", "실적", "경제 전망", "증시", "시황",
+        "inflation", "economic growth", "stock price", "earnings", "market outlook",
+    ]
+    concrete = [
+        "section 232", "section 301", "232조", "301조", "반덤핑", "상계관세", "세이프가드",
+        "예비판정", "최종판정", "조사 개시", "관세 부과", "관세 인상", "수출통제",
+        "anti-dumping", "countervailing", "safeguard", "tariff imposed", "export control",
+    ]
+    return any(x in title for x in hard) or (
+        any(x in title for x in macro) and not any(x in title for x in concrete)
+    )
+
+
+def _v322_recalibrate_news(rows: pd.DataFrame) -> pd.DataFrame:
+    if rows.empty:
+        return rows
+    rows = rows.copy()
+    noise = rows.apply(_v322_hard_scope_excluded, axis=1)
+    if noise.any():
+        print(f"[STEP5 BUSINESS-SCOPE GUARD] removed={int(noise.sum())}")
+        rows = rows.loc[~noise].copy()
+
+    valid_mapping = {"ENTITY_CONFIRMED", "ITEM_1TO1_MAPPED"}
+    specific_issues = {"AD/CVD", "반덤핑/상계관세", "HS/품목분류", "FTA/원산지"}
+    downgraded = 0
+    for idx, row in rows.iterrows():
+        if clean(row.get("Content Type")) != "News":
+            continue
+        status = clean(row.get("MappingStatus"))
+        issue = clean(row.get("Issue"))
+        impact = clean(row.get("Samsung Impact"))
+        mapped_hs = clean(row.get("MappedHS"))
+        mapping_evidence = clean(row.get("MappingEvidence"))
+        direct_evidence = clean(row.get("Direct Evidence"))
+        invalid_hs = bool(re.fullmatch(r"(?:19|20)\d{2}(?:\.\d+)?", mapped_hs))
+        candidate_mapping = any(
+            x in " ".join([clean(row.get("MappedProduct")), mapped_hs, clean(row.get("TradeRoute"))]).lower()
+            for x in ["후보", "확인 필요", "verify", "candidate"]
+        )
+        mapping_ok = status in valid_mapping
+        if issue in specific_issues:
+            mapping_ok = status == "ITEM_1TO1_MAPPED"
+        if invalid_hs or candidate_mapping:
+            mapping_ok = False
+        # ENTITY_CONFIRMED alone is insufficient: the evidence must identify
+        # Samsung in the concrete customs event, not merely in AI-generated prose.
+        if status == "ENTITY_CONFIRMED":
+            mapping_ok = bool(re.search(r"삼성|samsung", direct_evidence, re.I))
+        if mapping_evidence == "ARTICLE_ENTITY_PRODUCT" and not direct_evidence:
+            mapping_ok = False
+        if impact == "Direct" and not mapping_ok:
+            rows.at[idx, "Samsung Impact"] = "Indirect" if clean(row.get("Policy Event")).upper() == "Y" else "Watch"
+            rows.at[idx, "Top3 Eligible"] = "N"
+            downgraded += 1
+        top3_ok = (
+            clean(rows.at[idx, "Samsung Impact"]) == "Direct"
+            and mapping_ok
+            and clean(row.get("Body Verified")).upper() == "Y"
+            and bool(clean(row.get("Official Evidence")))
+            and bool(clean(row.get("Direct Evidence")))
+        )
+        if not top3_ok:
+            rows.at[idx, "Top3 Eligible"] = "N"
+    if downgraded:
+        print(f"[STEP5 DIRECT MAPPING GUARD] downgraded={downgraded}")
+    return rows
+
+
 def prepare_rows(rows: pd.DataFrame) -> pd.DataFrame:
     """Format STEP4-selected rows; do not apply v22-v27 re-selection guards."""
     rows = rows.copy()
+    if rows.empty:
+        return rows
+    rows = _v322_recalibrate_news(rows)
     if rows.empty:
         return rows
     rows["Content Type"] = rows["Content Type"].apply(lambda v: "Regulation" if clean(v) == "Regulation" else "News")
@@ -5949,7 +6110,18 @@ def choose_top3(rows: pd.DataFrame) -> pd.DataFrame:
     pool["_top3_score"] = pool.apply(top3_deep_score, axis=1)
     pool["_top3_ok"] = pool.apply(
         lambda r: (
-            (clean(r.get("Content Type")) == "News" and clean(r.get("Samsung Impact")) == "Direct" and clean(r.get("Top3 Eligible")).upper() == "Y")
+            (
+                clean(r.get("Content Type")) == "News"
+                and clean(r.get("Samsung Impact")) == "Direct"
+                and clean(r.get("Top3 Eligible")).upper() == "Y"
+                and clean(r.get("MappingStatus")) in {"ENTITY_CONFIRMED", "ITEM_1TO1_MAPPED"}
+                and (
+                    clean(r.get("MappingStatus")) == "ITEM_1TO1_MAPPED"
+                    or bool(re.search(r"삼성|samsung", clean(r.get("Direct Evidence")), re.I))
+                )
+                and bool(clean(r.get("Official Evidence")))
+                and bool(clean(r.get("Direct Evidence")))
+            )
             or (
                 clean(r.get("Content Type")) == "Regulation"
                 and clean(r.get("Samsung Impact")) == "Direct"
@@ -5975,6 +6147,203 @@ def choose_top3(rows: pd.DataFrame) -> pd.DataFrame:
     if not out.empty:
         out["No"] = range(1, len(out) + 1)
     return out
+
+
+# STEP5 v324: STEP4-2 is the analysis owner.  Earlier STEP5 fallbacks replaced
+# article-specific analysis/action text with generic templates, which erased
+# the policy-to-Samsung decision trace.  Preserve verified STEP4 text and use
+# a generic fallback only when the upstream field is genuinely empty.
+def _v324_source_text(row: pd.Series, *names: str) -> str:
+    for name in names:
+        value = clean(row.get(name))
+        if value and value.lower() not in {"nan", "none", "null", "확인 필요"}:
+            return value
+    return ""
+
+
+def major_changes(row: pd.Series) -> str:
+    source = _v324_source_text(row, "Original Summary", "Summary")
+    missing = _v324_source_text(row, "Missing Facts")
+    if source:
+        if missing and "미확인" not in source:
+            source = f"{source}\n\n[미확인/추가 확인] {missing}"
+        return source
+    return _v9_generic_top3_summary(row)
+
+
+def report_summary(row: pd.Series) -> str:
+    return major_changes(row)
+
+
+def report_impact(row: pd.Series) -> str:
+    source = _v324_source_text(row, "Original AI Analysis", "AI Analysis")
+    if source:
+        return source
+    return _v9_generic_top3_impact(row)
+
+
+def report_action(row: pd.Series) -> str:
+    source = _v324_source_text(row, "Original Action Plan", "Action Plan")
+    if source:
+        return source
+    return _v9_generic_top3_action(row)
+
+
+def _issue_summary_detail(row: pd.Series) -> str:
+    issue = clean(row.get("Issue")) or "확인 필요"
+    country = clean(row.get("Country")) or "확인 필요"
+    date = clean(row.get("Publish Date")) or clean(row.get("Date")) or "확인 필요"
+    product = clean(row.get("MappedProduct")) or "미확인"
+    hs = clean(row.get("MappedHS")) or "미확인"
+    route = clean(row.get("TradeRoute")) or "미확인"
+    evidence = clean(row.get("Official Evidence")) or "공식 근거 미확인"
+    return (
+        f"• 이슈/조치단계: {issue}\n"
+        f"• 발표국·영향국: {country}\n"
+        f"• 게시/시행일: {date}\n"
+        f"• 삼성 매핑: 제품={product} / HS={hs} / 거래경로={route}\n"
+        f"• 공식 근거: {evidence}\n"
+        f"• 확인 사실 및 변경내역:\n{major_changes(row)}"
+    )
+
+
+# ======================================================================
+# STEP5 v326 - ONE ENGINE FOR LAW + NEWS
+# - Regulation: keep every STEP4-1 row and split verified/pending.
+# - News: keep v325 24h, scope, semantic-event and Direct evidence guards.
+# - Both branches retain their STEP4 article-specific analysis and actions.
+# ======================================================================
+_v326_prepare_base = prepare_rows
+
+
+def _v326_verified(row: pd.Series) -> bool:
+    return clean(row.get("Body Verified")).upper() == "Y"
+
+
+def _v326_reg_mapping_ok(row: pd.Series) -> bool:
+    status = clean(row.get("MappingStatus")).upper()
+    mapped = {
+        "ENTITY_CONFIRMED", "MAPPED", "COUNTRY_ENTITY_MAPPED",
+        "ITEM_1TO1_MAPPED", "POLICY_GENERAL_MAPPED",
+    }
+    values = " ".join([
+        clean(row.get("MappedEntity")), clean(row.get("MappedProduct")),
+        clean(row.get("MappedHS")), clean(row.get("TradeRoute")),
+    ]).lower()
+    candidate = any(x in values for x in ["후보", "확인 필요", "candidate", "verify"])
+    return status in mapped and not candidate
+
+
+def prepare_rows(rows: pd.DataFrame) -> pd.DataFrame:
+    rows = _v326_prepare_base(rows)
+    if rows.empty:
+        return rows
+    rows = rows.copy()
+    reg_mask = rows["Content Type"].astype(str).eq("Regulation")
+    rows["Verification Group"] = rows.get(
+        "Verification Group", pd.Series("", index=rows.index, dtype="object")
+    ).astype("object")
+    rows.loc[reg_mask, "Verification Group"] = rows.loc[reg_mask].apply(
+        lambda r: "Verified Regulation" if _v326_verified(r) else "Verification Pending", axis=1
+    )
+    rows.loc[~reg_mask, "Verification Group"] = rows.loc[~reg_mask].apply(
+        lambda r: "Verified Policy News" if _v326_verified(r) else "News Pending", axis=1
+    )
+
+    # 법규는 전체를 표시하되 원문 또는 매핑이 미완료된 항목을 Direct/Top3로
+    # 승격하지 않는다. 뉴스는 이미 v325의 더 엄격한 증거 게이트를 통과했다.
+    for idx, row in rows.loc[reg_mask].iterrows():
+        direct_ok = _v326_verified(row) and _v326_reg_mapping_ok(row)
+        if clean(row.get("Samsung Impact")) == "Direct" and not direct_ok:
+            rows.at[idx, "Samsung Impact"] = "Watch"
+            rows.at[idx, "Top3 Eligible"] = "N"
+        if not direct_ok:
+            rows.at[idx, "Top3 Eligible"] = "N"
+
+    rows["_report_score"] = rows.apply(report_score, axis=1)
+    rows = rows.sort_values(["_report_score", "_sort_date"], ascending=[False, False]).reset_index(drop=True)
+    rows["No"] = range(1, len(rows) + 1)
+    return rows
+
+
+def overall_html(rows: pd.DataFrame, top3: pd.DataFrame) -> str:
+    reg = rows[rows["Content Type"].eq("Regulation")]
+    news = rows[rows["Content Type"].eq("News")]
+    verification_group = reg.get(
+        "Verification Group", pd.Series("", index=reg.index, dtype="object")
+    ).astype(str)
+    verified_reg = reg[verification_group.eq("Verified Regulation")]
+    pending_reg = reg[~reg.index.isin(verified_reg.index)]
+    direct = rows[rows["Samsung Impact"].eq("Direct")]
+    indirect = rows[rows["Samsung Impact"].eq("Indirect")]
+    watch = rows[rows["Samsung Impact"].eq("Watch")]
+    issue_counts = rows["Issue"].replace("", "기타").fillna("기타").value_counts().head(6)
+    country_counts = rows["Country"].replace("", "국가확인필요").fillna("국가확인필요").value_counts().head(6)
+    issues = ", ".join(f"{html.escape(str(k))} {v}건" for k, v in issue_counts.items()) or "신규 핵심정책 없음"
+    countries = ", ".join(f"{html.escape(str(k))} {v}건" for k, v in country_counts.items()) or "국가정보 확인 필요"
+    top_lines = "".join(
+        f"<li><b>{html.escape(clean(r.get('Headline')))}</b> — {html.escape(one_line(r))}</li>"
+        for _, r in top3.iterrows()
+    ) or "<li>Direct 근거와 실행성을 모두 충족한 Top3 후보가 없습니다.</li>"
+    return f"""
+    <div style="padding:16px;background:#F4F6F8;border-left:6px solid #1F4E78;margin-bottom:18px;line-height:1.65;">
+      <div style="font-size:15px;font-weight:bold;color:#1F4E78;">A. 글로벌 관세·통상 정책 Radar</div>
+      <div>법규 {len(reg)}건(원문검증 {len(verified_reg)} / 검증대기 {len(pending_reg)}), 정책뉴스 {len(news)}건</div>
+      <div><b>주요 정책축:</b> {issues}</div>
+      <div><b>주요 국가:</b> {countries}</div>
+      <div style="margin-top:12px;font-size:15px;font-weight:bold;color:#C00000;">B. 삼성전자 관세업무 영향</div>
+      <div>Direct {len(direct)}건 / Indirect {len(indirect)}건 / Watch {len(watch)}건</div>
+      <div>법규는 원문검증·적용범위 매핑, 뉴스는 삼성 직접증거 또는 승인된 1:1 매핑을 기준으로 판정했습니다.</div>
+      <div style="margin-top:9px;"><b>경영진 우선 확인사항</b><ol style="margin-top:5px;">{top_lines}</ol></div>
+    </div>
+    """
+
+
+def top3_html(top3: pd.DataFrame) -> str:
+    if top3.empty:
+        return "<div style='padding:12px;background:#FFF7F7;border-left:5px solid #C00000;'>금일은 Direct 근거가 충분한 Top3가 없습니다. Watch 항목을 임의로 승격하지 않았습니다.</div>"
+    blocks = []
+    for idx, row in top3.iterrows():
+        evidence = " | ".join(x for x in [
+            clean(row.get("Official Evidence")), clean(row.get("Direct Evidence")), clean(row.get("Evidence")),
+        ] if x) or "원문 근거 확인 필요"
+        missing = clean(row.get("Missing Facts")) or "추가 확인사항 없음"
+        owner = clean(row.get("Owner")) or "HQ Customs/FTA + 해당 사업부·법인"
+        blocks.append(f"""
+        <div style="margin:14px 0 20px;padding:16px;border-left:5px solid #C00000;background:#FFF7F7;line-height:1.6;">
+          <div style="font-size:16px;font-weight:bold;">Top {idx+1}. {html_link(row.get('Headline'), row.get('URL'))}</div>
+          <div style="color:#555;margin:6px 0;">{html.escape(clean(row.get('Content Type')))} | {html.escape(clean(row.get('Country')))} | {html.escape(clean(row.get('Issue')))} | Risk {html.escape(clean(row.get('Risk')))}</div>
+          <div><b>1) 정책 변경 및 일정</b><br>{html.escape(short_text(row.get('Major Changes'), '변경내역 확인 필요', 1200)).replace(chr(10), '<br>')}</div>
+          <div style="margin-top:8px;"><b>2) 삼성전자 관세업무 영향</b><br>{html.escape(short_text(row.get('AI Analysis'), '영향 검토 필요', 1200)).replace(chr(10), '<br>')}</div>
+          <div style="margin-top:8px;"><b>3) 원문/직접 근거</b><br>{html.escape(short_text(evidence, '원문 근거 확인 필요', 900)).replace(chr(10), '<br>')}</div>
+          <div style="margin-top:8px;"><b>4) 미확인 Mapping</b><br>{html.escape(short_text(missing, '추가 확인사항 없음', 700)).replace(chr(10), '<br>')}</div>
+          <div style="margin-top:8px;"><b>5) 대응방안</b><br>{html.escape(short_text(row.get('Action Plan'), '담당 부서 확인 필요', 1200)).replace(chr(10), '<br>')}</div>
+          <div style="margin-top:6px;"><b>Owner:</b> {html.escape(owner)}</div>
+        </div>""")
+    return "".join(blocks)
+
+
+def build_html(rows: pd.DataFrame, top3: pd.DataFrame) -> str:
+    subject = f"[GTI Radar] Global Trade Intelligence | {RUN_DATE}"
+    regulation = rows[rows["Content Type"].eq("Regulation")]
+    verification_group = regulation.get(
+        "Verification Group", pd.Series("", index=regulation.index, dtype="object")
+    ).astype(str)
+    verified = regulation[verification_group.eq("Verified Regulation")]
+    pending = regulation[~regulation.index.isin(verified.index)]
+    news = rows[rows["Content Type"].eq("News")]
+    return f"""<!DOCTYPE html><html lang="ko"><head><meta charset="utf-8"><title>{html.escape(subject)}</title></head>
+<body style="font-family:Arial,'Malgun Gothic',sans-serif;font-size:13px;color:#222;line-height:1.55;">
+<div style="max-width:1600px;margin:0 auto;">
+<h2 style="margin-bottom:3px;color:#1F4E78;">[GTI Radar] Global Trade Intelligence</h2>
+<div style="color:#555;margin-bottom:16px;">{RUN_DATE} | Samsung Electronics Customs & Trade Intelligence</div>
+<h3>1. Executive Summary</h3>{overall_html(rows, top3)}
+<h3 style="color:#C00000;">2. Samsung Customs Top3 Deep Analysis</h3>{top3_html(top3)}
+{table_html('3-1. Verified Regulation', verified, '#1F4E78')}
+{table_html('3-2. Verification Pending', pending, '#7F8C8D')}
+{table_html('4. Global Customs & Trade Policy News', news, '#548235')}
+<p style="margin-top:18px;color:#666;font-size:12px;">법규와 뉴스는 동일 메일 엔진에서 처리하되 서로 다른 Direct 판정 기준을 적용합니다.</p>
+</div></body></html>"""
 
 # ======================================================================
 # End of GTI STEP5 v319

@@ -10,6 +10,7 @@ GTI STEP4-2 NEWS AI v25 CLEAN
 
 from __future__ import annotations
 import os, re, json, time, html as html_lib
+from difflib import SequenceMatcher
 from pathlib import Path
 from datetime import datetime
 from urllib.parse import urlparse
@@ -23,12 +24,16 @@ OUT_CUMULATIVE = BASE_DIR / "4-2.news_ai_cumulative.xlsx"
 OUT_AUDIT = BASE_DIR / "4-2.news_ai_audit_candidates.xlsx"
 OUT_EXCLUDED = BASE_DIR / "4-2.news_ai_excluded.xlsx"
 OUT_LEGACY = BASE_DIR / "4.news_ai_analysis.xlsx"
+MAPPING_MASTER_XLSX = BASE_DIR / "gti_samsung_customs_mapping.xlsx"
+MAPPING_MASTER_CSV = BASE_DIR / "gti_samsung_customs_mapping.csv"
 
 MAX_AGE_HOURS = int(os.getenv("GTI_STEP4_NEWS_MAX_AGE_HOURS", "24"))
+INPUT_FILE_MAX_AGE_HOURS = float(os.getenv("GTI_STEP4_INPUT_FILE_MAX_AGE_HOURS", "8"))
 TARGET_MAX = int(os.getenv("GTI_STEP4_NEWS_TARGET_MAX", "0"))  # 0 = quality-based, no fixed count
 AI_REVIEW_MAX = int(os.getenv("GTI_STEP4_AI_REVIEW_MAX", "120"))
 REPORT_TARGET = int(os.getenv("GTI_STEP4_NEWS_REPORT_TARGET", "30"))
-WATCH_MIN_RELEVANCE = int(os.getenv("GTI_STEP4_WATCH_MIN_RELEVANCE", "5"))
+WATCH_MIN_RELEVANCE = int(os.getenv("GTI_STEP4_WATCH_MIN_RELEVANCE", "3"))
+AI_TARIFF_QUOTA = int(os.getenv("GTI_STEP4_AI_TARIFF_QUOTA", "60"))
 GEMINI_MODEL = os.getenv("GTI_GEMINI_MODEL", "gemini-2.5-flash-lite").strip()
 GEMINI_TIMEOUT = int(os.getenv("GTI_GEMINI_TIMEOUT", "20"))
 GEMINI_API_KEY = (
@@ -62,6 +67,26 @@ OUTPUT_COLS = [
     "RejectReason", "AIRelevant", "AIRelevanceScore", "AIReason",
     "Top3 Eligible", "Body Verified", "Direct Evidence", "Missing Facts",
     "Policy Event", "Official Evidence",
+    "RegulationMappingType", "MappingStatus", "RequiredMappingKeys", "EntityDirectFlag",
+    "MappedEntity", "MappedProduct", "MappedHS", "TradeRoute", "MappingEvidence",
+]
+
+HARD_SCOPE_EXCLUDE_TITLE_TERMS = [
+    "마약", "코카인", "필로폰", "합성대마", "대마초", "다크웹", "마약수사",
+    "drug bust", "drug seizure", "narcotics", "cocaine", "methamphetamine",
+    "기술 탈취", "기술탈취", "기술 유출", "산업기술 유출", "영업비밀", "폭탄 증언",
+    "trade secret theft", "technology theft", "industrial espionage",
+]
+MACRO_NOISE_TITLE_TERMS = [
+    "인플레이션", "물가", "성장률", "수출 호황", "수출 증가", "일자리 전망",
+    "주가", "특징주", "실적", "경제 전망", "증시", "시황",
+    "inflation", "economic growth", "stock price", "earnings", "market outlook",
+]
+CONCRETE_TITLE_ACTION_TERMS = [
+    "section 232", "section 301", "232조", "301조", "반덤핑", "상계관세",
+    "세이프가드", "예비판정", "최종판정", "조사 개시", "관세 부과", "관세 인상",
+    "수입금지", "수출통제", "원산지 규정", "통관절차 개정", "품목분류 결정",
+    "anti-dumping", "countervailing", "safeguard", "tariff imposed", "export control",
 ]
 
 
@@ -116,6 +141,243 @@ def opinion_article(title: object) -> bool:
     return any(term in clean(title).lower() for term in OPINION_TITLE_TERMS)
 
 
+def hard_scope_excluded(title: object) -> bool:
+    t = clean(title).lower()
+    if any(term in t for term in HARD_SCOPE_EXCLUDE_TITLE_TERMS):
+        return True
+    return (
+        any(term in t for term in MACRO_NOISE_TITLE_TERMS)
+        and not any(term in t for term in CONCRETE_TITLE_ACTION_TERMS)
+    )
+
+
+def _event_title(v: object) -> str:
+    t = clean(v).lower()
+    t = re.sub(r"\s+-\s+[^-]{2,50}$", "", t)
+    t = re.sub(r"[^0-9a-z가-힣%]+", " ", t)
+    stop = {
+        "속보", "종합", "단독", "오늘", "뉴스", "관련", "대한", "위한", "통해", "검토",
+        "the", "a", "an", "and", "or", "of", "to", "in", "on", "for", "with", "says",
+    }
+    return " ".join(x for x in t.split() if x not in stop)
+
+
+def _event_anchor(row: pd.Series) -> str:
+    raw_context = f"{clean(row.get('Headline'))} {clean(row.get('Summary'))} {clean(row.get('Country'))}".lower()
+    t = _event_title(row.get("Headline"))
+    context = f"{raw_context} {t} {_event_title(row.get('Summary'))}"
+    issue = clean(row.get("Issue")).upper() or "OTHER"
+    # High-frequency cross-publisher events: use policy-event identity rather
+    # than the occasionally inconsistent upstream Issue label.
+    if any(x in context for x in ["멕시코", "mexico"]) and any(x in context for x in ["중국", "중국산", "china", "chinese"]) and any(x in context for x in ["관세", "tariff"]):
+        return "EVENT|MEXICO_CHINA_ADDITIONAL_TARIFF"
+    if any(x in context for x in ["h200", "엔비디아칩", "엔비디아 칩", "nvidia chip"]) and any(x in context for x in ["중국", "china", "中"]) and any(x in context for x in ["허용", "완화", "반입", "수입", "빗장 일부", "allow", "import"]):
+        return "EVENT|CHINA_NVIDIA_H200_IMPORT_RELAXATION"
+    if any(x in context for x in ["우회수출", "환적", "transshipment", "관세 회피"]) and any(x in context for x in ["미국", "백악관", "유럽", "eu", "u s"]):
+        return "EVENT|US_EU_CHINA_CIRCUMVENTION_ENFORCEMENT"
+    if (
+        any(x in context for x in ["미국", "美", "미,", "미-", "미·", "미 캐나다", "미 관세", "usa", "us ", "u.s.", "united states"])
+        and any(x in context for x in ["캐나다", "canada"])
+        and any(x in context for x in ["관세", "tariff"])
+    ):
+        return "EVENT|US_CANADA_50PCT_RETALIATORY_TARIFFS"
+    if any(x in context for x in ["호우", "침수", "수해", "flood"]) and any(x in context for x in ["관세", "세관", "customs", "납부기한", "관세조사", "원산지검증", "신속통관", "통관 지원", "지원책"]):
+        return "EVENT|KR_FLOOD_CUSTOMS_RELIEF"
+    countries = [
+        "미국", "중국", "멕시코", "캐나다", "한국", "일본", "인도", "베트남", "브라질",
+        "유럽", "eu", "usa", "china", "mexico", "canada", "korea", "japan", "india",
+    ]
+    products = [
+        "반도체", "h200", "폴리실리콘", "철강", "자동차", "드론", "선재", "황산", "알루미늄",
+        "semiconductor", "polysilicon", "steel", "vehicle", "drone", "wire rod", "aluminum",
+    ]
+    actions = [
+        "추가 관세", "관세 인상", "반덤핑", "상계관세", "우회수출", "원산지", "수출통제",
+        "수입제한", "재심", "예비판정", "최종판정", "section 232", "section 301",
+        "tariff", "anti dumping", "countervailing", "transshipment", "export control",
+    ]
+    picked = []
+    for group in (countries, products, actions):
+        found = next((x for x in group if x in t), "")
+        if found:
+            picked.append(found)
+    rate = re.search(r"\b\d{1,3}(?:\.\d+)?%", t)
+    if rate:
+        picked.append(rate.group(0))
+    return issue + "|" + "|".join(picked) if len(picked) >= 2 else ""
+
+
+def pre_ai_event_dedup(df: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """Compress same-event articles before Gemini calls; keep the best representative."""
+    if df.empty:
+        return df.copy(), df.iloc[0:0].copy()
+    kept_idx, dropped_idx = [], []
+    representatives = []
+    for idx, row in df.iterrows():
+        title = _event_title(row.get("Headline"))
+        issue = clean(row.get("Issue")).upper()
+        cluster = clean(row.get("Cluster"))
+        anchor = _event_anchor(row)
+        duplicate = False
+        for rep in representatives:
+            same_cluster = bool(cluster and cluster == rep["cluster"])
+            same_anchor = bool(anchor and anchor == rep["anchor"])
+            similarity = SequenceMatcher(None, title, rep["title"]).ratio() if issue == rep["issue"] else 0.0
+            if same_cluster or same_anchor or similarity >= 0.62:
+                duplicate = True
+                break
+        if duplicate:
+            dropped_idx.append(idx)
+        else:
+            kept_idx.append(idx)
+            representatives.append({"title": title, "issue": issue, "cluster": cluster, "anchor": anchor})
+    kept = df.loc[kept_idx].copy().reset_index(drop=True)
+    dropped = df.loc[dropped_idx].copy()
+    if not dropped.empty:
+        dropped["RejectReason"] = "PRE_AI_SAME_EVENT_DUPLICATE"
+    log(f"PRE-AI EVENT DEDUP: {len(df)} -> {len(kept)} / removed={len(dropped)}")
+    return kept, dropped
+
+
+_MAPPING_CACHE = None
+
+
+def load_mapping_master() -> pd.DataFrame:
+    global _MAPPING_CACHE
+    if _MAPPING_CACHE is not None:
+        return _MAPPING_CACHE
+    path = MAPPING_MASTER_XLSX if MAPPING_MASTER_XLSX.exists() else MAPPING_MASTER_CSV
+    if not path.exists():
+        log("MAPPING MASTER missing: gti_samsung_customs_mapping.xlsx/csv / Direct requires article-level entity evidence")
+        _MAPPING_CACHE = pd.DataFrame()
+        return _MAPPING_CACHE
+    try:
+        frame = pd.read_excel(path) if path.suffix.lower() == ".xlsx" else pd.read_csv(path, encoding="utf-8-sig")
+        frame = unique_columns(frame)
+        active = pick_col(frame, ["Active", "Use", "Enabled"])
+        if active:
+            frame = frame[~frame[active].fillna("Y").astype(str).str.upper().isin({"N", "NO", "0", "FALSE"})]
+        _MAPPING_CACHE = frame.fillna("")
+        log(f"MAPPING MASTER loaded: {path.name} / rows={len(_MAPPING_CACHE)}")
+    except Exception as exc:
+        raise RuntimeError(f"mapping master read failed: {path} / {type(exc).__name__}: {exc}")
+    return _MAPPING_CACHE
+
+
+def _term_in_text(text: str, term: str) -> bool:
+    term = clean(term).lower()
+    if not term:
+        return False
+    if re.fullmatch(r"[a-z0-9]{2,5}", term):
+        return bool(re.search(rf"(?<![a-z0-9]){re.escape(term)}(?![a-z0-9])", text))
+    return term in text
+
+
+def _explicit_samsung_customs_context(title: str, body: str) -> tuple[bool, str]:
+    """Return only article-native Samsung evidence, excluding related-link/sidebar noise."""
+    samsung_terms = ["삼성전자", "삼성 전자", "samsung electronics", "samsung semiconductor"]
+    product_terms = [
+        "반도체", "메모리", "스마트폰", "휴대전화", "tv", "텔레비전", "디스플레이", "가전",
+        "네트워크 장비", "배터리", "semiconductor", "memory", "smartphone", "display", "appliance",
+    ]
+    customs_terms = [
+        "관세", "통관", "반덤핑", "상계관세", "세이프가드", "원산지", "품목분류", "수출통제",
+        "tariff", "customs", "anti-dumping", "countervailing", "origin", "export control",
+        "section 232", "section 301",
+    ]
+    headline = clean(title).lower()
+    candidates = [headline]
+    candidates.extend(
+        clean(x).lower() for x in re.split(r"(?:[.!?。]\s+|다\.\s+|\n+)", clean(body)[:12000])
+        if clean(x)
+    )
+    for sentence in candidates:
+        if (
+            any(_term_in_text(sentence, x) for x in samsung_terms)
+            and any(_term_in_text(sentence, x) for x in product_terms)
+            and any(_term_in_text(sentence, x) for x in customs_terms)
+        ):
+            return True, sentence[:700]
+    return False, ""
+
+
+def _explicit_hs(text: str) -> str:
+    """Accept HS only when explicitly labelled; never treat dates/years as HS."""
+    m = re.search(
+        r"\bhs(?:\s*code|\s*코드|\s*세번)?\s*[:#-]?\s*(\d{4,10}(?:\.\d{2,6})?)\b",
+        clean(text), re.I,
+    )
+    return clean(m.group(1)) if m else ""
+
+
+def map_article_to_business(title: str, body: str, country: str, issue: str, verified: bool) -> dict:
+    text = f"{title} {body} {country}".lower()
+    samsung_named, samsung_evidence = _explicit_samsung_customs_context(title, body)
+    hs_value = _explicit_hs(f"{title} {body}")
+    product_terms = [
+        "반도체", "메모리", "스마트폰", "휴대전화", "tv", "텔레비전", "디스플레이", "가전",
+        "네트워크 장비", "배터리", "semiconductor", "memory", "smartphone", "display", "appliance",
+    ]
+    product_text = f"{clean(title).lower()} {samsung_evidence}"
+    product = next((x for x in product_terms if _term_in_text(product_text, x)), "")
+    trade_route = ""
+    if any(x in text for x in ["환적", "우회수출", "transshipment", "원산지 세탁"]):
+        trade_route = "TRANSshipment/origin route"
+
+    master = load_mapping_master()
+    matched = None
+    for _, mr in master.iterrows():
+        def mv(names):
+            c = pick_col(master, names)
+            return clean(mr.get(c)) if c else ""
+        m_country = mv(["Country", "국가"])
+        m_entity = mv(["Entity", "Subsidiary", "법인"])
+        m_product = mv(["Product", "제품"])
+        m_hs = mv(["HS", "HSCode", "HS Code"])
+        aliases = mv(["Aliases", "Alias", "키워드"])
+        country_ok = not m_country or m_country.lower() in text
+        candidate_master = any(x in f"{m_product} {m_hs} {mv(['TradeRoute', 'Trade Route', '거래경로'])}".lower() for x in ["후보", "확인 필요", "verify", "candidate"])
+        entity_terms = [m_entity] + aliases.split(";")
+        entity_ok = any(_term_in_text(text, x) for x in entity_terms if clean(x) and clean(x).lower() not in {"all", "global"})
+        product_ok = bool(m_product) and _term_in_text(text, m_product)
+        hs_terms = [x.strip() for x in re.split(r"[;,|]", m_hs) if x.strip()]
+        hs_ok = bool(hs_value) and any(hs_value == re.sub(r"[^0-9.]", "", x) for x in hs_terms)
+        detail_ok = entity_ok or (country_ok and product_ok and hs_ok)
+        if country_ok and detail_ok and not candidate_master:
+            matched = {"entity": m_entity, "product": m_product, "hs": m_hs, "route": mv(["TradeRoute", "Trade Route", "거래경로"])}
+            break
+
+    specific_issue = issue in {"AD_CVD", "HS_CLASSIFICATION", "ORIGIN_FTA", "TARIFF", "EXPORT_CONTROL", "SANCTIONS"}
+    mapping_type = "ENTITY_DIRECT" if samsung_named else ("PRODUCT_1TO1" if specific_issue else "POLICY_GENERAL")
+    if not verified:
+        status = "VERIFICATION_PENDING"
+    elif matched and matched.get("entity") and (matched.get("product") or matched.get("hs")):
+        status = "ITEM_1TO1_MAPPED"
+    elif samsung_named and product:
+        status = "ENTITY_CONFIRMED"
+    elif mapping_type == "POLICY_GENERAL":
+        status = "POLICY_MONITORING"
+    else:
+        status = "MAPPING_REQUIRED"
+
+    required = []
+    if not (matched or samsung_named): required.append("Entity")
+    if not (matched and matched.get("product")) and not product: required.append("Product")
+    if not (matched and matched.get("hs")) and not hs_value: required.append("HS")
+    if not (matched and matched.get("route")) and not trade_route: required.append("TradeRoute")
+    return {
+        "mapping_type": mapping_type,
+        "mapping_status": status,
+        "required_mapping_keys": ",".join(required),
+        "entity_direct": status in {"ENTITY_CONFIRMED", "ITEM_1TO1_MAPPED"},
+        "mapped_entity": (matched or {}).get("entity", "Samsung Electronics" if samsung_named else ""),
+        "mapped_product": (matched or {}).get("product", product),
+        "mapped_hs": (matched or {}).get("hs", hs_value),
+        "trade_route": (matched or {}).get("route", trade_route),
+        "mapping_evidence": "MASTER_MATCH" if matched else ("ARTICLE_ENTITY_PRODUCT" if samsung_named and product else ""),
+    }
+
+
 def unique_columns(df: pd.DataFrame) -> pd.DataFrame:
     out = df.copy()
     out.columns = [str(c).strip() for c in out.columns]
@@ -145,6 +407,14 @@ def domain(u: str) -> str:
 def load_input() -> pd.DataFrame:
     if not INPUT_FILE.exists():
         raise FileNotFoundError(f"input not found: {INPUT_FILE}")
+    file_age_hours = max(0.0, (datetime.now().timestamp() - INPUT_FILE.stat().st_mtime) / 3600)
+    if file_age_hours > INPUT_FILE_MAX_AGE_HOURS:
+        raise RuntimeError(
+            f"STALE STEP3-2 INPUT: {INPUT_FILE.name} age={file_age_hours:.1f}h "
+            f"> {INPUT_FILE_MAX_AGE_HOURS:g}h. STEP3-2 did not complete in the current run. "
+            "Run 2-1, 2-2, 2-3 and 3-2 successfully before STEP4-2. "
+            "Existing STEP4 outputs were preserved."
+        )
     raw = unique_columns(pd.read_excel(INPUT_FILE))
 
     aliases = {
@@ -304,9 +574,28 @@ def analyze_row(row: pd.Series) -> dict:
     evidence_text = body if len(body) >= 350 else source_summary
     body_verified = body_status == "BODY_OK" and len(body) >= 350
 
+    if hard_scope_excluded(title):
+        return {
+            "relevant": False, "relevance_score": 0, "reason": "HARD_SCOPE_EXCLUDED",
+            "analysis_ok": True, "samsung_impact": "None", "top3_eligible": False,
+            "body_verified": body_verified, "direct_evidence": [],
+            "affected_subsidiary": "", "risk": "하", "summary_ko": source_summary or title,
+            "analysis_ko": "관세·통상 보고 범위가 아닌 범죄·기술보호·거시경제 기사로 제외",
+            "action_ko": "", "country": "", "agency": clean(row.get("Publisher")) or clean(row.get("Source")),
+            "missing_facts": [], "policy_event": False, "official_evidence": "", "issue": "OTHER",
+        }
+
     prompt = f"""
 당신은 삼성전자 본사 관세·통상 및 관세컴플라이언스 책임자입니다.
 아래 기사 원문을 근거로 먼저 보고 대상 여부를 판정한 뒤 의사결정용 분석을 작성하십시오.
+
+보고 품질 원칙:
+- B형 수작업 보고서 수준으로 쓰되 원문에 없는 수치·HS·법인·제품·일정은 절대 만들지 않는다.
+- 정책의 '발표/검토/조사개시/예비판정/최종판정/시행' 단계를 구분한다.
+- 변경 전→변경 후, 대상국, 대상품목/HS, 세율, 시행일, 법적 근거 중 원문에서 확인된 것만 명시한다.
+- 삼성 영향은 반드시 [정책조치 → 대상 품목/HS → 생산·판매 법인 → 수출입 경로 → 관세업무 변화] 순서로 연결한다.
+- 연결고리가 하나라도 확인되지 않으면 Direct라고 쓰지 말고 Missing Facts에 남긴다.
+- 대응은 단순 '모니터링'이 아니라 확인할 데이터, 산출물, 기한, 담당 Owner를 포함한다.
 
 1단계 관련성 판정:
 - YES: 관세율·Section 232/301·AD/CVD·세이프가드·통관·HS·과세가격·FTA/원산지·수출통제·제재·CBAM·수입규제의 구체적 조치가 핵심인 기사.
@@ -319,8 +608,9 @@ def analyze_row(row: pd.Series) -> dict:
 - [대응] 즉시(오늘~3영업일), 1개월 내, 상시 모니터링, Owner.
 
 Direct/Top3 조건:
-- 삼성전자가 직접 언급되고 구체적 관세조치가 연결되면 Direct 후보.
-- 삼성전자 명칭이 없으면 원칙적으로 Indirect/Watch. 단, 한국 반도체(HS 854239 포함)가 중국산 제품의 환적·원산지 위험 경로로 공식 지목된 사건은 Direct 후보.
+- Direct는 원문 검증, 구체적 공식조치, 삼성 법인·공장·거래 직접 언급 또는 완료된 제품·HS·거래경로 1:1 매핑을 모두 요구한다.
+- 삼성전자 명칭이 없으면 원칙적으로 Indirect/Watch. 환적·원산지 사건도 삼성 거래 1:1 매핑 전에는 Direct 금지.
+- AD/CVD·품목분류·원산지 등 특정 품목 사건은 법인·제품·HS·거래경로 매핑 완료 전 Top3 금지.
 - 생산국·제품명·관세 단어가 각각 등장하는 것만으로 연결관계를 추정하지 말 것.
 - 국가명, 삼성/반도체 단어, 일반 공급망 언급만으로 Direct 금지.
 - 원문 본문을 확보하지 못했으면 body_verified=false, Direct 금지, Top3 Eligible=false.
@@ -337,9 +627,9 @@ JSON만 출력:
  "direct_evidence": ["Direct 판정 원문 근거"],
  "affected_subsidiary": "영향 법인/지역 또는 관련 법인 검토",
  "risk": "상|중|하",
- "summary_ko": "[사실관계] 원문 근거 3~5문장",
- "analysis_ko": "[삼성전자 관세업무 직접영향] 영향 경로와 업무를 4~7문장",
- "action_ko": "[즉시] ... | [1개월 내] ... | [상시] ... | [Owner] ...",
+ "summary_ko": "[확인 사실] 조치단계·발표/시행일·대상국·대상품목/HS·세율·법적근거를 원문 범위에서 3~5문장. [미확인] 핵심 공백을 1문장",
+ "analysis_ko": "[연결 경로] 정책조치 → 품목/HS → 법인 → 거래경로 → 바뀌는 관세업무. [비용/리스크] 계산식 또는 필요한 입력데이터. 연결 미확인 시 직접영향 미확정이라고 명시",
+ "action_ko": "[즉시/3영업일] 확인 데이터와 산출물 | [1개월 내] 시스템·SOP·계약 반영 산출물 | [상시/Trigger] 후속 판정·시행 등 재보고 조건 | [Owner] HQ Customs + 해당 사업부/법인",
  "country": "발표국/영향국",
  "agency": "발표기관/매체",
  "issue": "TARIFF|AD_CVD|EXPORT_CONTROL|SANCTIONS|CUSTOMS|HS_CLASSIFICATION|ORIGIN_FTA|CBAM_CARBON|OTHER",
@@ -421,15 +711,26 @@ Body status: {body_status}
         "section 232", "section 301", "반덤핑", "anti-dumping", "통관",
         "customs", "수출통제", "export control", "제재", "sanction", "fta",
     ]
-    samsung_named = any(term in route_text for term in [
-        "삼성전자", "삼성 전자", "samsung electronics", "samsung semiconductor",
-    ])
+    samsung_named, samsung_direct_sentence = _explicit_samsung_customs_context(title, evidence_text)
+    mapping = map_article_to_business(title, evidence_text, country, issue_out, verified)
+    official_evidence = clean(result.get("official_evidence"))
+    product_specific_issue = issue_out in {"AD_CVD", "HS_CLASSIFICATION", "ORIGIN_FTA"}
+    mapping_ok = (
+        mapping["mapping_status"] == "ITEM_1TO1_MAPPED"
+        or (
+            mapping["mapping_status"] == "ENTITY_CONFIRMED"
+            and samsung_named
+            and not product_specific_issue
+        )
+    )
+    direct_evidence_mentions_samsung = any(
+        re.search(r"삼성전자|samsung electronics|samsung", item, re.I) for item in evidence
+    )
     explicit_samsung_direct = (
-        verified
-        and policy_event
-        and samsung_named
+        verified and policy_event and mapping_ok and samsung_named
         and any(term in route_text for term in product_terms)
         and any(term in route_text for term in route_customs_terms)
+        and bool(official_evidence) and direct_evidence_mentions_samsung
     )
     korea_semicon_transshipment_direct = (
         verified
@@ -438,6 +739,8 @@ Body status: {body_status}
         and any(term in route_text for term in ["한국", "korea", "경기", "반도체벨트", "semiconductor belt"])
         and any(term in route_text for term in ["반도체", "semiconductor", "854239", "8542.39"])
         and any(term in route_text for term in ["중국", "china", "중국산"])
+        and mapping["mapping_status"] == "ITEM_1TO1_MAPPED"
+        and bool(official_evidence)
     )
     route_direct = explicit_samsung_direct or korea_semicon_transshipment_direct
 
@@ -459,10 +762,9 @@ Body status: {body_status}
             result["relevance_score"] = max(8, int(float(result.get("relevance_score", 0) or 0)))
         except Exception:
             result["relevance_score"] = 8
-        if not evidence and korea_semicon_transshipment_direct:
-            evidence = [
-                "한국 반도체(HS 854239 포함)의 중국 연계 환적·원산지 위험 경로를 원문에서 확인"
-            ]
+        if not evidence:
+            impact = "Indirect"
+            route_direct = False
 
     # Enforce the same evidence gate on Gemini's original Direct label. A
     # concrete global measure without a proven Samsung route is Indirect; an
@@ -471,9 +773,10 @@ Body status: {body_status}
         impact = "Watch" if denies_direct else "Indirect"
 
     # 사설·칼럼은 공식 조치의 보조 해설로만 사용하며 Direct/Top3로 올리지 않는다.
-    if opinion_article(title) and impact == "Direct":
-        impact = "Watch"
+    if opinion_article(title):
+        impact = "Watch" if as_bool(result.get("relevant")) else "None"
         route_direct = False
+        result["top3_eligible"] = False
 
     third_party_case = (
         not samsung_named
@@ -488,6 +791,7 @@ Body status: {body_status}
     top3 = (
         (as_bool(result.get("top3_eligible")) or route_direct)
         and verified and impact == "Direct" and len(evidence) >= 1
+        and mapping_ok and bool(official_evidence)
     )
     if not relevant:
         impact = "None"
@@ -505,6 +809,15 @@ Body status: {body_status}
         "policy_event": policy_event,
         "country": country,
         "issue": issue_out,
+        "mapping_type": mapping["mapping_type"],
+        "mapping_status": mapping["mapping_status"],
+        "required_mapping_keys": mapping["required_mapping_keys"],
+        "entity_direct": mapping["entity_direct"],
+        "mapped_entity": mapping["mapped_entity"],
+        "mapped_product": mapping["mapped_product"],
+        "mapped_hs": mapping["mapped_hs"],
+        "trade_route": mapping["trade_route"],
+        "mapping_evidence": mapping["mapping_evidence"],
     })
     return result
 
@@ -512,11 +825,35 @@ Body status: {body_status}
 def build() -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
     df = load_input()
     fresh, stale = strict_24h(df)
+    if fresh.empty:
+        source_dates = pd.to_datetime(df.get("Date"), errors="coerce")
+        newest = source_dates.max()
+        newest_text = "unknown" if pd.isna(newest) else str(newest)
+        raise RuntimeError(
+            f"NO FRESH NEWS AFTER 24H GUARD: input={len(df)} / fresh=0 / "
+            f"newest_publish_date={newest_text}. "
+            "The current 3-2.news_summary.xlsx contains no reportable article from the last 24 hours. "
+            "Run 2-1, 2-2, 2-3 and 3-2 again. Existing STEP4 outputs were preserved."
+        )
     fresh["PreScore"] = fresh.apply(pre_score, axis=1)
     fresh = fresh.sort_values(["PreScore", "Date"], ascending=[False, False], kind="stable").reset_index(drop=True)
 
-    review = fresh.head(AI_REVIEW_MAX).copy()
-    tail = fresh.iloc[AI_REVIEW_MAX:].copy()
+    # AI 비용을 쓰기 전에 동일 사건을 대표기사 하나로 압축한다.
+    fresh, pre_ai_duplicates = pre_ai_event_dedup(fresh)
+
+    # 한 개의 대형 관세사건이 AI 120건을 잠식하지 않도록 관세 일반기사에
+    # 상한을 두고 AD/CVD·FTA/원산지·통관·수출통제·CBAM·HS를 확보한다.
+    issue_series = fresh.get("Issue", pd.Series(index=fresh.index, dtype=str)).fillna("").astype(str).str.upper()
+    tariff_mask = issue_series.eq("TARIFF")
+    tariff_part = fresh.loc[tariff_mask].head(min(AI_TARIFF_QUOTA, AI_REVIEW_MAX))
+    other_part = fresh.loc[~tariff_mask].head(max(0, AI_REVIEW_MAX - len(tariff_part)))
+    review = pd.concat([tariff_part, other_part], axis=0).drop_duplicates().copy()
+    if len(review) < AI_REVIEW_MAX:
+        review = pd.concat([review, fresh.loc[~fresh.index.isin(review.index)]], axis=0).head(AI_REVIEW_MAX)
+    review = review.sort_values(["PreScore", "Date"], ascending=[False, False], kind="stable")
+    tail = fresh.loc[~fresh.index.isin(review.index)].copy()
+    review_issue = review.get("Issue", pd.Series(index=review.index, dtype=str)).fillna("").astype(str).str.upper()
+    log(f"AI REVIEW DIVERSITY: total={len(review)} / tariff={int(review_issue.eq('TARIFF').sum())} / other={int((~review_issue.eq('TARIFF')).sum())}")
     if not tail.empty:
         tail["RejectReason"] = "OUTSIDE_AI_REVIEW_POOL"
 
@@ -549,6 +886,15 @@ def build() -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
         r["Country"] = clean(a.get("country"))
         r["Issue"] = clean(a.get("issue")) or "OTHER"
         r["Agency"] = clean(a.get("agency")) or clean(row.get("Publisher"))
+        r["RegulationMappingType"] = clean(a.get("mapping_type"))
+        r["MappingStatus"] = clean(a.get("mapping_status")) or "VERIFICATION_PENDING"
+        r["RequiredMappingKeys"] = clean(a.get("required_mapping_keys"))
+        r["EntityDirectFlag"] = "Y" if as_bool(a.get("entity_direct")) else "N"
+        r["MappedEntity"] = clean(a.get("mapped_entity"))
+        r["MappedProduct"] = clean(a.get("mapped_product"))
+        r["MappedHS"] = clean(a.get("mapped_hs"))
+        r["TradeRoute"] = clean(a.get("trade_route"))
+        r["MappingEvidence"] = clean(a.get("mapping_evidence"))
         audited.append(r)
         if i % 10 == 0 or i == len(review):
             log(f"AI REVIEW {i}/{len(review)}")
@@ -635,6 +981,8 @@ def build() -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
         ):
             return "US_DRONE_232_TARIFF"
         rules = [
+            ("US_CANADA_50PCT_RETALIATORY_TARIFFS", [["미국", "美", "미,", "미-", "미·", "미 캐나다", "미 관세", "usa", "us ", "u.s.", "united states"], ["캐나다", "canada"], ["관세", "tariff"]]),
+            ("KR_FLOOD_CUSTOMS_RELIEF", [["호우", "침수", "수해", "flood"], ["관세청", "세관", "customs"], ["납부기한", "관세조사", "원산지검증", "신속통관", "통관 지원", "지원책"]]),
             ("US_SECTION232_DRONE_COMPONENTS_TARIFF", [["드론", "drone", "무인기", "uas"], ["section 232", "무역확장법 232", "232조"], ["관세", "tariff"]]),
             ("US_CHINA_TRANSSHIPMENT_KOREA_SEMICON", [["환적", "transshipment", "원산지 세탁", "관세 회피"], ["한국", "korea", "경기", "반도체벨트"], ["중국", "china", "중국산"]]),
             ("US_CHINA_AUTO_TARIFF_BLOCK", [["중국차", "중국산 자동차", "chinese car", "chinese vehicle"], ["127.5%", "딜러", "dealer", "봉쇄", "진입 반대"]]),
@@ -718,13 +1066,22 @@ def build() -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
             "Missing Facts": clean(r.get("Missing Facts")),
             "Policy Event": clean(r.get("Policy Event")) or "N",
             "Official Evidence": clean(r.get("Official Evidence")),
+            "RegulationMappingType": clean(r.get("RegulationMappingType")),
+            "MappingStatus": clean(r.get("MappingStatus")),
+            "RequiredMappingKeys": clean(r.get("RequiredMappingKeys")),
+            "EntityDirectFlag": clean(r.get("EntityDirectFlag")),
+            "MappedEntity": clean(r.get("MappedEntity")),
+            "MappedProduct": clean(r.get("MappedProduct")),
+            "MappedHS": clean(r.get("MappedHS")),
+            "TradeRoute": clean(r.get("TradeRoute")),
+            "MappingEvidence": clean(r.get("MappingEvidence")),
         })
     daily = pd.DataFrame(selected_rows, columns=OUTPUT_COLS)
 
     rejected_ai = audit[~audit.index.isin(selected_audit_indices) & ~audit["AIRelevant"].eq("Y")].copy()
     if not rejected_ai.empty:
         rejected_ai["RejectReason"] = "AI_NOT_CUSTOMS_TRADE"
-    excluded = pd.concat([stale, tail, rejected_ai], ignore_index=True, sort=False)
+    excluded = pd.concat([stale, pre_ai_duplicates, tail, rejected_ai], ignore_index=True, sort=False)
 
     return daily, audit, excluded
 
@@ -756,7 +1113,7 @@ def safe_write(path: Path, df: pd.DataFrame) -> None:
 
 
 def main() -> int:
-    log("GTI STEP4-2 NEWS AI v30 ISSUE-VERIFIED + WATCH-HANDOFF START")
+    log("GTI STEP4-2 NEWS AI v33 STALE-INPUT + EMPTY-24H FAIL-CLOSED START")
     log(f"MODEL={GEMINI_MODEL} / Gemini={'Y' if USE_GEMINI else 'N'} / 24h / max={TARGET_MAX}")
     daily, audit, excluded = build()
     cumulative = merge_cumulative(daily)
