@@ -550,17 +550,20 @@ def fallback_relevant(row: pd.Series) -> tuple[bool, int, str]:
 def concrete_customs_signal(text: str) -> bool:
     t = clean(text).lower()
     subject = any(x in t for x in [
-        "관세율", "추가관세", "반덤핑", "상계관세", "세이프가드", "원산지 규정",
+        "관세", "관세율", "추가관세", "반덤핑", "상계관세", "세이프가드", "원산지 규정",
         "수입신고", "수출신고", "품목분류", "전략물자", "수출통제", "제재 대상",
         "tariff rate", "additional tariff", "anti-dumping", "countervailing duty",
         "rules of origin", "customs declaration", "hs code", "export control", "sanctions",
-        "section 232", "section 301", "cbam"
+        "section 232", "section 301", "cbam", "tariff", "customs", "duty rate",
+        "import restriction", "import ban", "quota"
     ])
     action = any(x in t for x in [
         "시행", "발효", "개정", "공포", "고시", "공고", "조사 개시", "예비판정", "최종판정",
         "법원", "판결", "행정명령", "적용", "유예", "철회", "면제", "환급",
+        "유지", "연장", "확대", "강화", "완화", "종료", "착수", "발표", "합의", "결렬",
         "effective", "entered into force", "amend", "notice", "investigation", "determination",
-        "court", "ruling", "executive order", "exemption", "refund"
+        "court", "ruling", "executive order", "exemption", "refund", "maintain", "continued",
+        "extend", "expanded", "tighten", "strengthen", "relax", "terminate", "launched", "announced"
     ])
     return subject and action
 
@@ -674,10 +677,6 @@ Body status: {body_status}
         impact = "Watch" if as_bool(result.get("relevant")) else "None"
     verified = as_bool(result.get("body_verified")) and body_verified
     evidence = [clean(x) for x in result.get("direct_evidence", []) if clean(x)]
-    policy_event = (
-        as_bool(result.get("policy_event"))
-        and concrete_customs_signal(evidence_text)
-    )
     issue_out = clean(result.get("issue")).upper()
     allowed_issues = {
         "TARIFF", "AD_CVD", "EXPORT_CONTROL", "SANCTIONS",
@@ -685,10 +684,26 @@ Body status: {body_status}
         "CBAM_CARBON",
     }
     if issue_out not in allowed_issues:
-        policy_event = False
         issue_out = "OTHER"
 
-    country = clean(result.get("country"))
+    # Gemini가 확인한 정책사건을 원문 한글 표현 사전 하나만으로 다시 0으로
+    # 만들지 않는다. 원문 + AI 확인사실 + 공식근거 전체에서 구체 조치를
+    # 재검증한다. Direct/Top3의 본문·매핑 증빙 기준은 별도로 그대로 유지한다.
+    official_evidence = clean(result.get("official_evidence"))
+    measure_text = " ".join([
+        evidence_text,
+        clean(result.get("summary_ko")),
+        official_evidence,
+        title,
+    ])
+    policy_event = (
+        as_bool(result.get("policy_event"))
+        and issue_out in allowed_issues
+        and concrete_customs_signal(measure_text)
+    )
+
+    # 발표국을 AI가 생략해도 STEP3에서 정규화한 국가를 보존한다.
+    country = clean(result.get("country")) or clean(row.get("Country"))
 
     if event_only_noise(title, evidence_text):
         policy_event = False
@@ -713,7 +728,6 @@ Body status: {body_status}
     ]
     samsung_named, samsung_direct_sentence = _explicit_samsung_customs_context(title, evidence_text)
     mapping = map_article_to_business(title, evidence_text, country, issue_out, verified)
-    official_evidence = clean(result.get("official_evidence"))
     product_specific_issue = issue_out in {"AD_CVD", "HS_CLASSIFICATION", "ORIGIN_FTA"}
     mapping_ok = (
         mapping["mapping_status"] == "ITEM_1TO1_MAPPED"
@@ -915,6 +929,17 @@ def build() -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
             lambda r: event_only_noise(r.get("Headline"), r.get("SummaryAI")), axis=1
         )
 
+        # 선택 결과가 갑자기 0건이 될 때 어느 증빙 게이트가 병목인지
+        # 실행 로그만으로 즉시 확인할 수 있게 한다.
+        log(
+            "SELECTION GATE DIAGNOSTICS: "
+            f"ai_relevant={int(audit['AIRelevant'].eq('Y').sum())} / "
+            f"body_verified={int(audit['Body Verified'].eq('Y').sum())} / "
+            f"policy_event={int(audit['Policy Event'].eq('Y').sum())} / "
+            f"non_event_noise={int((~audit['_EventOnly'].fillna(False)).sum())} / "
+            f"valid_issue={int(audit['Issue'].ne('OTHER').sum())}"
+        )
+
     ai_failures = int((audit.get("Analysis OK", pd.Series(index=audit.index, dtype=str)) != "Y").sum())
     if len(audit) and ai_failures / len(audit) >= 0.20:
         raise RuntimeError(
@@ -946,9 +971,9 @@ def build() -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
             ~audit.index.isin(used_idx)
             & audit["Body Verified"].eq("Y")
             & audit["Analysis OK"].eq("Y")
+            & audit["Policy Event"].eq("Y")
             & audit["Issue"].ne("OTHER")
             & ~audit["_EventOnly"].fillna(False)
-            & pd.to_numeric(audit["AIRelevanceScore"], errors="coerce").fillna(0).ge(WATCH_MIN_RELEVANCE)
         ].copy()
         watch_pool = watch_pool.sort_values(
             ["SelectionScore", "PreScore", "Date"], ascending=[False, False, False], kind="stable"
@@ -1007,9 +1032,9 @@ def build() -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
             ~audit.index.isin(set(selected.index))
             & audit["Body Verified"].eq("Y")
             & audit["Analysis OK"].eq("Y")
+            & audit["Policy Event"].eq("Y")
             & audit["Issue"].ne("OTHER")
             & ~audit["_EventOnly"].fillna(False)
-            & pd.to_numeric(audit["AIRelevanceScore"], errors="coerce").fillna(0).ge(WATCH_MIN_RELEVANCE)
         ].copy()
         if not refill.empty:
             refill["Samsung Impact"] = "Watch"
@@ -1113,7 +1138,7 @@ def safe_write(path: Path, df: pd.DataFrame) -> None:
 
 
 def main() -> int:
-    log("GTI STEP4-2 NEWS AI v33 STALE-INPUT + EMPTY-24H FAIL-CLOSED START")
+    log("GTI STEP4-2 NEWS AI v34 POLICY-GATE RECOVERY + EVIDENCE-SAFE WATCH START")
     log(f"MODEL={GEMINI_MODEL} / Gemini={'Y' if USE_GEMINI else 'N'} / 24h / max={TARGET_MAX}")
     daily, audit, excluded = build()
     cumulative = merge_cumulative(daily)

@@ -5782,7 +5782,7 @@ def choose_top3(rows: pd.DataFrame) -> pd.DataFrame:
 # Regulation remains event-based and is not subjected to the news 24h rule.
 # ======================================================================
 
-GTI_STEP5_VERSION = "v327 UNIFIED LAW + NEWS FAIL-SAFE REPORT"
+GTI_STEP5_VERSION = "v328 UNIFIED LAW + EMPTY-NEWS SAFE REPORT"
 
 
 def _v319_parse_news_date(row: pd.Series):
@@ -5980,10 +5980,15 @@ def read_step4_results() -> pd.DataFrame:
     # STEP4-2 semantic event key is authoritative for news. One event appears once.
     if "Cluster" in rows.columns:
         news_mask = rows["Content Type"].astype(str).eq("News")
-        news_keys = rows.loc[news_mask].apply(_v321_news_semantic_key, axis=1)
-        fallback = rows.loc[news_mask, "Headline"].fillna("").astype(str).str.lower().str.strip()
-        rows.loc[news_mask, "_semantic_key"] = news_keys.where(news_keys.ne(""), fallback)
-        rows.loc[~news_mask, "_semantic_key"] = rows.loc[~news_mask, "Headline"].fillna("").astype(str).str.lower().str.strip()
+        def semantic_key(row: pd.Series) -> str:
+            headline = clean(row.get("Headline")).lower().strip()
+            if clean(row.get("Content Type")) == "News":
+                return _v321_news_semantic_key(row) or headline
+            return headline
+
+        # Build the complete column in one pass.  Assigning strings into a
+        # float64 placeholder fails on pandas 2.x when the news branch is empty.
+        rows["_semantic_key"] = rows.apply(semantic_key, axis=1).astype("string")
         before_semantic = len(rows)
         rows = rows.drop_duplicates(["Content Type", "_semantic_key"], keep="first").drop(columns="_semantic_key")
         if len(rows) != before_semantic:
