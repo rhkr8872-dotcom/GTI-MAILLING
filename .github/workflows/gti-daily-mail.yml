@@ -2,278 +2,220 @@ name: GTI Daily Mail
 
 on:
   schedule:
-    # 06:00 KST = previous day 21:00 UTC
+    # UTC 21:00 = KST 06:00 (next day)
     - cron: "0 21 * * *"
-
-  # 코드 업로드만으로 메일이 자동 발송되지 않도록 push 제거
   workflow_dispatch:
+    inputs:
+      send_email:
+        description: "Send the GTI email"
+        required: true
+        default: false
+        type: boolean
+
+concurrency:
+  group: gti-daily-mail
+  cancel-in-progress: false
 
 env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
   PYTHONIOENCODING: utf-8
   PYTHONUTF8: "1"
 
 jobs:
   gti-mail:
     runs-on: windows-latest
+    timeout-minutes: 180
 
     permissions:
       contents: read
 
     env:
-      # -------------------------------------------------
-      # GTI Runtime
-      # -------------------------------------------------
       GTI_BASE_DIR: C:\temp
       GTI_OUTPUT_DIR: C:\temp
       GTI_LOOKBACK_HOURS: "24"
       GTI_MAX_PER_SOURCE: "50"
 
-      # -------------------------------------------------
-      # Mail
-      # -------------------------------------------------
-      GTI_SEND_EMAIL: ${{ secrets.GTI_SEND_EMAIL }}
+      GTI_SEND_EMAIL_SECRET: ${{ secrets.GTI_SEND_EMAIL }}
       GTI_SMTP_HOST: ${{ secrets.GTI_SMTP_HOST }}
       GTI_SMTP_PORT: ${{ secrets.GTI_SMTP_PORT }}
       GTI_SMTP_USER: ${{ secrets.GTI_SMTP_USER }}
       GTI_SMTP_PASS: ${{ secrets.GTI_SMTP_PASS }}
       GTI_MAIL_TO: ${{ secrets.GTI_MAIL_TO }}
 
-      # -------------------------------------------------
-      # News / API
-      # -------------------------------------------------
       NAVER_CLIENT_ID: ${{ secrets.NAVER_CLIENT_ID }}
       NAVER_CLIENT_SECRET: ${{ secrets.NAVER_CLIENT_SECRET }}
       SERPAPI_KEY: ${{ secrets.SERPAPI_KEY }}
       NEWS_API: ${{ secrets.NEWS_API }}
       NEWS_KEY: ${{ secrets.NEWS_KEY }}
 
-      # -------------------------------------------------
-      # Gemini
-      # -------------------------------------------------
       GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
       GEMINI_MODEL: ${{ secrets.GEMINI_MODEL }}
 
     steps:
-
-      # =================================================
-      # 1. Checkout
-      # =================================================
       - name: Checkout repository
         uses: actions/checkout@v7
 
-      # =================================================
-      # 2. Python
-      # =================================================
       - name: Set up Python
         uses: actions/setup-python@v7
         with:
           python-version: "3.12"
-          cache: "pip"
+          cache: pip
 
-      # =================================================
-      # 3. Runtime folders
-      # =================================================
-      - name: Create runtime folders
-        shell: cmd
+      - name: Create folders
+        shell: pwsh
         run: |
-          if exist C:\temp rmdir /S /Q C:\temp
+          @(
+            "C:\temp",
+            "C:\temp\logs",
+            "C:\temp\archive",
+            "C:\temp\12345",
+            "outputs",
+            "outputs\logs",
+            "outputs\archive"
+          ) | ForEach-Object {
+            New-Item -ItemType Directory -Force -Path $_ | Out-Null
+          }
 
-          mkdir C:\temp
-          mkdir C:\temp\logs
-          mkdir C:\temp\archive
+      # Restore only cumulative history, never yesterday's daily stage outputs.
+      - name: Restore GTI cumulative archive
+        id: restore-gti-archive
+        uses: actions/cache/restore@v5
+        with:
+          path: |
+            C:\temp\archive
+            C:\temp\12345
+          key: gti-archive-${{ runner.os }}-${{ github.run_id }}
+          restore-keys: |
+            gti-archive-${{ runner.os }}-
 
-          if exist "%GITHUB_WORKSPACE%\outputs" rmdir /S /Q "%GITHUB_WORKSPACE%\outputs"
-
-          mkdir "%GITHUB_WORKSPACE%\outputs"
-          mkdir "%GITHUB_WORKSPACE%\outputs\logs"
-          mkdir "%GITHUB_WORKSPACE%\outputs\archive"
-
-      # =================================================
-      # 4. Copy GTI source/input files
-      # =================================================
-      - name: Copy GTI files
-        shell: cmd
+      - name: Copy GTI program and configuration files
+        shell: pwsh
         run: |
-          echo ==================================================
-          echo COPY GTI FILES TO C:\temp
-          echo ==================================================
+          Get-ChildItem -Path $env:GITHUB_WORKSPACE -File -Filter "*.py" |
+            Copy-Item -Destination "C:\temp" -Force
 
-          copy *.py C:\temp\
+          # Exclude old pipeline outputs that could trigger a stale-file error.
+          Get-ChildItem -Path $env:GITHUB_WORKSPACE -File -Filter "*.xlsx" |
+            Where-Object {
+              $_.Name -notmatch '^[1-5]-' -and
+              $_.Name -notmatch '^GTI_Radar_' -and
+              $_.Name -notmatch '^\[GTI Radar\]'
+            } |
+            Copy-Item -Destination "C:\temp" -Force
 
-          if exist *.xlsx copy *.xlsx C:\temp\
-          if exist *.csv  copy *.csv  C:\temp\
-          if exist *.json copy *.json C:\temp\
-          if exist *.txt  copy *.txt  C:\temp\
+          @("*.csv", "*.json", "*.txt") | ForEach-Object {
+            Get-ChildItem -Path $env:GITHUB_WORKSPACE -File -Filter $_ |
+              Copy-Item -Destination "C:\temp" -Force
+          }
 
-          echo.
-          echo ===== C:\temp =====
-          dir C:\temp
-
-      # =================================================
-      # 5. Install dependencies
-      # =================================================
       - name: Install dependencies
-        shell: cmd
+        shell: pwsh
         run: |
           python -m pip install --upgrade pip
-          pip install -r requirements.txt
+          python -m pip install -r "$env:GITHUB_WORKSPACE\requirements.txt"
 
-      # =================================================
-      # 6. Environment diagnostic
-      # 비밀번호 등 Secret 값은 절대 출력하지 않음
-      # =================================================
-      - name: Check GTI environment
-        shell: cmd
+      - name: Validate required settings
+        shell: pwsh
         run: |
-          echo ==================================================
-          echo GTI ENVIRONMENT CHECK
-          echo ==================================================
+          $requiredFiles = @("C:\temp\7.run_gti_pipeline.py")
+          $missingFiles = $requiredFiles | Where-Object { -not (Test-Path $_) }
+          if ($missingFiles) {
+            throw "Missing required file(s): $($missingFiles -join ', ')"
+          }
 
-          python --version
-          where python
-
-          echo GTI_BASE_DIR=%GTI_BASE_DIR%
-          echo GTI_OUTPUT_DIR=%GTI_OUTPUT_DIR%
-
-          if exist C:\temp\7.run_gti_pipeline.py (
-            echo [OK] 7.run_gti_pipeline.py
-          ) else (
-            echo [ERROR] 7.run_gti_pipeline.py NOT FOUND
-            exit /b 1
+          $requiredSecrets = @(
+            "NAVER_CLIENT_ID",
+            "NAVER_CLIENT_SECRET",
+            "GEMINI_API_KEY"
           )
+          $missingSecrets = $requiredSecrets | Where-Object {
+            [string]::IsNullOrWhiteSpace([Environment]::GetEnvironmentVariable($_))
+          }
+          if ($missingSecrets) {
+            throw "Missing required GitHub secret(s): $($missingSecrets -join ', ')"
+          }
 
-          if exist C:\temp\sites.xlsx (
-            echo [OK] sites.xlsx
-          ) else (
-            echo [WARN] sites.xlsx NOT FOUND
-          )
-
-          if exist C:\temp\KEYWORD.xlsx (
-            echo [OK] KEYWORD.xlsx
-          ) else (
-            echo [WARN] KEYWORD.xlsx NOT FOUND
-          )
-
-          if exist C:\temp\00.xlsx (
-            echo [OK] 00.xlsx
-          ) else (
-            echo [WARN] 00.xlsx NOT FOUND
-          )
-
-      # =================================================
-      # 7. Run GTI
-      # =================================================
-      - name: RUN GTI PIPELINE
-        shell: cmd
+      - name: Set mail mode
+        shell: pwsh
         run: |
-          echo GTI PIPELINE START > "%GITHUB_WORKSPACE%\outputs\pipeline_console.log"
-          echo RUN DATE: %DATE% %TIME% >> "%GITHUB_WORKSPACE%\outputs\pipeline_console.log"
+          $secretEnabled = "$env:GTI_SEND_EMAIL_SECRET" -match '^(?i:true|1|yes|y|on)$'
+          $manualApproved = "${{ github.event.inputs.send_email }}" -eq "true"
+          $scheduledRun = "${{ github.event_name }}" -eq "schedule"
+          $sendMail = $secretEnabled -and ($scheduledRun -or $manualApproved)
 
-          python C:\temp\7.run_gti_pipeline.py >> "%GITHUB_WORKSPACE%\outputs\pipeline_console.log" 2>&1
+          "GTI_SEND_EMAIL=$($sendMail.ToString().ToLowerInvariant())" |
+            Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          Write-Host "GTI email enabled: $sendMail"
 
-          set PIPELINE_RC=%ERRORLEVEL%
+      - name: Show execution inputs
+        shell: pwsh
+        run: |
+          Write-Host "===== Repository files ====="
+          Get-ChildItem -Path $env:GITHUB_WORKSPACE -File | Select-Object Name, Length
+          Write-Host "===== C:\temp input files ====="
+          Get-ChildItem -Path "C:\temp" -File | Select-Object Name, Length, LastWriteTime
+          Write-Host "===== Restored archive ====="
+          Get-ChildItem -Path "C:\temp\archive" -Recurse -File -ErrorAction SilentlyContinue |
+            Select-Object FullName, Length, LastWriteTime
 
-          echo. >> "%GITHUB_WORKSPACE%\outputs\pipeline_console.log"
-          echo PIPELINE RETURN CODE: %PIPELINE_RC% >> "%GITHUB_WORKSPACE%\outputs\pipeline_console.log"
+      - name: Run GTI pipeline
+        id: run-gti-pipeline
+        shell: pwsh
+        run: |
+          $logPath = Join-Path $env:GITHUB_WORKSPACE "outputs\pipeline_console.log"
+          & python "C:\temp\7.run_gti_pipeline.py" 2>&1 |
+            Tee-Object -FilePath $logPath
+          $pipelineExitCode = $LASTEXITCODE
 
-          type "%GITHUB_WORKSPACE%\outputs\pipeline_console.log"
+          if ($pipelineExitCode -ne 0) {
+            Write-Error "GTI pipeline failed with exit code $pipelineExitCode"
+            exit $pipelineExitCode
+          }
 
-          exit /b %PIPELINE_RC%
-
-      # =================================================
-      # 8. Collect outputs
-      # 실패하더라도 실행
-      # =================================================
-      - name: Collect GTI outputs
+      - name: Copy results to outputs
         if: always()
-        shell: cmd
+        shell: pwsh
         run: |
-          echo ==================================================
-          echo COLLECT GTI OUTPUTS
-          echo ==================================================
+          if (Test-Path "C:\temp\logs") {
+            Copy-Item "C:\temp\logs\*" "outputs\logs" -Recurse -Force -ErrorAction SilentlyContinue
+          }
+          if (Test-Path "C:\temp\archive") {
+            Copy-Item "C:\temp\archive\*" "outputs\archive" -Recurse -Force -ErrorAction SilentlyContinue
+          }
 
-          REM ----------------------------------------------
-          REM 최종 GTI Radar 결과만 Artifact root에 복사
-          REM ----------------------------------------------
-          if exist C:\temp\GTI_Radar_*.xlsx (
-            copy C:\temp\GTI_Radar_*.xlsx "%GITHUB_WORKSPACE%\outputs\"
-          )
+          # Search recursively because STEP5 can write under
+          # C:\temp\12345\c_type_outputs instead of C:\temp root.
+          $freshCutoff = (Get-Date).AddHours(-4)
+          Get-ChildItem "C:\temp" -Recurse -File | Where-Object {
+            $_.LastWriteTime -ge $freshCutoff -and
+            $_.FullName -notlike "C:\temp\archive\*" -and
+            $_.Extension -in @(".xlsx", ".html") -and (
+              $_.Name -match '^[1-5]-' -or
+              $_.Name -match '^GTI_Radar_' -or
+              $_.Name -match '^\[GTI Radar\]'
+            )
+          } | ForEach-Object {
+            Copy-Item $_.FullName -Destination (Join-Path "outputs" $_.Name) -Force
+          }
 
-          if exist C:\temp\GTI_Radar_*.html (
-            copy C:\temp\GTI_Radar_*.html "%GITHUB_WORKSPACE%\outputs\"
-          )
+          Get-ChildItem "C:\temp" -File -Filter "*.log" |
+            Copy-Item -Destination "outputs\logs" -Force
 
-          REM ----------------------------------------------
-          REM 주요 중간 산출물
-          REM ----------------------------------------------
-          if exist C:\temp\1-1.regulation_raw.xlsx (
-            copy C:\temp\1-1.regulation_raw.xlsx "%GITHUB_WORKSPACE%\outputs\"
-          )
+      - name: Save GTI cumulative data
+        # Keep the last valid history. A failed/partial run must not replace it.
+        if: success()
+        uses: actions/cache/save@v5
+        with:
+          path: |
+            C:\temp\archive
+            C:\temp\12345
+          key: gti-archive-${{ runner.os }}-${{ github.run_id }}
 
-          if exist C:\temp\1-2.site_news_raw.xlsx (
-            copy C:\temp\1-2.site_news_raw.xlsx "%GITHUB_WORKSPACE%\outputs\"
-          )
-
-          if exist C:\temp\2-1.naver_news_raw.xlsx (
-            copy C:\temp\2-1.naver_news_raw.xlsx "%GITHUB_WORKSPACE%\outputs\"
-          )
-
-          if exist C:\temp\2-2.google_news_raw.xlsx (
-            copy C:\temp\2-2.google_news_raw.xlsx "%GITHUB_WORKSPACE%\outputs\"
-          )
-
-          if exist C:\temp\2-3.rss_news_raw.xlsx (
-            copy C:\temp\2-3.rss_news_raw.xlsx "%GITHUB_WORKSPACE%\outputs\"
-          )
-
-          if exist C:\temp\3-1.regulation_summary.xlsx (
-            copy C:\temp\3-1.regulation_summary.xlsx "%GITHUB_WORKSPACE%\outputs\"
-          )
-
-          if exist C:\temp\3-2.news_summary.xlsx (
-            copy C:\temp\3-2.news_summary.xlsx "%GITHUB_WORKSPACE%\outputs\"
-          )
-
-          if exist C:\temp\4-1.regulation_ai_summary.xlsx (
-            copy C:\temp\4-1.regulation_ai_summary.xlsx "%GITHUB_WORKSPACE%\outputs\"
-          )
-
-          if exist C:\temp\4-2.news_ai_summary.xlsx (
-            copy C:\temp\4-2.news_ai_summary.xlsx "%GITHUB_WORKSPACE%\outputs\"
-          )
-
-          REM ----------------------------------------------
-          REM 로그
-          REM ----------------------------------------------
-          if exist C:\temp\logs (
-            xcopy C:\temp\logs "%GITHUB_WORKSPACE%\outputs\logs\" /E /I /Y
-          )
-
-          if exist C:\temp\*.log (
-            copy C:\temp\*.log "%GITHUB_WORKSPACE%\outputs\logs\"
-          )
-
-          REM ----------------------------------------------
-          REM Archive
-          REM ----------------------------------------------
-          if exist C:\temp\archive (
-            xcopy C:\temp\archive "%GITHUB_WORKSPACE%\outputs\archive\" /E /I /Y
-          )
-
-          echo.
-          echo ==================================================
-          echo FINAL ARTIFACT CONTENT
-          echo ==================================================
-          dir "%GITHUB_WORKSPACE%\outputs" /S
-
-      # =================================================
-      # 9. Upload Artifact
-      # =================================================
       - name: Upload GTI artifacts
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: gti-radar-output-${{ github.run_number }}
           path: outputs
           if-no-files-found: warn
-          retention-days: 14
+          retention-days: 30
