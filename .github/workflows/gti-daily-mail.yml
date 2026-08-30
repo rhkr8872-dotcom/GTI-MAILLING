@@ -2,14 +2,13 @@ name: GTI Daily Mail
 
 on:
   schedule:
+    # 06:00 KST = previous day 21:00 UTC
     - cron: "0 21 * * *"
-  push:
-    branches: [ "main" ]
+
+  # 코드 업로드만으로 메일이 자동 발송되지 않도록 push 제거
   workflow_dispatch:
 
 env:
-  # Node.js 24 강제 환경 변수는 액션 버전 업데이트로 더 이상 필요하지 않으나 원본 유지를 위해 남겨둡니다.
-  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
   PYTHONIOENCODING: utf-8
   PYTHONUTF8: "1"
 
@@ -21,11 +20,17 @@ jobs:
       contents: read
 
     env:
+      # -------------------------------------------------
+      # GTI Runtime
+      # -------------------------------------------------
       GTI_BASE_DIR: C:\temp
-      GTI_OUTPUT_DIR: outputs
+      GTI_OUTPUT_DIR: C:\temp
       GTI_LOOKBACK_HOURS: "24"
       GTI_MAX_PER_SOURCE: "50"
 
+      # -------------------------------------------------
+      # Mail
+      # -------------------------------------------------
       GTI_SEND_EMAIL: ${{ secrets.GTI_SEND_EMAIL }}
       GTI_SMTP_HOST: ${{ secrets.GTI_SMTP_HOST }}
       GTI_SMTP_PORT: ${{ secrets.GTI_SMTP_PORT }}
@@ -33,76 +38,242 @@ jobs:
       GTI_SMTP_PASS: ${{ secrets.GTI_SMTP_PASS }}
       GTI_MAIL_TO: ${{ secrets.GTI_MAIL_TO }}
 
+      # -------------------------------------------------
+      # News / API
+      # -------------------------------------------------
       NAVER_CLIENT_ID: ${{ secrets.NAVER_CLIENT_ID }}
       NAVER_CLIENT_SECRET: ${{ secrets.NAVER_CLIENT_SECRET }}
       SERPAPI_KEY: ${{ secrets.SERPAPI_KEY }}
       NEWS_API: ${{ secrets.NEWS_API }}
       NEWS_KEY: ${{ secrets.NEWS_KEY }}
 
+      # -------------------------------------------------
+      # Gemini
+      # -------------------------------------------------
       GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
       GEMINI_MODEL: ${{ secrets.GEMINI_MODEL }}
 
     steps:
-      - name: Checkout repository
-        uses: actions/checkout@v6 # 🔄 v4 -> v6 업데이트 (Node 24 내장 지원)
 
+      # =================================================
+      # 1. Checkout
+      # =================================================
+      - name: Checkout repository
+        uses: actions/checkout@v7
+
+      # =================================================
+      # 2. Python
+      # =================================================
       - name: Set up Python
-        uses: actions/setup-python@v6 # 🔄 v5 -> v6 업데이트 (Node 24 내장 지원)
+        uses: actions/setup-python@v7
         with:
           python-version: "3.12"
+          cache: "pip"
 
-      - name: Create folders
+      # =================================================
+      # 3. Runtime folders
+      # =================================================
+      - name: Create runtime folders
         shell: cmd
         run: |
-          if not exist C:\temp mkdir C:\temp
-          if not exist C:\temp\logs mkdir C:\temp\logs
-          if not exist C:\temp\archive mkdir C:\temp\archive
-          if not exist outputs mkdir outputs
-          if not exist outputs\logs mkdir outputs\logs
-          if not exist outputs\archive mkdir outputs\archive
+          if exist C:\temp rmdir /S /Q C:\temp
 
-      - name: Copy GTI Files
+          mkdir C:\temp
+          mkdir C:\temp\logs
+          mkdir C:\temp\archive
+
+          if exist "%GITHUB_WORKSPACE%\outputs" rmdir /S /Q "%GITHUB_WORKSPACE%\outputs"
+
+          mkdir "%GITHUB_WORKSPACE%\outputs"
+          mkdir "%GITHUB_WORKSPACE%\outputs\logs"
+          mkdir "%GITHUB_WORKSPACE%\outputs\archive"
+
+      # =================================================
+      # 4. Copy GTI source/input files
+      # =================================================
+      - name: Copy GTI files
         shell: cmd
         run: |
+          echo ==================================================
+          echo COPY GTI FILES TO C:\temp
+          echo ==================================================
+
           copy *.py C:\temp\
-          if exist *.xlsx copy *.xlsx C:\temp\
-          if exist *.csv copy *.csv C:\temp\
-          if exist *.json copy *.json C:\temp\
-          if exist *.txt copy *.txt C:\temp\
 
+          if exist *.xlsx copy *.xlsx C:\temp\
+          if exist *.csv  copy *.csv  C:\temp\
+          if exist *.json copy *.json C:\temp\
+          if exist *.txt  copy *.txt  C:\temp\
+
+          echo.
+          echo ===== C:\temp =====
+          dir C:\temp
+
+      # =================================================
+      # 5. Install dependencies
+      # =================================================
       - name: Install dependencies
         shell: cmd
         run: |
           python -m pip install --upgrade pip
           pip install -r requirements.txt
 
-      - name: Show Files
+      # =================================================
+      # 6. Environment diagnostic
+      # 비밀번호 등 Secret 값은 절대 출력하지 않음
+      # =================================================
+      - name: Check GTI environment
         shell: cmd
         run: |
-          echo ===== Repository Files =====
-          dir
-          echo ===== C:\temp Files =====
-          dir C:\temp
+          echo ==================================================
+          echo GTI ENVIRONMENT CHECK
+          echo ==================================================
 
+          python --version
+          where python
+
+          echo GTI_BASE_DIR=%GTI_BASE_DIR%
+          echo GTI_OUTPUT_DIR=%GTI_OUTPUT_DIR%
+
+          if exist C:\temp\7.run_gti_pipeline.py (
+            echo [OK] 7.run_gti_pipeline.py
+          ) else (
+            echo [ERROR] 7.run_gti_pipeline.py NOT FOUND
+            exit /b 1
+          )
+
+          if exist C:\temp\sites.xlsx (
+            echo [OK] sites.xlsx
+          ) else (
+            echo [WARN] sites.xlsx NOT FOUND
+          )
+
+          if exist C:\temp\KEYWORD.xlsx (
+            echo [OK] KEYWORD.xlsx
+          ) else (
+            echo [WARN] KEYWORD.xlsx NOT FOUND
+          )
+
+          if exist C:\temp\00.xlsx (
+            echo [OK] 00.xlsx
+          ) else (
+            echo [WARN] 00.xlsx NOT FOUND
+          )
+
+      # =================================================
+      # 7. Run GTI
+      # =================================================
       - name: RUN GTI PIPELINE
         shell: cmd
         run: |
-          python C:\temp\7.run_gti_pipeline.py > outputs\pipeline_console.log 2>&1
-          type outputs\pipeline_console.log
+          echo GTI PIPELINE START > "%GITHUB_WORKSPACE%\outputs\pipeline_console.log"
+          echo RUN DATE: %DATE% %TIME% >> "%GITHUB_WORKSPACE%\outputs\pipeline_console.log"
 
-      - name: Copy results to outputs
+          python C:\temp\7.run_gti_pipeline.py >> "%GITHUB_WORKSPACE%\outputs\pipeline_console.log" 2>&1
+
+          set PIPELINE_RC=%ERRORLEVEL%
+
+          echo. >> "%GITHUB_WORKSPACE%\outputs\pipeline_console.log"
+          echo PIPELINE RETURN CODE: %PIPELINE_RC% >> "%GITHUB_WORKSPACE%\outputs\pipeline_console.log"
+
+          type "%GITHUB_WORKSPACE%\outputs\pipeline_console.log"
+
+          exit /b %PIPELINE_RC%
+
+      # =================================================
+      # 8. Collect outputs
+      # 실패하더라도 실행
+      # =================================================
+      - name: Collect GTI outputs
         if: always()
         shell: cmd
         run: |
-          if exist C:\temp\logs xcopy C:\temp\logs outputs\logs\ /E /I /Y
-          if exist C:\temp\archive xcopy C:\temp\archive outputs\archive\ /E /I /Y
-          if exist C:\temp\*.xlsx copy C:\temp\*.xlsx outputs\
-          if exist C:\temp\*.html copy C:\temp\*.html outputs\
-          if exist C:\temp\*.log copy C:\temp\*.log outputs\logs\
+          echo ==================================================
+          echo COLLECT GTI OUTPUTS
+          echo ==================================================
 
-      - name: Upload Artifacts
+          REM ----------------------------------------------
+          REM 최종 GTI Radar 결과만 Artifact root에 복사
+          REM ----------------------------------------------
+          if exist C:\temp\GTI_Radar_*.xlsx (
+            copy C:\temp\GTI_Radar_*.xlsx "%GITHUB_WORKSPACE%\outputs\"
+          )
+
+          if exist C:\temp\GTI_Radar_*.html (
+            copy C:\temp\GTI_Radar_*.html "%GITHUB_WORKSPACE%\outputs\"
+          )
+
+          REM ----------------------------------------------
+          REM 주요 중간 산출물
+          REM ----------------------------------------------
+          if exist C:\temp\1-1.regulation_raw.xlsx (
+            copy C:\temp\1-1.regulation_raw.xlsx "%GITHUB_WORKSPACE%\outputs\"
+          )
+
+          if exist C:\temp\1-2.site_news_raw.xlsx (
+            copy C:\temp\1-2.site_news_raw.xlsx "%GITHUB_WORKSPACE%\outputs\"
+          )
+
+          if exist C:\temp\2-1.naver_news_raw.xlsx (
+            copy C:\temp\2-1.naver_news_raw.xlsx "%GITHUB_WORKSPACE%\outputs\"
+          )
+
+          if exist C:\temp\2-2.google_news_raw.xlsx (
+            copy C:\temp\2-2.google_news_raw.xlsx "%GITHUB_WORKSPACE%\outputs\"
+          )
+
+          if exist C:\temp\2-3.rss_news_raw.xlsx (
+            copy C:\temp\2-3.rss_news_raw.xlsx "%GITHUB_WORKSPACE%\outputs\"
+          )
+
+          if exist C:\temp\3-1.regulation_summary.xlsx (
+            copy C:\temp\3-1.regulation_summary.xlsx "%GITHUB_WORKSPACE%\outputs\"
+          )
+
+          if exist C:\temp\3-2.news_summary.xlsx (
+            copy C:\temp\3-2.news_summary.xlsx "%GITHUB_WORKSPACE%\outputs\"
+          )
+
+          if exist C:\temp\4-1.regulation_ai_summary.xlsx (
+            copy C:\temp\4-1.regulation_ai_summary.xlsx "%GITHUB_WORKSPACE%\outputs\"
+          )
+
+          if exist C:\temp\4-2.news_ai_summary.xlsx (
+            copy C:\temp\4-2.news_ai_summary.xlsx "%GITHUB_WORKSPACE%\outputs\"
+          )
+
+          REM ----------------------------------------------
+          REM 로그
+          REM ----------------------------------------------
+          if exist C:\temp\logs (
+            xcopy C:\temp\logs "%GITHUB_WORKSPACE%\outputs\logs\" /E /I /Y
+          )
+
+          if exist C:\temp\*.log (
+            copy C:\temp\*.log "%GITHUB_WORKSPACE%\outputs\logs\"
+          )
+
+          REM ----------------------------------------------
+          REM Archive
+          REM ----------------------------------------------
+          if exist C:\temp\archive (
+            xcopy C:\temp\archive "%GITHUB_WORKSPACE%\outputs\archive\" /E /I /Y
+          )
+
+          echo.
+          echo ==================================================
+          echo FINAL ARTIFACT CONTENT
+          echo ==================================================
+          dir "%GITHUB_WORKSPACE%\outputs" /S
+
+      # =================================================
+      # 9. Upload Artifact
+      # =================================================
+      - name: Upload GTI artifacts
         if: always()
-        uses: actions/upload-artifact@v7 # 🔄 v4 -> v7 업데이트 (Node 24 내장 지원)
+        uses: actions/upload-artifact@v4
         with:
-          name: gti-radar-output
+          name: gti-radar-output-${{ github.run_number }}
           path: outputs
+          if-no-files-found: warn
+          retention-days: 14
