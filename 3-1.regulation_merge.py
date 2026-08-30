@@ -195,6 +195,8 @@ def keyword_hits(title: str, keywords: list[str]) -> list[str]:
 NEGATIVE_GUARD_TERMS = [
     # 기관명/조직·내부행정: 관세/통상 문자열이 있어도 삼성전자 관세업무 법규가 아님
     '직제 시행규칙','직제 일부개정','조직개편','기구 개편','정원','인사발령',
+    '그 소속기관 직제','소속기관 직제','직제 (행정관련','직제(행정관련',
+    '철도교통관제센터','선박안전법','한국수출입은행법','인터넷 통관포털(uni-pass) 이용약관',
     '공익신고','신고자 보호','행정처분 및 과태료의 가중 처분',
     '도시정책','도시 계획','도시계획','주택정책','공익신고','신고자 보호',
     '채용','인사발령','조직개편','복무','청렴','윤리','개인정보 보호',
@@ -207,6 +209,25 @@ NEGATIVE_GUARD_TERMS = [
     ,'bắt giữ','hàng giả','giả nhãn hiệu','lịch bảo trì hệ thống'
     ,'와인제품','포도주','denominação de origem','denomination of origin','geographical indication'
 ]
+
+OFFICIAL_TRADE_POLICY_AGENCIES = [
+    'dgft', 'cbic', 'customs', '관세청', 'ustr', 'usitc', 'mofcom',
+    'gacc', 'taxud', 'department of commerce', 'ministry of trade',
+]
+OFFICIAL_TRADE_POLICY_ACTIONS = [
+    'amendment in the export policy', 'amendment in export policy',
+    'amendment in the import policy', 'amendment in import policy',
+    'export policy of', 'import policy of', 'trade notice',
+    '수출정책 개정', '수입정책 개정', '수출입정책 개정',
+]
+
+def official_trade_policy_rule(title: str, agency: str = '', source: str = '') -> tuple[bool, list[str]]:
+    """Require both an official trade agency and a concrete policy action."""
+    title_n = norm(title)
+    owner_n = norm(f'{agency} {source}')
+    agency_hits = [x for x in OFFICIAL_TRADE_POLICY_AGENCIES if x in owner_n]
+    action_hits = [x for x in OFFICIAL_TRADE_POLICY_ACTIONS if x in title_n]
+    return bool(agency_hits and action_hits), action_hits
 
 def obvious_non_customs_guard(title: str) -> bool:
     t = norm(title)
@@ -516,6 +537,9 @@ def cumulative_row_is_valid(row: pd.Series, keywords: list[str]) -> tuple[bool, 
     noise = any(x in norm(title) for x in NOISE_TERMS)
     negative_guard = obvious_non_customs_guard(title)
     strong_rel, _ = strong_customs_rule(title)
+    official_policy, _ = official_trade_policy_rule(
+        title, clean(row.get('Agency', '')), clean(row.get('Source', ''))
+    )
     kw_hits = keyword_hits_effective(title, keywords)
 
     # Preserve previously confirmed AI rows only when they are not now blocked.
@@ -527,6 +551,8 @@ def cumulative_row_is_valid(row: pd.Series, keywords: list[str]) -> tuple[bool, 
         return False, 'NOISE'
     if negative_guard:
         return False, 'OBVIOUS_NON_CUSTOMS'
+    if official_policy:
+        return True, 'OFFICIAL_TRADE_POLICY'
     if strong_rel:
         return True, 'STRONG_CUSTOMS_RULE'
     if kw_hits:
@@ -629,7 +655,7 @@ def safe_write(path: Path, df: pd.DataFrame):
         print(f'[WARN] locked: {path.name} -> {alt.name}')
 
 def main():
-    print('GTI v5.7 STEP3-1 REGULATION EVENT MERGE START')
+    print('GTI v5.8 STEP3-1 REGULATION POLICY CONTRACT START')
     if not INPUT_FILE.exists():
         raise FileNotFoundError(INPUT_FILE)
 
@@ -649,6 +675,9 @@ def main():
         hits = keyword_hits_effective(title, keywords)
         keyword_rel = bool(hits)
         strong_rel, strong_hits = strong_customs_rule(title)
+        official_policy, official_policy_hits = official_trade_policy_rule(
+            title, clean(r['Agency']), clean(r['Source'])
+        )
         noise = any(x in norm(title) for x in NOISE_TERMS)
         negative_guard = obvious_non_customs_guard(title)
 
@@ -656,7 +685,7 @@ def main():
         ai_score = 0
         ai_reason = ''
 
-        if not strong_rel and not keyword_rel and not noise and not negative_guard:
+        if not strong_rel and not keyword_rel and not official_policy and not noise and not negative_guard:
             ai_rel, ai_score, ai_reason = ai_judge(title, clean(r['Agency']))
             rescue_terms = [
                 '대외경제','수출입','무역','통상','외환','trade','import','export',
@@ -669,11 +698,14 @@ def main():
         # keyword/AI rescue cases.
         keep = (
             (strong_rel and not negative_guard)
+            or (official_policy and not negative_guard)
             or ((keyword_rel or ai_rel) and not negative_guard)
         ) and not noise
         r['KeywordMatches'] = '; '.join(hits)
         r['StrongRuleMatches'] = '; '.join(strong_hits)
         r['StrongRuleFlag'] = 'Y' if strong_rel else 'N'
+        r['OfficialPolicyMatches'] = '; '.join(official_policy_hits)
+        r['OfficialPolicyFlag'] = 'Y' if official_policy else 'N'
         r['TitleKeywordFlag'] = 'Y' if hits else 'N'
         r['AIRelevant'] = 'Y' if ai_rel else 'N'
         r['AIRelevantScore'] = ai_score
@@ -682,8 +714,9 @@ def main():
         r['CanonicalTitle'] = canonical_regulation_title(title)
         r['SelectionRule'] = (
             'REJECT_NEGATIVE_GUARD' if negative_guard
-            else ('STRONG_CUSTOMS_RULE' if strong_rel
-                  else ('TITLE_KEYWORD' if hits else ('AI_CUSTOMS_YES' if ai_rel else 'REJECT')))
+            else ('OFFICIAL_TRADE_POLICY' if official_policy
+                  else ('STRONG_CUSTOMS_RULE' if strong_rel
+                        else ('TITLE_KEYWORD' if hits else ('AI_CUSTOMS_YES' if ai_rel else 'REJECT'))))
         )
         r['CheckedAt'] = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
         mapping_type, mapping_status, entity_direct = regulation_mapping_type(r, title)
@@ -779,7 +812,7 @@ def main():
         safe_write(cumulative_removed_path, cumulative_removed)
 
     print(f'[STEP3-1] raw={len(raw)} selected={len(sel)} new={len(today)} excluded={len(exc)} cumulative={len(combined)}')
-    print('GTI v5.7 STEP3-1 DONE')
+    print('GTI v5.8 STEP3-1 DONE')
 
 if __name__ == '__main__':
     main()

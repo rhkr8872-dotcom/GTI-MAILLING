@@ -152,6 +152,28 @@ BIS_VALID_CONTEXT = [
 OUTPUT_COLS = [
     "No", "Content Type", "Mail Group", "Samsung Impact", "Affected Subsidiary", "Impact Reason", "Date", "Headline", "Summary", "AI Analysis", "Action Plan", "Country", "Agency", "Risk", "Importance Score", "Priority Group", "Issue", "Cluster", "URL", "Source", "Source File", "RejectReason", "KeywordMatches", "effective_date_hint", "hs_hint", "tariff_rate_hint"
 ]
+
+REGULATION_HARD_NOISE_TERMS = [
+    "직제 시행규칙", "직제 일부개정", "그 소속기관 직제", "소속기관 직제",
+    "직제 (행정관련", "직제(행정관련", "조직개편", "기구 개편", "정원 일부개정",
+    "외국인청고시", "국적상실", "철도교통관제센터", "한국수출입은행법", "선박안전법",
+]
+
+def is_official_trade_policy_candidate(row: pd.Series) -> bool:
+    if clean(row.get("OfficialPolicyFlag", "")).upper() == "Y":
+        return True
+    headline = clean(row.get("Headline", row.get("title", ""))).lower()
+    owner = " ".join([
+        clean(row.get("Agency", row.get("agency", ""))),
+        clean(row.get("Source", row.get("source", ""))),
+    ]).lower()
+    agency_ok = any(x in owner for x in ["dgft", "cbic", "customs", "ustr", "usitc", "mofcom", "gacc", "taxud"])
+    action_ok = any(x in headline for x in [
+        "amendment in the export policy", "amendment in export policy",
+        "amendment in the import policy", "amendment in import policy",
+        "export policy of", "import policy of", "trade notice",
+    ])
+    return agency_ok and action_ok
 CUMULATIVE_REMOVED_DF = pd.DataFrame()
 for _quality_col in [
     "Top3 Eligible", "Body Verified", "Change Type", "Evidence", "Missing Facts",
@@ -719,6 +741,32 @@ def action_for(topic):
     if topic == "TARIFF": return "통관운영/FTA팀", "관세율·시행일·대상국·대상품목을 확인하고 원가 영향을 점검하십시오."
     return "통관운영", "업무 관련성 확인 후 모니터링하십시오."
 
+def guard_unverified_dates(analysis: dict, row: pd.Series) -> dict:
+    """Remove dates asserted by AI when they are absent from extracted evidence."""
+    result = dict(analysis or {})
+    evidence_text = " ".join([
+        clean(row.get("article_body", "")), clean(row.get("regulation_fallback_body", "")),
+        clean(result.get("Evidence", "")),
+    ])
+    verified = clean(result.get("Body Verified", "N")).upper() == "Y"
+    evidence_dates = set(re.findall(r"(?:20\d{2})[-년./ ]+\s*(?:0?[1-9]|1[0-2])[-월./ ]+\s*(?:0?[1-9]|[12]\d|3[01])", evidence_text))
+    if verified and evidence_dates:
+        return result
+    for field in ["Summary", "AI Analysis", "Action Plan"]:
+        value = clean(result.get(field, ""))
+        if not value:
+            continue
+        value = re.sub(
+            r"20\d{2}년\s*\d{1,2}월\s*\d{1,2}일(?:부터|자로)?\s*(?:시행|발효|적용|공포)(?:될\s*)?(?:예정입니다|예정이다|됩니다|된다|되었습니다|되었다)?[.]?",
+            "구체적인 시행·발효일은 원문 확인이 필요합니다.", value,
+        )
+        value = value.replace("필요합니다.예정이며", "필요합니다.")
+        value = value.replace("필요합니다. 예정이며", "필요합니다.")
+        value = value.replace("필요합니다.,", "필요합니다.")
+        value = value.replace("필요합니다..", "필요합니다.")
+        result[field] = value
+    return result
+
 def score_row(row):
     text = row_text(row)
     topic = detect_topic(text)
@@ -735,12 +783,15 @@ def score_row(row):
     policy_briefing_news = is_policy_briefing_press_release(row)
     unipass_notice_force = is_unipass_notice_candidate(row)
     indirect_tax_law_force = is_indirect_customs_tax_law(row, text) and not policy_briefing_news
-    forced_customs_trade_regulation = unipass_notice_force or indirect_tax_law_force
+    official_trade_policy_force = is_official_trade_policy_candidate(row)
+    forced_customs_trade_regulation = unipass_notice_force or indirect_tax_law_force or official_trade_policy_force
     strict_trade_signal = has_strict_trade_reg_signal(text, row) or metadata_trade_signal or forced_customs_trade_regulation
     old_ad_cvd_review = is_old_ad_cvd_review(topic, text, age_days)
-    pure_regulation = is_pure_regulation_candidate(row, text, topic)
+    pure_regulation = is_pure_regulation_candidate(row, text, topic) or official_trade_policy_force
 
     if not is_valid_url(url): rejects.append("no_valid_url")
+    if contains_any(headline.lower(), REGULATION_HARD_NOISE_TERMS):
+        rejects.append("organization_or_non_customs_hard_noise")
     if age_days is not None and age_days > MAX_AGE_DAYS:
         rejects.append(f"old_regulation>{MAX_AGE_DAYS}d")
         if old_ad_cvd_review:
@@ -775,6 +826,8 @@ def score_row(row):
             keyword_hits.append("UNIPASS_NOTICE_FORCE_INCLUDE")
         if indirect_tax_law_force:
             keyword_hits.append("INDIRECT_CUSTOMS_TAX_LAW")
+        if official_trade_policy_force:
+            keyword_hits.append("OFFICIAL_TRADE_POLICY")
     if keyword_hits and not rejects:
         score = max(score, 72)
     if rejects:
@@ -798,6 +851,7 @@ def score_row(row):
         default_action=action,
         content_type="Regulation",
     )
+    analysis = guard_unverified_dates(analysis, row)
     mapping_type = clean(row.get("RegulationMappingType", "POLICY_GENERAL")) or "POLICY_GENERAL"
     if mapping_type == "ITEM_1TO1":
         mapping_type = "PRODUCT_1TO1"
@@ -830,6 +884,12 @@ def score_row(row):
         else:
             ai_impact = "Watch"
             mapping_status = "MAPPING_REQUIRED" if body_ok else "VERIFICATION_PENDING"
+    else:
+        # Hypothetical language such as "if Samsung trades this product" is
+        # not an indirect-impact mapping.  Keep general policy at Watch until
+        # an actual Samsung entity/product/HS/trade route is evidenced.
+        ai_impact = "Watch"
+        mapping_status = "POLICY_REVIEW"
 
     policy_score = max(0, min(100, int(score)))
     direct_score = 100 if ai_impact == "Direct" else 65 if ai_impact == "Indirect" else 35
@@ -837,7 +897,10 @@ def score_row(row):
     weighted_score = round(policy_score * 0.4 + direct_score * 0.4 + samsung_relevance * 0.2)
     top3 = "Y" if body_ok and ai_impact == "Direct" and weighted_score >= 80 else "N"
 
-    return {"selected": selected, "RejectReason": "; ".join(rejects), "Issue": issue, "topic": topic, "score": score, "Risk": risk, "URL": url, "Headline": headline, "Date": clean(date_val), "Country": clean(row.get("Country", row.get("country", ""))), "Agency": clean(row.get("Agency", row.get("agency", ""))), "Source": clean(row.get("Source", row.get("source", ""))), "Summary": analysis.get("Summary", ""), "AI Analysis": analysis.get("AI Analysis", ""), "Action Plan": analysis.get("Action Plan", action), "Owner": owner, "KeywordMatches": "; ".join(keyword_hits[:12]), "tariff_rate_hint": extract_tariff_rate(text), "effective_date_hint": clean(row.get("effective_date_hint", "본문에서 확인 불가")) or "본문에서 확인 불가", "hs_hint": hs_value or "본문에서 확인 불가", "article_extract_status": analysis.get("article_extract_status", ""), "Samsung Impact": ai_impact, "Top3 Eligible": top3, "Body Verified": analysis.get("Body Verified", "N"), "Change Type": analysis.get("Change Type", "기타"), "Evidence": analysis.get("Evidence", ""), "Missing Facts": analysis.get("Missing Facts", ""), "RegulationMappingType": mapping_type, "MappingStatus": mapping_status, "RequiredMappingKeys": clean(row.get("RequiredMappingKeys", "")), "EntityDirectFlag": "Y" if mapping_type == "ENTITY_DIRECT" else "N", "SamsungRelevanceScore": samsung_relevance, "CustomsTradePolicyScore": policy_score, "DirectImpactScore": direct_score, "WeightedScore": weighted_score}
+    effective_hint = clean(row.get("effective_date_hint", ""))
+    if not any(x in " ".join([clean(row.get("article_body", "")), clean(row.get("regulation_fallback_body", "")), clean(analysis.get("Evidence", ""))]).lower() for x in ["시행", "적용", "발효", "effective", "takes effect", "enters into force"]):
+        effective_hint = "본문에서 확인 불가"
+    return {"selected": selected, "RejectReason": "; ".join(rejects), "Issue": issue, "topic": topic, "score": score, "Risk": risk, "URL": url, "Headline": headline, "Date": clean(date_val), "Country": clean(row.get("Country", row.get("country", ""))), "Agency": clean(row.get("Agency", row.get("agency", ""))), "Source": clean(row.get("Source", row.get("source", ""))), "Summary": analysis.get("Summary", ""), "AI Analysis": analysis.get("AI Analysis", ""), "Action Plan": analysis.get("Action Plan", action), "Owner": owner, "KeywordMatches": "; ".join(keyword_hits[:12]), "tariff_rate_hint": extract_tariff_rate(text), "effective_date_hint": effective_hint or "본문에서 확인 불가", "hs_hint": hs_value or "본문에서 확인 불가", "article_extract_status": analysis.get("article_extract_status", ""), "Samsung Impact": ai_impact, "Top3 Eligible": top3, "Body Verified": analysis.get("Body Verified", "N"), "Change Type": analysis.get("Change Type", "기타"), "Evidence": analysis.get("Evidence", ""), "Missing Facts": analysis.get("Missing Facts", ""), "RegulationMappingType": mapping_type, "MappingStatus": mapping_status, "RequiredMappingKeys": clean(row.get("RequiredMappingKeys", "")), "EntityDirectFlag": "Y" if mapping_type == "ENTITY_DIRECT" else "N", "SamsungRelevanceScore": samsung_relevance, "CustomsTradePolicyScore": policy_score, "DirectImpactScore": direct_score, "WeightedScore": weighted_score}
 
 def read_input():
     input_path = INPUT_FILE if INPUT_FILE.exists() else FALLBACK_INPUT_FILE
@@ -883,11 +946,19 @@ def to_output(df, content_type="Regulation"):
         if "관세청" in headline:
             agency = "대한민국 관세청"
             country = "대한민국"
+        strategic_priority = clean(r.get("topic")) == "EXPORT_CONTROL" or any(
+            term in headline.lower() for term in ["전략물자", "수출통제", "export control", "entity list"]
+        )
         rows.append({
             "No": i+1, "Content Type": content_type, "Mail Group": "Regulation" if content_type=="Regulation" else "News - 주요/참고",
-            "Samsung Impact": impact, "Affected Subsidiary": "관련 법인 검토", "Impact Reason": "official_trade_regulation_watch",
+            "Samsung Impact": impact,
+            "Affected Subsidiary": "HQ 수출통제·관세팀 / 관련 사업부" if strategic_priority else "관련 법인 검토",
+            "Impact Reason": "critical_export_control_regulation_pending_verification" if strategic_priority else "official_trade_regulation_watch",
             "Date": r["Date"], "Headline": headline, "Summary": r["Summary"], "AI Analysis": r["AI Analysis"], "Action Plan": r["Action Plan"],
-            "Country": country, "Agency": agency, "Risk": r["Risk"], "Importance Score": int(r["score"]), "Priority Group": "CORE" if int(r["score"])>=85 else "USABLE",
+            "Country": country, "Agency": agency,
+            "Risk": "상" if strategic_priority else r["Risk"],
+            "Importance Score": 100 if strategic_priority else int(r["score"]),
+            "Priority Group": "CORE" if strategic_priority or int(r["score"])>=85 else "USABLE",
             "Issue": r["Issue"], "Cluster": r["Headline"], "URL": r["URL"], "Source": r["Source"], "Source File": "3-1.regulation_article_summary.xlsx",
             "Top3 Eligible": r.get("Top3 Eligible", "N"), "Body Verified": r.get("Body Verified", "N"), "Change Type": r.get("Change Type", "기타"), "Evidence": r.get("Evidence", ""), "Missing Facts": r.get("Missing Facts", ""),
             "RegulationMappingType": r.get("RegulationMappingType", ""), "MappingStatus": r.get("MappingStatus", ""), "RequiredMappingKeys": r.get("RequiredMappingKeys", ""), "EntityDirectFlag": r.get("EntityDirectFlag", "N"),
@@ -931,7 +1002,7 @@ def _clean_legacy_cumulative(df):
             continue
         if contains_terms(low, ["와인제품", "포도주", "denominação de origem", "denomination of origin", "geographical indication"]):
             continue
-        if contains_terms(low, ["직제 시행규칙", "직제 일부개정", "조직개편", "정원 일부개정"]):
+        if contains_terms(low, REGULATION_HARD_NOISE_TERMS):
             continue
         if contains_terms(low, [
             "전체 관세청 유관기관", "시스템 작업 안내", "오프라인 작업 안내",
@@ -1586,7 +1657,7 @@ def _gti_step4_extractor_log_once():
 # ======================================================================
 
 def main():
-    print("GTI STEP4-1 REGULATION AI v8 VERIFIED BODY START")
+    print("GTI STEP4-1 REGULATION AI v8.3 STRATEGIC CONTROL PRIORITY START")
     print(f"[MODEL] {GEMINI_MODEL}")
     _gti_step4_gemini_log_once()
     _gti_step4_extractor_log_once()

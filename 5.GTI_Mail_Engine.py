@@ -865,6 +865,75 @@ def append_output_row(ws, row: pd.Series) -> None:
         cell.font = Font(color="0563C1", underline="single", bold=True)
 
 
+def _v331_clean_cumulative_direct(old: pd.DataFrame) -> pd.DataFrame:
+    """Revalidate legacy News/Direct rows against the current v330 contract."""
+    if old.empty:
+        return old
+    old = old.copy()
+    if "MappedHS" in old.columns:
+        old["MappedHS"] = old["MappedHS"].astype("object")
+
+    valid_mapping = {"ENTITY_CONFIRMED", "ITEM_1TO1_MAPPED"}
+    specific_issues = {"AD/CVD", "반덤핑/상계관세", "HS/품목분류", "FTA/원산지"}
+    downgraded = 0
+    fake_hs_cleared = 0
+    for idx, row in old.iterrows():
+        if clean(row.get("Content Type")) != "News" or clean(row.get("Samsung Impact")) != "Direct":
+            continue
+        status = clean(row.get("MappingStatus"))
+        issue = clean(row.get("Issue"))
+        mapped_hs = clean(row.get("MappedHS"))
+        direct_evidence = clean(row.get("Direct Evidence"))
+        mapping_evidence = clean(row.get("MappingEvidence"))
+        invalid_hs = bool(re.fullmatch(r"(?:19|20)\d{2}(?:\.\d+)?", mapped_hs))
+        candidate_mapping = any(
+            term in " ".join([
+                clean(row.get("MappedProduct")), mapped_hs, clean(row.get("TradeRoute")),
+            ]).lower()
+            for term in ["후보", "확인 필요", "verify", "candidate"]
+        )
+        mapping_ok = status in valid_mapping
+        if issue in specific_issues:
+            mapping_ok = status == "ITEM_1TO1_MAPPED"
+        if invalid_hs or candidate_mapping:
+            mapping_ok = False
+        if status == "ENTITY_CONFIRMED":
+            mapping_ok = bool(re.search(r"삼성|samsung", direct_evidence, re.I))
+        if mapping_evidence == "ARTICLE_ENTITY_PRODUCT" and not direct_evidence:
+            mapping_ok = False
+        if not _v330_direct_stage_ok(row) or not _v330_official_primary(row.get("Official Evidence")):
+            mapping_ok = False
+        if mapping_ok:
+            continue
+
+        samsung_named = bool(re.search(
+            r"삼성|samsung",
+            " ".join([
+                clean(row.get("Headline")), direct_evidence, clean(row.get("AI Analysis")),
+                clean(row.get("MappedEntity")),
+            ]),
+            re.I,
+        ))
+        new_impact = "Indirect" if samsung_named else "Watch"
+        old.at[idx, "Samsung Impact"] = new_impact
+        old.at[idx, "MappingStatus"] = "POLICY_REVIEW"
+        old.at[idx, "RegulationMappingType"] = "POLICY_GENERAL"
+        old.at[idx, "EntityDirectFlag"] = "N"
+        old.at[idx, "DirectImpactScore"] = 65 if new_impact == "Indirect" else 35
+        old.at[idx, "Top3 Eligible"] = "N"
+        if invalid_hs and not clean(row.get("TradeRoute")):
+            old.at[idx, "MappedHS"] = ""
+            fake_hs_cleared += 1
+        downgraded += 1
+
+    if downgraded or fake_hs_cleared:
+        print(
+            f"[STEP5 CUMULATIVE DIRECT REVALIDATION] downgraded={downgraded} / "
+            f"fake_hs_cleared={fake_hs_cleared}"
+        )
+    return old
+
+
 def save_excel(rows: pd.DataFrame, top3: pd.DataFrame, paths: dict[str, Path]) -> None:
     wb = Workbook()
     sheets = [
@@ -901,6 +970,7 @@ def save_excel(rows: pd.DataFrame, top3: pd.DataFrame, paths: dict[str, Path]) -
     if paths["cumulative"].exists():
         try:
             old_cumulative = pd.read_excel(paths["cumulative"])
+            old_cumulative = _v331_clean_cumulative_direct(old_cumulative)
         except Exception:
             old_cumulative = pd.DataFrame()
     else:
@@ -4128,6 +4198,7 @@ def save_excel(rows: pd.DataFrame, top3: pd.DataFrame, paths: dict[str, Path]) -
     if paths["cumulative"].exists():
         try:
             old_cumulative = pd.read_excel(paths["cumulative"])
+            old_cumulative = _v331_clean_cumulative_direct(old_cumulative)
         except Exception as exc:
             raise RuntimeError(
                 f"cumulative read failed; existing history was not overwritten: "
@@ -5782,7 +5853,44 @@ def choose_top3(rows: pd.DataFrame) -> pd.DataFrame:
 # Regulation remains event-based and is not subjected to the news 24h rule.
 # ======================================================================
 
-GTI_STEP5_VERSION = "v328 UNIFIED LAW + EMPTY-NEWS SAFE REPORT"
+GTI_STEP5_VERSION = "v331 PROVISIONAL-POLICY + MAPPING CONSISTENCY + CUMULATIVE DIRECT CLEAN"
+
+for _v330_col in [
+    "Article Extract Status", "Article Source Type", "Article Body Evidence",
+    "Policy Stage", "Quality Contract",
+]:
+    if _v330_col not in OUTPUT_COLUMNS:
+        OUTPUT_COLUMNS.append(_v330_col)
+
+
+def _v330_official_primary(value: object) -> bool:
+    t = clean(value).lower()
+    if not t or any(x in t for x in ["언론", "보도", "기사", "로이터", "폴리티코", "전망", "관계자"]):
+        return False
+    return any(x in t for x in [
+        "관보", "연방관보", "federal register", "ustr", "cbp", "bis", "ofac", "미 재무부",
+        "미 상무부", "eu 집행위원회", "commission regulation", "관세청", "세관", "법원",
+        "행정명령", "고시", "공식문서", "official gazette", "regulation (eu)", "decision",
+    ])
+
+
+def _v330_direct_stage_ok(row: pd.Series) -> bool:
+    explicit = clean(row.get("Policy Stage")).upper()
+    if explicit:
+        return explicit == "OPERATIVE"
+    t = " ".join([
+        clean(row.get("Headline")), clean(row.get("Summary")), clean(row.get("AI Analysis")),
+    ]).lower()
+    tentative = any(x in t for x in [
+        "검토", "추진", "가능성", "예상", "방안", "계획", "협상 중", "논의", "보도",
+        "consider", "review", "proposal", "proposed", "may", "could", "plan",
+    ])
+    operative = any(x in t for x in [
+        "시행", "발효", "부과", "최종판정", "조사 개시", "명령", "고시", "지정", "수입금지",
+        "effective", "entered into force", "imposed", "final determination", "investigation initiated",
+        "executive order", "designated", "import ban",
+    ])
+    return operative and not tentative
 
 
 def _v319_parse_news_date(row: pd.Series):
@@ -5873,6 +5981,15 @@ def read_step4_results() -> pd.DataFrame:
         reg = normalize_input(raw_reg, "Regulation", REGULATION_INPUT_FILE)
         reg["Content Type"] = "Regulation"
         reg["Mail Group"] = GROUP_REGULATION
+        reg_title = reg["Headline"].fillna("").astype(str).str.lower()
+        reg_hard_noise = reg_title.apply(lambda value: any(term in value for term in [
+            "직제 시행규칙", "직제 일부개정", "그 소속기관 직제", "소속기관 직제",
+            "직제 (행정관련", "직제(행정관련", "조직개편", "정원 일부개정",
+            "외국인청고시", "국적상실", "철도교통관제센터", "한국수출입은행법",
+        ]))
+        if reg_hard_noise.any():
+            print(f"[STEP5 REGULATION HARD-NOISE GUARD] removed={int(reg_hard_noise.sum())}")
+            reg = reg.loc[~reg_hard_noise].copy()
         frames.append(reg)
         print(f"[STEP5 INPUT] regulation={len(reg)} / file={REGULATION_INPUT_FILE.name}")
     else:
@@ -5915,12 +6032,14 @@ def read_step4_results() -> pd.DataFrame:
             raw_news["AIRelevant"].astype(str).str.upper().eq("Y")
             & raw_news["Policy Event"].astype(str).str.upper().eq("Y")
         )
-        # STEP4의 보충 Watch는 확정 정책사건이 아니어서 AIRelevant/Policy Event가
-        # N일 수 있다. 원문 검증과 점수는 유지하되 Direct/Top3 승격은 금지한다.
-        supplemental_watch = raw_news.get(
-            "Samsung Impact", pd.Series(index=raw_news.index, dtype=str)
-        ).astype(str).str.strip().eq("Watch")
-        raw_news = raw_news[verified & score_ok & (strict_selected | supplemental_watch)].copy()
+        contract_ok = verified & score_ok & strict_selected
+        violations = raw_news.loc[~contract_ok].copy()
+        if not violations.empty:
+            print(
+                f"[STEP5 CONTRACT VIOLATION] rejected={len(violations)} / "
+                "STEP4 output must already satisfy relevant+score+body+policy gates"
+            )
+        raw_news = raw_news.loc[contract_ok].copy()
         if raw_news.empty:
             print("[STEP5 INFO] no mail-grade news after STEP4-2 quality gate")
         news = normalize_input(raw_news, "News", NEWS_INPUT_FILE)
@@ -6032,6 +6151,8 @@ def _v322_recalibrate_news(rows: pd.DataFrame) -> pd.DataFrame:
     if rows.empty:
         return rows
     rows = rows.copy()
+    if "MappedHS" in rows.columns:
+        rows["MappedHS"] = rows["MappedHS"].astype("object")
     noise = rows.apply(_v322_hard_scope_excluded, axis=1)
     if noise.any():
         print(f"[STEP5 BUSINESS-SCOPE GUARD] removed={int(noise.sum())}")
@@ -6065,9 +6186,20 @@ def _v322_recalibrate_news(rows: pd.DataFrame) -> pd.DataFrame:
             mapping_ok = bool(re.search(r"삼성|samsung", direct_evidence, re.I))
         if mapping_evidence == "ARTICLE_ENTITY_PRODUCT" and not direct_evidence:
             mapping_ok = False
+        # 검토·가능성·언론보도 단계 또는 1차 공식근거가 없는 뉴스는
+        # 메일에는 남길 수 있지만 Direct/Top3로 확정하지 않는다.
+        if not _v330_direct_stage_ok(row) or not _v330_official_primary(row.get("Official Evidence")):
+            mapping_ok = False
         if impact == "Direct" and not mapping_ok:
-            rows.at[idx, "Samsung Impact"] = "Indirect" if clean(row.get("Policy Event")).upper() == "Y" else "Watch"
+            new_impact = "Indirect" if clean(row.get("Policy Event")).upper() == "Y" else "Watch"
+            rows.at[idx, "Samsung Impact"] = new_impact
+            rows.at[idx, "MappingStatus"] = "POLICY_REVIEW"
+            rows.at[idx, "RegulationMappingType"] = "POLICY_GENERAL"
+            rows.at[idx, "EntityDirectFlag"] = "N"
+            rows.at[idx, "DirectImpactScore"] = 65 if new_impact == "Indirect" else 35
             rows.at[idx, "Top3 Eligible"] = "N"
+            if invalid_hs and not clean(row.get("TradeRoute")):
+                rows.at[idx, "MappedHS"] = ""
             downgraded += 1
         top3_ok = (
             clean(rows.at[idx, "Samsung Impact"]) == "Direct"
@@ -6120,6 +6252,8 @@ def choose_top3(rows: pd.DataFrame) -> pd.DataFrame:
                 and clean(r.get("Samsung Impact")) == "Direct"
                 and clean(r.get("Top3 Eligible")).upper() == "Y"
                 and clean(r.get("MappingStatus")) in {"ENTITY_CONFIRMED", "ITEM_1TO1_MAPPED"}
+                and _v330_direct_stage_ok(r)
+                and _v330_official_primary(r.get("Official Evidence"))
                 and (
                     clean(r.get("MappingStatus")) == "ITEM_1TO1_MAPPED"
                     or bool(re.search(r"삼성|samsung", clean(r.get("Direct Evidence")), re.I))
@@ -6359,6 +6493,12 @@ def main() -> None:
     paths = output_paths()
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
     rows = prepare_rows(read_step4_results())
+    if rows.empty:
+        print(
+            "[STEP5 STOP] reportable regulation=0 and news=0. "
+            "Email was NOT sent; existing HTML/XLSX/cumulative outputs were preserved."
+        )
+        return
     top3 = choose_top3(rows)
     html_body = build_html(rows, top3)
     save_excel(rows, top3, paths)
