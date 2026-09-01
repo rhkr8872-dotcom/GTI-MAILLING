@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-GTI PIPELINE v43 - REGULATION / NEWS FULLY SEPARATED
+GTI PIPELINE v44 - FAIL-SAFE PARTIAL REPORT + LIVE WATCHDOG
 ====================================================
 
 REGULATION BRANCH
@@ -40,13 +40,15 @@ Critical rules
 3. 3-2 never creates/checks regulation files.
 4. 4-1 reads regulation output only.
 5. 4-2 reads news output only.
-6. Step5 runs only when BOTH current-run AI outputs are freshly generated.
-7. Old AI outputs are never mixed into a new mail.
+6. Step5 may report either successful branch; a failed branch is never reused.
+7. A valid zero-row AI result is accepted as a successful current-run result.
+8. Child logs are unbuffered and a no-progress watchdog prevents silent hangs.
 """
 
 from __future__ import annotations
 
 import argparse
+import atexit
 import os
 import queue
 import shutil
@@ -116,6 +118,7 @@ class Step:
     min_rows: dict[str, int] = field(default_factory=dict)
     args: tuple[str, ...] = field(default_factory=tuple)
     timeout_sec: int | None = None
+    idle_timeout_sec: int | None = None
 
 
 # =============================================================================
@@ -197,8 +200,10 @@ NEWS_POST_STEPS = [
             "4-2.news_ai_summary.xlsx",
             "4-2.news_ai_cumulative.xlsx",
         ),
-        min_rows={"4-2.news_ai_summary.xlsx": 1},
-        timeout_sec=3600,
+        # Zero selected news is a valid quality-gate result when the workbook
+        # was freshly generated and still has its schema/header.
+        timeout_sec=7200,
+        idle_timeout_sec=900,
     ),
 ]
 
@@ -283,6 +288,34 @@ def apply_env_defaults() -> None:
         os.environ.setdefault(k, v)
 
 
+def enable_windows_sleep_guard() -> None:
+    """Keep an unattended Windows pipeline awake until this process exits."""
+    if os.name != "nt":
+        return
+    try:
+        import ctypes
+
+        es_continuous = 0x80000000
+        es_system_required = 0x00000001
+        result = ctypes.windll.kernel32.SetThreadExecutionState(
+            es_continuous | es_system_required
+        )
+        if result:
+            log("WINDOWS SLEEP GUARD : enabled")
+
+            def restore() -> None:
+                try:
+                    ctypes.windll.kernel32.SetThreadExecutionState(es_continuous)
+                except Exception:
+                    pass
+
+            atexit.register(restore)
+        else:
+            log("WINDOWS SLEEP GUARD WARN : activation returned 0")
+    except Exception as exc:
+        log(f"WINDOWS SLEEP GUARD WARN : {type(exc).__name__}: {exc}")
+
+
 def get_python() -> str:
     candidates = [
         str(PYTHON_EXE),
@@ -359,7 +392,9 @@ def run_step(step: Step, python_exe: str, dry_run: bool = False) -> str:
         log(f"FILE NOT FOUND : {script}")
         return "FAILED" if step.required else "SKIPPED"
 
-    cmd = [python_exe, str(script), *step.args]
+    # -u is essential for long AI stages: progress must reach this watchdog
+    # immediately instead of remaining in the child process' stdout buffer.
+    cmd = [python_exe, "-u", str(script), *step.args]
     log("COMMAND : " + " ".join(f'"{x}"' if " " in x else x for x in cmd))
 
     if dry_run:
@@ -370,6 +405,7 @@ def run_step(step: Step, python_exe: str, dry_run: bool = False) -> str:
     env = os.environ.copy()
     env.setdefault("PYTHONIOENCODING", "utf-8")
     env.setdefault("PYTHONUTF8", "1")
+    env.setdefault("PYTHONUNBUFFERED", "1")
 
     proc = subprocess.Popen(
         cmd,
@@ -398,6 +434,9 @@ def run_step(step: Step, python_exe: str, dry_run: bool = False) -> str:
 
     reader_done = False
     timed_out = False
+    timeout_reason = ""
+    last_output_at = time.monotonic()
+    started_mono = time.monotonic()
 
     while True:
         try:
@@ -405,6 +444,7 @@ def run_step(step: Step, python_exe: str, dry_run: bool = False) -> str:
             if item is None:
                 reader_done = True
             else:
+                last_output_at = time.monotonic()
                 log("  " + item.rstrip())
         except queue.Empty:
             pass
@@ -412,10 +452,21 @@ def run_step(step: Step, python_exe: str, dry_run: bool = False) -> str:
         if (
             step.timeout_sec
             and proc.poll() is None
-            and time.time() - started > step.timeout_sec
+            and time.monotonic() - started_mono > step.timeout_sec
         ):
             timed_out = True
-            log(f"TIMEOUT : {step.timeout_sec} sec")
+            timeout_reason = f"hard limit {step.timeout_sec} sec"
+            log(f"TIMEOUT : {timeout_reason}")
+        elif (
+            step.idle_timeout_sec
+            and proc.poll() is None
+            and time.monotonic() - last_output_at > step.idle_timeout_sec
+        ):
+            timed_out = True
+            timeout_reason = f"no child output for {step.idle_timeout_sec} sec"
+            log(f"TIMEOUT : {timeout_reason}")
+
+        if timed_out:
             try:
                 if os.name == "nt":
                     subprocess.run(
@@ -446,7 +497,7 @@ def run_step(step: Step, python_exe: str, dry_run: bool = False) -> str:
     elapsed = round(time.time() - started, 2)
 
     if timed_out:
-        log(f"{step.name} FAILED : timeout / {elapsed}s")
+        log(f"{step.name} FAILED : {timeout_reason} / {elapsed}s")
         return "FAILED" if step.required else "WARNING"
 
     if rc != 0:
@@ -571,11 +622,16 @@ def run_news_branch(
     return True
 
 
-def ai_outputs_current_run_ready(run_started_at: float) -> tuple[bool, list[str]]:
-    checks = [
-        BASE_DIR / "4-1.regulation_ai_summary.xlsx",
-        BASE_DIR / "4-2.news_ai_summary.xlsx",
-    ]
+def ai_outputs_current_run_ready(
+    run_started_at: float,
+    regulation_ok: bool,
+    news_ok: bool,
+) -> tuple[bool, list[str]]:
+    checks = []
+    if regulation_ok:
+        checks.append(BASE_DIR / "4-1.regulation_ai_summary.xlsx")
+    if news_ok:
+        checks.append(BASE_DIR / "4-2.news_ai_summary.xlsx")
 
     bad = []
 
@@ -598,6 +654,32 @@ def ai_outputs_current_run_ready(run_started_at: float) -> tuple[bool, list[str]
     return not bad, bad
 
 
+def mail_step_for_current_branches(regulation_ok: bool, news_ok: bool) -> Step:
+    """Build Step5 arguments without exposing a failed branch's stale file."""
+    unavailable_dir = BASE_DIR / "_gti_current_run_unavailable"
+    regulation_input = (
+        BASE_DIR / "4-1.regulation_ai_summary.xlsx"
+        if regulation_ok
+        else unavailable_dir / "regulation_not_available.xlsx"
+    )
+    news_input = (
+        BASE_DIR / "4-2.news_ai_summary.xlsx"
+        if news_ok
+        else unavailable_dir / "news_not_available.xlsx"
+    )
+    return Step(
+        name=MAIL_STEP.name,
+        script=MAIL_STEP.script,
+        expected_outputs=MAIL_STEP.expected_outputs,
+        args=(
+            "--regulation-input", str(regulation_input),
+            "--news-input", str(news_input),
+            "--output-dir", str(MAIL_OUTPUT_DIR),
+        ),
+        timeout_sec=MAIL_STEP.timeout_sec,
+    )
+
+
 def run_mail(
     python_exe: str,
     dry_run: bool,
@@ -615,21 +697,21 @@ def run_mail(
         results.append((MAIL_STEP.name, MAIL_STEP.script, "DRY_RUN"))
         return True
 
-    if not regulation_ok or not news_ok:
-        log(
-            "MAIL BLOCKED : current-run branch failure "
-            f"/ regulation_ok={regulation_ok} / news_ok={news_ok}"
-        )
+    if not regulation_ok and not news_ok:
+        log("MAIL BLOCKED : neither branch produced a valid current-run AI output")
         results.append((MAIL_STEP.name, MAIL_STEP.script, "SKIPPED"))
         return False
 
-    ready, bad = ai_outputs_current_run_ready(run_started_at)
+    ready, bad = ai_outputs_current_run_ready(run_started_at, regulation_ok, news_ok)
     if not ready:
         log("MAIL BLOCKED : stale/missing AI output / " + " / ".join(bad))
         results.append((MAIL_STEP.name, MAIL_STEP.script, "SKIPPED"))
         return False
 
-    status = run_step(MAIL_STEP, python_exe, dry_run=False)
+    mode = "COMBINED" if regulation_ok and news_ok else ("REGULATION-ONLY" if regulation_ok else "NEWS-ONLY")
+    log(f"MAIL MODE : {mode} / failed branch input is explicitly excluded")
+    current_mail_step = mail_step_for_current_branches(regulation_ok, news_ok)
+    status = run_step(current_mail_step, python_exe, dry_run=False)
     results.append((MAIL_STEP.name, MAIL_STEP.script, status))
     return status == "OK"
 
@@ -637,7 +719,7 @@ def run_mail(
 def print_result(results: list[tuple[str, str, str]]) -> None:
     log("")
     log("#" * 80)
-    log("GTI PIPELINE v43 SPLIT RESULT")
+    log("GTI PIPELINE v44 RESULT")
     log("#" * 80)
 
     counts = {}
@@ -653,7 +735,7 @@ def print_result(results: list[tuple[str, str, str]]) -> None:
 
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(
-        description="GTI v42 fully separated regulation/news pipeline"
+        description="GTI v44 fail-safe regulation/news pipeline"
     )
     p.add_argument("--no-archive", action="store_true")
     p.add_argument("--skip-mail", action="store_true")
@@ -668,12 +750,13 @@ def main() -> int:
 
     ensure_dirs()
     apply_env_defaults()
+    enable_windows_sleep_guard()
 
     run_started_at = time.time()
     python_exe = get_python()
 
     log("#" * 80)
-    log("GTI PIPELINE v43 - REGULATION / NEWS FULLY SEPARATED START")
+    log("GTI PIPELINE v44 - FAIL-SAFE PARTIAL REPORT + LIVE WATCHDOG START")
     log("#" * 80)
     log(f"BASE_DIR : {BASE_DIR}")
     log(f"PYTHON   : {python_exe}")
@@ -726,10 +809,13 @@ def main() -> int:
         and (args.news_only or news_ok)
         and mail_ok
     ):
-        log("GTI PIPELINE v43 FINISHED")
+        log("GTI PIPELINE v44 FINISHED")
         return 0
 
-    log("GTI PIPELINE v43 FINISHED WITH ERROR")
+    if mail_ok and (regulation_ok or news_ok):
+        log("GTI PIPELINE v44 FINISHED WITH PARTIAL REPORT")
+    else:
+        log("GTI PIPELINE v44 FINISHED WITH ERROR")
     return 1
 
 
