@@ -1000,6 +1000,12 @@ def resolve_original_news_urls(df: pd.DataFrame) -> pd.DataFrame:
     """Resolve only selected unresolved links; never replace a verified original URL."""
     if df.empty:
         return df
+    # Google News redirect resolution has repeatedly returned 0/120 while
+    # consuming more than two minutes. Keep the browser-safe Google article
+    # URL and let STEP4 extract the body. Explicit opt-in remains available.
+    if os.getenv("GTI_STEP3_RESOLVE_URL", "N").strip().upper() not in {"Y", "YES", "1", "TRUE"}:
+        log("ORIGINAL URL RESOLVE SKIP: GTI_STEP3_RESOLVE_URL=N / STEP4 body extraction will verify the article")
+        return df
     out = df.copy()
     unresolved = out.apply(
         lambda r: is_google_unresolved_url(r.get("URL", ""))
@@ -1958,7 +1964,7 @@ def best_link_for_dedup(row: pd.Series) -> str:
 def dedup_news(df: pd.DataFrame) -> pd.DataFrame:
     """Two-pass de-duplication.
 
-    v3.4 fix:
+    v5.11 fix:
     - Keep GoogleURL/BestLinkURL for mail links.
     - Do not let unique Google RSS article IDs prevent duplicate removal.
     - After URL de-dup, always run title_norm de-dup across all rows.
@@ -2016,6 +2022,31 @@ def make_issue_cluster_key(row: pd.Series) -> str:
 
     # 의미 기반 핵심 사건 앵커. 언론사·표현·번역이 달라도 동일 사건은 하나로 묶는다.
     semantic_events = [
+        ("KR_STRATEGIC_EXPORT_CONTROL_AI_CHIP", [
+            ["전략물자수출입고시", "전략물자 수출입고시"],
+            ["ai 칩", "ai용 집적회로", "반도체 장비", "수출통제"],
+        ]),
+        ("KR_CHINA_BUTYL_ACRYLATE_AD", [
+            ["아크릴산 부틸", "butyl acrylate"],
+            ["덤핑관세", "덤핑 관세", "반덤핑", "anti-dumping", "anti dumping", "duties"],
+            ["중국", "china", "chinese"],
+        ]),
+        ("US_KR_COUPANG_SECTION301_TARIFF", [
+            ["쿠팡", "coupang"],
+            ["301조", "section 301", "추가 관세", "관세 보복", "retaliatory tariff"],
+        ]),
+        ("KR_HOLIDAY_ORIGIN_MARKING_ENFORCEMENT", [
+            ["추석", "명절"],
+            ["원산지표시", "국산 둔갑", "원산지 표시"],
+            ["단속", "관세청"],
+        ]),
+        ("G20_TRADE_IMBALANCE_CHINA", [
+            ["g20"], ["무역 불균형", "trade imbalance"], ["중국", "china"],
+        ]),
+        ("EU_LOW_VALUE_DEMINIMIS_2026", [
+            ["eu", "유럽연합"], ["저가", "low-value", "de minimis", "150유로"],
+            ["3유로", "€3", "면세 폐지", "tariff", "관세"],
+        ]),
         ("US_CANADA_50PCT_RETALIATORY_TARIFFS", [
             ["미국", "美", "미,", "미-", "미·", "미 캐나다", "미 관세", "usa", "us ", "u.s.", "united states"], ["캐나다", "canada"],
             ["관세", "tariff"],
@@ -2877,7 +2908,7 @@ def main() -> None:
     global MIN_SCORE
     MIN_SCORE = args.min_score
 
-    log("GTI v5.10 STEP3-2 INPUT-CHAIN GUARD + BROAD EVENT-ANCHOR START")
+    log("GTI v5.11 STEP3-2 POLICY-EVENT KEY + ZERO-YIELD URL BYPASS START")
 
     keywords = load_keywords()
     validate_required_news_inputs(INPUT_FILES)
@@ -2952,7 +2983,7 @@ def main() -> None:
     write_excel(args.output, final_df, "news_summary")
     write_excel(args.cumulative, cumulative_df, "news_cumulative")
 
-    log(f"GTI v5.10 STEP3-2 COMPLETE: candidates={len(final_df)} / cumulative={len(cumulative_df)}")
+    log(f"GTI v5.11 STEP3-2 COMPLETE: candidates={len(final_df)} / cumulative={len(cumulative_df)}")
     log(f"SAVE: {args.output}")
     log(f"SAVE: {args.cumulative}")
 

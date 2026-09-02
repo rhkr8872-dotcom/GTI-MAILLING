@@ -32,7 +32,7 @@ from pathlib import Path
 from urllib.parse import unquote
 
 import pandas as pd
-from openpyxl import Workbook
+from openpyxl import Workbook, load_workbook
 from openpyxl.styles import Alignment, Border, Font, PatternFill, Side
 
 
@@ -971,6 +971,7 @@ def save_excel(rows: pd.DataFrame, top3: pd.DataFrame, paths: dict[str, Path]) -
         try:
             old_cumulative = pd.read_excel(paths["cumulative"])
             old_cumulative = _v331_clean_cumulative_direct(old_cumulative)
+            old_cumulative = _v322_recalibrate_news(old_cumulative)
         except Exception:
             old_cumulative = pd.DataFrame()
     else:
@@ -4199,6 +4200,7 @@ def save_excel(rows: pd.DataFrame, top3: pd.DataFrame, paths: dict[str, Path]) -
         try:
             old_cumulative = pd.read_excel(paths["cumulative"])
             old_cumulative = _v331_clean_cumulative_direct(old_cumulative)
+            old_cumulative = _v322_recalibrate_news(old_cumulative)
         except Exception as exc:
             raise RuntimeError(
                 f"cumulative read failed; existing history was not overwritten: "
@@ -4221,8 +4223,15 @@ def save_excel(rows: pd.DataFrame, top3: pd.DataFrame, paths: dict[str, Path]) -
         cluster = clean(r.get("Cluster")).lower()
         url = clean(r.get("URL")).lower()
         headline = re.sub(r"\s+", " ", clean(r.get("Headline")).lower()).strip()
-        if content_type == "news" and cluster:
-            identity = "cluster:" + cluster
+        if content_type == "news":
+            semantic = _v321_news_semantic_key(r)
+            identity = "event:" + (semantic or cluster or headline)
+        elif "전략물자수출입고시" in headline:
+            identity = "event:kr_strategic_goods_notice_2026_101"
+        elif "아크릴산" in headline and "부틸" in headline and any(
+            x in headline for x in ["덤핑", "관세", "anti-dumping", "antidumping"]
+        ):
+            identity = "event:kr_cn_butyl_acrylate_ad_regulation"
         else:
             identity = "url:" + url if url else "headline:" + headline
         return content_type + "|" + identity
@@ -5853,11 +5862,11 @@ def choose_top3(rows: pd.DataFrame) -> pd.DataFrame:
 # Regulation remains event-based and is not subjected to the news 24h rule.
 # ======================================================================
 
-GTI_STEP5_VERSION = "v331 PROVISIONAL-POLICY + MAPPING CONSISTENCY + CUMULATIVE DIRECT CLEAN"
+GTI_STEP5_VERSION = "v335 PANDAS DTYPE SAFE + INDIRECT INTEGRITY + POLICY WATCH"
 
 for _v330_col in [
     "Article Extract Status", "Article Source Type", "Article Body Evidence",
-    "Policy Stage", "Quality Contract",
+    "Policy Stage", "Quality Contract", "Verification Group",
 ]:
     if _v330_col not in OUTPUT_COLUMNS:
         OUTPUT_COLUMNS.append(_v330_col)
@@ -5944,6 +5953,19 @@ def _v321_news_semantic_key(row: pd.Series) -> str:
         clean(row.get("Headline")), clean(row.get("Summary")),
         clean(row.get("Country")),
     ]).lower()
+    # Stable policy-event identities for recurring multi-source coverage.
+    # Keep one representative article instead of filling the report with
+    # multiple rewrites of the same government measure or political signal.
+    if all(x in text for x in ["아크릴산", "부틸"]) and any(
+        x in text for x in ["덤핑", "anti-dumping", "antidumping", "duty", "관세"]
+    ):
+        return "KR_CN_BUTYL_ACRYLATE_AD_EVENT"
+    if "쿠팡" in text and any(x in text for x in ["관세", "301조", "section 301", "통상"]):
+        return "KR_US_COUPANG_TARIFF_TENSION"
+    if "추석" in text and any(x in text for x in ["원산지", "국산 둔갑", "특별단속"]):
+        return "KR_CHUSEOK_ORIGIN_MARKING_ENFORCEMENT"
+    if "전략물자수출입고시" in text:
+        return "KR_STRATEGIC_GOODS_NOTICE_2026_101"
     semicon = [
         ["미국", "트럼프", "백악관", "washington", "u.s."],
         ["삼성전자", "삼전", "samsung", "sk하이닉스", "하이닉스", "반도체", "semiconductor", "chip"],
@@ -6153,6 +6175,21 @@ def _v322_recalibrate_news(rows: pd.DataFrame) -> pd.DataFrame:
     rows = rows.copy()
     if "MappedHS" in rows.columns:
         rows["MappedHS"] = rows["MappedHS"].astype("object")
+    # pandas 2.2+/3.x may infer Excel columns containing blank/text values as
+    # StringDtype. Assigning numeric downgrade scores (35/65) then raises a
+    # TypeError. Normalize every score column before any row-level mutation.
+    numeric_score_columns = [
+        "DirectImpactScore", "IndirectImpactScore", "WeightedScore",
+        "CustomsTradeLawScore", "CustomsTradePolicyScore",
+        "SamsungRelevanceScore", "Importance Score",
+    ]
+    normalized_score_columns = []
+    for col in numeric_score_columns:
+        if col in rows.columns:
+            rows[col] = pd.to_numeric(rows[col], errors="coerce").fillna(0).astype("float64")
+            normalized_score_columns.append(col)
+    if normalized_score_columns:
+        print(f"[STEP5 SCORE DTYPE NORMALIZED] columns={len(normalized_score_columns)}")
     noise = rows.apply(_v322_hard_scope_excluded, axis=1)
     if noise.any():
         print(f"[STEP5 BUSINESS-SCOPE GUARD] removed={int(noise.sum())}")
@@ -6161,6 +6198,8 @@ def _v322_recalibrate_news(rows: pd.DataFrame) -> pd.DataFrame:
     valid_mapping = {"ENTITY_CONFIRMED", "ITEM_1TO1_MAPPED"}
     specific_issues = {"AD/CVD", "반덤핑/상계관세", "HS/품목분류", "FTA/원산지"}
     downgraded = 0
+    indirect_downgraded = 0
+    master_mapping_cleared = 0
     for idx, row in rows.iterrows():
         if clean(row.get("Content Type")) != "News":
             continue
@@ -6170,6 +6209,27 @@ def _v322_recalibrate_news(rows: pd.DataFrame) -> pd.DataFrame:
         mapped_hs = clean(row.get("MappedHS"))
         mapping_evidence = clean(row.get("MappingEvidence"))
         direct_evidence = clean(row.get("Direct Evidence"))
+        article_text = " ".join([
+            clean(row.get("Headline")), clean(row.get("Summary")),
+            clean(row.get("Original Summary")), clean(row.get("Original Body Text")),
+        ]).lower()
+        mapped_product = clean(row.get("MappedProduct")).lower()
+        mapped_entity = clean(row.get("MappedEntity")).lower()
+        samsung_in_article = bool(re.search(r"삼성|samsung", article_text, re.I))
+        product_in_article = bool(
+            mapped_product and len(mapped_product) >= 2 and mapped_product in article_text
+        )
+        mapped_hs_in_article = bool(
+            mapped_hs and len(mapped_hs) >= 4
+            and re.search(rf"(?<!\d){re.escape(mapped_hs.rstrip('.0'))}(?!\d)", article_text)
+        )
+        indirect_supported = bool(
+            (status == "ENTITY_CONFIRMED" and (samsung_in_article or bool(re.search(r"삼성|samsung", direct_evidence, re.I))))
+            or (
+                status == "ITEM_1TO1_MAPPED"
+                and (samsung_in_article or mapped_hs_in_article or bool(direct_evidence))
+            )
+        )
         invalid_hs = bool(re.fullmatch(r"(?:19|20)\d{2}(?:\.\d+)?", mapped_hs))
         candidate_mapping = any(
             x in " ".join([clean(row.get("MappedProduct")), mapped_hs, clean(row.get("TradeRoute"))]).lower()
@@ -6186,6 +6246,32 @@ def _v322_recalibrate_news(rows: pd.DataFrame) -> pd.DataFrame:
             mapping_ok = bool(re.search(r"삼성|samsung", direct_evidence, re.I))
         if mapping_evidence == "ARTICLE_ENTITY_PRODUCT" and not direct_evidence:
             mapping_ok = False
+        # A generic MASTER_MATCH must not manufacture a Samsung entity/route.
+        # Retain it only when the article itself supports Samsung or the exact
+        # mapped product and describes a concrete operative customs measure.
+        if mapping_evidence.upper() == "MASTER_MATCH":
+            concrete_measure = any(x in article_text for x in [
+                "시행한다", "시행되었습니다", "발효", "부과한다", "부과되었습니다", "최종판정", "조사 개시", "수입금지",
+                "effective", "entered into force", "imposed", "final determination",
+                "investigation initiated", "import ban",
+            ])
+            third_party_only = any(x in article_text for x in [
+                "현대차", "현대자동차", "토요타", "toyota", "general motors", "gm ",
+            ]) and not samsung_in_article
+            if third_party_only or not concrete_measure or not (
+                samsung_in_article or mapped_hs_in_article or bool(direct_evidence)
+            ):
+                mapping_ok = False
+                for col in ["MappedEntity", "MappedProduct", "MappedHS", "TradeRoute"]:
+                    if col in rows.columns:
+                        rows.at[idx, col] = ""
+                rows.at[idx, "MappingEvidence"] = "MASTER_MATCH_REJECTED_NO_ARTICLE_LINK"
+                rows.at[idx, "MappingStatus"] = "POLICY_REVIEW"
+                rows.at[idx, "RegulationMappingType"] = "POLICY_GENERAL"
+                rows.at[idx, "EntityDirectFlag"] = "N"
+                status = "POLICY_REVIEW"
+                indirect_supported = False
+                master_mapping_cleared += 1
         # 검토·가능성·언론보도 단계 또는 1차 공식근거가 없는 뉴스는
         # 메일에는 남길 수 있지만 Direct/Top3로 확정하지 않는다.
         if not _v330_direct_stage_ok(row) or not _v330_official_primary(row.get("Official Evidence")):
@@ -6201,6 +6287,18 @@ def _v322_recalibrate_news(rows: pd.DataFrame) -> pd.DataFrame:
             if invalid_hs and not clean(row.get("TradeRoute")):
                 rows.at[idx, "MappedHS"] = ""
             downgraded += 1
+        elif impact == "Indirect" and status in {
+            "MAPPING_REQUIRED", "POLICY_MONITORING", "POLICY_REVIEW", "VERIFICATION_PENDING"
+        }:
+            rows.at[idx, "Samsung Impact"] = "Watch"
+            rows.at[idx, "DirectImpactScore"] = 35
+            rows.at[idx, "Top3 Eligible"] = "N"
+            indirect_downgraded += 1
+        elif impact == "Indirect" and not indirect_supported:
+            rows.at[idx, "Samsung Impact"] = "Watch"
+            rows.at[idx, "DirectImpactScore"] = 35
+            rows.at[idx, "Top3 Eligible"] = "N"
+            indirect_downgraded += 1
         top3_ok = (
             clean(rows.at[idx, "Samsung Impact"]) == "Direct"
             and mapping_ok
@@ -6212,6 +6310,11 @@ def _v322_recalibrate_news(rows: pd.DataFrame) -> pd.DataFrame:
             rows.at[idx, "Top3 Eligible"] = "N"
     if downgraded:
         print(f"[STEP5 DIRECT MAPPING GUARD] downgraded={downgraded}")
+    if indirect_downgraded or master_mapping_cleared:
+        print(
+            f"[STEP5 INDIRECT MAPPING INTEGRITY] downgraded={indirect_downgraded} / "
+            f"master_mapping_cleared={master_mapping_cleared}"
+        )
     return rows
 
 
@@ -6373,6 +6476,20 @@ def _v326_reg_mapping_ok(row: pd.Series) -> bool:
     return status in mapped and not candidate
 
 
+def _v332_strategic_pending(row: pd.Series) -> bool:
+    """Important export-control laws need urgent visibility even without Direct proof."""
+    if clean(row.get("Content Type")) != "Regulation":
+        return False
+    text = " ".join([
+        clean(row.get("Headline")), clean(row.get("Issue")),
+        clean(row.get("KeywordMatches")), clean(row.get("Impact Reason")),
+    ]).lower()
+    strategic = any(term in text for term in [
+        "전략물자", "수출통제", "export control", "strategic goods", "entity list",
+    ])
+    return strategic and not _v326_verified(row)
+
+
 def prepare_rows(rows: pd.DataFrame) -> pd.DataFrame:
     rows = _v326_prepare_base(rows)
     if rows.empty:
@@ -6383,11 +6500,70 @@ def prepare_rows(rows: pd.DataFrame) -> pd.DataFrame:
         "Verification Group", pd.Series("", index=rows.index, dtype="object")
     ).astype("object")
     rows.loc[reg_mask, "Verification Group"] = rows.loc[reg_mask].apply(
-        lambda r: "Verified Regulation" if _v326_verified(r) else "Verification Pending", axis=1
+        lambda r: (
+            "Verified Regulation" if _v326_verified(r)
+            else "Strategic Control Urgent Verification" if _v332_strategic_pending(r)
+            else "Verification Pending"
+        ), axis=1
     )
     rows.loc[~reg_mask, "Verification Group"] = rows.loc[~reg_mask].apply(
-        lambda r: "Verified Policy News" if _v326_verified(r) else "News Pending", axis=1
+        lambda r: (
+            "Officially Verified Policy News"
+            if _v326_verified(r) and _v330_official_primary(r.get("Official Evidence"))
+            else "Article-Verified Policy News" if _v326_verified(r)
+            else "News Pending"
+        ), axis=1
     )
+    rows["OfficialSourceFlag"] = rows.apply(
+        lambda r: "Y" if _v330_official_primary(r.get("Official Evidence")) else "N", axis=1
+    )
+
+    # v334 defense in depth: AI-generated analysis text cannot sustain an
+    # entity/product/HS/route mapping. Only article-native evidence is valid.
+    native_mapping_downgraded = 0
+    for idx, row in rows.loc[~reg_mask].iterrows():
+        if clean(row.get("EntityDirectFlag")).upper() != "Y":
+            continue
+        native = " ".join(clean(row.get(c)) for c in [
+            "Headline", "Direct Evidence", "Article Body Evidence",
+        ]).lower()
+        samsung_named = bool(re.search(r"삼성전자|samsung electronics|samsung semiconductor", native, re.I))
+        product = clean(row.get("MappedProduct")).lower()
+        product_named = bool(product and product in native)
+        customs_named = any(term in native for term in [
+            "관세", "통관", "수출통제", "반덤핑", "원산지", "tariff", "customs",
+            "export control", "anti-dumping", "section 232", "section 301",
+        ])
+        if not (samsung_named and product_named and customs_named):
+            for col in ["MappedEntity", "MappedProduct", "MappedHS", "TradeRoute"]:
+                rows.at[idx, col] = ""
+            rows.at[idx, "MappingEvidence"] = "ARTICLE_NATIVE_LINK_NOT_PROVEN"
+            rows.at[idx, "EntityDirectFlag"] = "N"
+            rows.at[idx, "MappingStatus"] = "POLICY_REVIEW"
+            rows.at[idx, "RegulationMappingType"] = "POLICY_GENERAL"
+            rows.at[idx, "Top3 Eligible"] = "N"
+            if clean(rows.at[idx, "Samsung Impact"]) == "Direct":
+                rows.at[idx, "Samsung Impact"] = "Indirect"
+            native_mapping_downgraded += 1
+    if native_mapping_downgraded:
+        print(f"[STEP5 ARTICLE-NATIVE MAPPING GUARD] downgraded={native_mapping_downgraded}")
+
+    # Older STEP4 outputs may still contain obvious non-policy/third-party rows.
+    news_title = rows["Headline"].fillna("").astype(str).str.lower()
+    news_mask = ~reg_mask
+    hard_noise = news_mask & news_title.apply(lambda title: any(term in title for term in [
+        "으뜸이", "할랄시장 잡아라", "금리 압박", "수출액 늘었다고 경쟁력",
+        "인사 발령", "임원 인사", "수상자", "포상",
+    ]))
+    unrelated_auto = news_mask & news_title.apply(
+        lambda title: any(term in title for term in ["토요타", "toyota", "현대차", "hyundai"])
+        and not any(term in title for term in ["삼성전자", "samsung electronics"])
+    )
+    remove_mask = hard_noise | unrelated_auto
+    if remove_mask.any():
+        print(f"[STEP5 HARD POLICY-NOISE GUARD] removed={int(remove_mask.sum())}")
+        rows = rows.loc[~remove_mask].copy()
+        reg_mask = rows["Content Type"].astype(str).eq("Regulation")
 
     # 법규는 전체를 표시하되 원문 또는 매핑이 미완료된 항목을 Direct/Top3로
     # 승격하지 않는다. 뉴스는 이미 v325의 더 엄격한 증거 게이트를 통과했다.
@@ -6399,10 +6575,126 @@ def prepare_rows(rows: pd.DataFrame) -> pd.DataFrame:
         if not direct_ok:
             rows.at[idx, "Top3 Eligible"] = "N"
 
+    # v334 cross-stage identity: regulation and news covering one government
+    # measure compete for a single representative instead of separate sections.
+    def _v334_event_key(row: pd.Series) -> str:
+        text = " ".join(clean(row.get(c)) for c in [
+            "Headline", "Summary", "AI Analysis", "Issue", "Cluster",
+        ]).lower()
+        rules = [
+            ("KR_STRATEGIC_EXPORT_CONTROL_AI_CHIP", [["전략물자수출입고시", "전략물자 수출입고시"], ["ai 칩", "ai용 집적회로", "반도체 장비", "수출통제"]]),
+            ("KR_CHINA_BUTYL_ACRYLATE_AD", [["아크릴산 부틸", "butyl acrylate"], ["덤핑관세", "덤핑 관세", "반덤핑", "anti-dumping", "anti dumping", "duties"]]),
+            ("US_KR_COUPANG_SECTION301_TARIFF", [["쿠팡", "coupang"], ["301조", "section 301", "추가 관세", "관세 보복"]]),
+            ("KR_HOLIDAY_ORIGIN_MARKING_ENFORCEMENT", [["추석", "명절"], ["원산지표시", "국산 둔갑", "원산지 표시"], ["단속", "관세청"]]),
+            ("G20_TRADE_IMBALANCE_CHINA", [["g20"], ["무역 불균형", "trade imbalance"], ["중국", "china"]]),
+            ("EU_LOW_VALUE_DEMINIMIS_2026", [["eu", "유럽연합"], ["저가", "low-value", "de minimis", "150유로"], ["3유로", "€3", "면세 폐지", "tariff", "관세"]]),
+        ]
+        for name, groups in rules:
+            if all(any(term in text for term in group) for group in groups):
+                return name
+        cluster = clean(row.get("Cluster"))
+        if cluster and ("semantic" in cluster.lower() or cluster.upper().startswith(("KR_", "US_", "EU_", "G20_"))):
+            return cluster.lower()
+        return f"{clean(row.get('Content Type'))}|{cluster or clean(row.get('Headline')).lower()}"
+
+    def _v334_rep_rank(row: pd.Series) -> float:
+        group = clean(row.get("Verification Group"))
+        numeric = pd.to_numeric(row.get("AIRelevanceScore"), errors="coerce")
+        score = 0.0 if pd.isna(numeric) else float(numeric)
+        if group == "Verified Regulation": score += 100
+        elif group == "Officially Verified Policy News": score += 90
+        elif group == "Article-Verified Policy News": score += 75
+        elif group == "Strategic Control Urgent Verification": score += 55
+        elif clean(row.get("Content Type")) == "Regulation": score += 35
+        if clean(row.get("Policy Stage")) == "OPERATIVE": score += 15
+        if clean(row.get("Samsung Impact")) == "Direct": score += 15
+        return score
+
+    rows["_v334_event_key"] = rows.apply(_v334_event_key, axis=1)
+    rows["_v334_rep_rank"] = rows.apply(_v334_rep_rank, axis=1)
+    before_cross_dedup = len(rows)
+    rows = (
+        rows.sort_values(["_v334_rep_rank", "_sort_date"], ascending=[False, False])
+        .drop_duplicates("_v334_event_key", keep="first")
+        .drop(columns=["_v334_event_key", "_v334_rep_rank"], errors="ignore")
+    )
+    if len(rows) != before_cross_dedup:
+        print(f"[STEP5 CROSS-STAGE EVENT DEDUP] before={before_cross_dedup} / after={len(rows)} / removed={before_cross_dedup-len(rows)}")
+
     rows["_report_score"] = rows.apply(report_score, axis=1)
     rows = rows.sort_values(["_report_score", "_sort_date"], ascending=[False, False]).reset_index(drop=True)
     rows["No"] = range(1, len(rows) + 1)
     return rows
+
+
+def choose_policy_watch_top3(rows: pd.DataFrame) -> pd.DataFrame:
+    """Actionable Indirect/Watch priorities; never relabel them Direct."""
+    if rows.empty:
+        return rows.copy()
+    pool = rows[
+        rows["Samsung Impact"].isin(["Indirect", "Watch"])
+        & rows.get("Body Verified", pd.Series("N", index=rows.index)).astype(str).str.upper().eq("Y")
+        & rows.get("Policy Event", pd.Series("N", index=rows.index)).astype(str).str.upper().eq("Y")
+    ].copy()
+    if pool.empty:
+        return pool
+
+    def _issue_family(row: pd.Series) -> str:
+        text = f"{clean(row.get('Headline'))} {clean(row.get('Issue'))}".upper()
+        if any(x in text for x in ["CBAM", "탄소국경", "CARBON BORDER"]): return "CBAM_CARBON"
+        if any(x in text for x in ["수출통제", "전략물자", "EXPORT CONTROL"]): return "EXPORT_CONTROL"
+        if any(x in text for x in ["반덤핑", "덤핑관세", "덤핑 관세", "ANTI-DUMPING", "AD/CVD"]): return "AD_CVD"
+        if any(x in text for x in ["FTA", "자유무역협정", "원산지 기준"]): return "ORIGIN_FTA"
+        if any(x in text for x in ["품목분류", "HS CODE", "TARIFF CLASSIFICATION"]): return "HS_CLASSIFICATION"
+        issue = clean(row.get("Issue")).upper().replace("/", "_")
+        return {
+            "수출통제": "EXPORT_CONTROL", "관세정책": "TARIFF", "FTA_원산지": "ORIGIN_FTA",
+            "통관": "CUSTOMS", "품목분류": "HS_CLASSIFICATION",
+        }.get(issue, issue)
+
+    issue_bonus = {
+        "EXPORT_CONTROL": 28, "AD_CVD": 24, "CBAM_CARBON": 22,
+        "ORIGIN_FTA": 20, "HS_CLASSIFICATION": 20, "TARIFF": 18, "CUSTOMS": 12,
+    }
+    def _watch_score(row: pd.Series) -> float:
+        numeric = pd.to_numeric(row.get("AIRelevanceScore"), errors="coerce")
+        relevance = 0.0 if pd.isna(numeric) else float(numeric)
+        return (
+            relevance * 10 + issue_bonus.get(_issue_family(row), 10)
+            + (18 if clean(row.get("Policy Stage")) == "OPERATIVE" else 0)
+            + (12 if _v330_official_primary(row.get("Official Evidence")) else 0)
+            + (8 if clean(row.get("EntityDirectFlag")).upper() == "Y" else 0)
+        )
+    pool["_policy_watch_score"] = pool.apply(_watch_score, axis=1)
+    pool = pool.sort_values(["_policy_watch_score", "_sort_date"], ascending=[False, False])
+    selected, used = [], set()
+    for _, row in pool.iterrows():
+        issue = _issue_family(row)
+        if issue in used:
+            continue
+        selected.append(row)
+        used.add(issue)
+        if len(selected) == 3:
+            break
+    return pd.DataFrame(selected).drop(columns=["_policy_watch_score"], errors="ignore").reset_index(drop=True)
+
+
+def policy_watch_html(rows: pd.DataFrame) -> str:
+    watch_top3 = choose_policy_watch_top3(rows)
+    if watch_top3.empty:
+        return "<div style='padding:12px;background:#F6F8FA;border-left:5px solid #7F8C8D;'>금일 검증된 Priority Policy Watch 후보가 없습니다.</div>"
+    blocks = []
+    for idx, row in watch_top3.iterrows():
+        blocks.append(f"""
+        <div style="margin:12px 0;padding:14px;border-left:5px solid #C65911;background:#FFF8E8;line-height:1.6;">
+          <div style="font-size:15px;font-weight:bold;">Policy Watch {idx+1}. {html_link(row.get('Headline'), row.get('URL'))}</div>
+          <div style="color:#555;margin:5px 0;">{html.escape(clean(row.get('Country')))} | {html.escape(clean(row.get('Issue')))} | {html.escape(clean(row.get('Samsung Impact')))}</div>
+          <div><b>확인된 정책:</b> {html.escape(short_text(row.get('Major Changes'), '정책내용 확인 필요', 900)).replace(chr(10), '<br>')}</div>
+          <div style="margin-top:6px;"><b>삼성 관세업무 검토:</b> {html.escape(short_text(row.get('AI Analysis'), '영향 검토 필요', 900)).replace(chr(10), '<br>')}</div>
+          <div style="margin-top:6px;"><b>Action:</b> {html.escape(short_text(row.get('Action Plan'), '담당부서 확인 필요', 900)).replace(chr(10), '<br>')}</div>
+          <div style="margin-top:5px;color:#7F6000;">Direct로 승격하지 않은 검증된 정책 우선순위입니다.</div>
+        </div>""")
+    return "".join(blocks)
 
 
 def overall_html(rows: pd.DataFrame, top3: pd.DataFrame) -> str:
@@ -6413,6 +6705,7 @@ def overall_html(rows: pd.DataFrame, top3: pd.DataFrame) -> str:
     ).astype(str)
     verified_reg = reg[verification_group.eq("Verified Regulation")]
     pending_reg = reg[~reg.index.isin(verified_reg.index)]
+    strategic_pending = reg[reg.apply(_v332_strategic_pending, axis=1)]
     direct = rows[rows["Samsung Impact"].eq("Direct")]
     indirect = rows[rows["Samsung Impact"].eq("Indirect")]
     watch = rows[rows["Samsung Impact"].eq("Watch")]
@@ -6424,6 +6717,10 @@ def overall_html(rows: pd.DataFrame, top3: pd.DataFrame) -> str:
         f"<li><b>{html.escape(clean(r.get('Headline')))}</b> — {html.escape(one_line(r))}</li>"
         for _, r in top3.iterrows()
     ) or "<li>Direct 근거와 실행성을 모두 충족한 Top3 후보가 없습니다.</li>"
+    strategic_lines = "".join(
+        f"<li><b>{html_link(r.get('Headline'), r.get('URL'))}</b> — 공식 원문·개정 전후표를 즉시 확보하여 대상 품목, ECCN/전략물자 번호, 허가요건과 시행일을 확인하십시오.</li>"
+        for _, r in strategic_pending.iterrows()
+    ) or "<li>금일 긴급 원문확인 대상 전략물자·수출통제 법규는 없습니다.</li>"
     return f"""
     <div style="padding:16px;background:#F4F6F8;border-left:6px solid #1F4E78;margin-bottom:18px;line-height:1.65;">
       <div style="font-size:15px;font-weight:bold;color:#1F4E78;">A. 글로벌 관세·통상 정책 Radar</div>
@@ -6434,6 +6731,11 @@ def overall_html(rows: pd.DataFrame, top3: pd.DataFrame) -> str:
       <div>Direct {len(direct)}건 / Indirect {len(indirect)}건 / Watch {len(watch)}건</div>
       <div>법규는 원문검증·적용범위 매핑, 뉴스는 삼성 직접증거 또는 승인된 1:1 매핑을 기준으로 판정했습니다.</div>
       <div style="margin-top:9px;"><b>경영진 우선 확인사항</b><ol style="margin-top:5px;">{top_lines}</ol></div>
+      <div style="margin-top:12px;padding:11px;background:#FFF2CC;border-left:5px solid #C65911;">
+        <b style="color:#C65911;">C. Strategic Control Urgent Verification ({len(strategic_pending)}건)</b>
+        <ul style="margin:6px 0 0 18px;">{strategic_lines}</ul>
+        <div style="margin-top:5px;color:#666;">Direct/Top3 판정과 별개인 업무 긴급도 경보입니다. 원문 검증 후 영향도를 재판정합니다.</div>
+      </div>
     </div>
     """
 
@@ -6469,7 +6771,8 @@ def build_html(rows: pd.DataFrame, top3: pd.DataFrame) -> str:
         "Verification Group", pd.Series("", index=regulation.index, dtype="object")
     ).astype(str)
     verified = regulation[verification_group.eq("Verified Regulation")]
-    pending = regulation[~regulation.index.isin(verified.index)]
+    strategic_pending = regulation[verification_group.eq("Strategic Control Urgent Verification")]
+    pending = regulation[~regulation.index.isin(verified.index) & ~regulation.index.isin(strategic_pending.index)]
     news = rows[rows["Content Type"].eq("News")]
     return f"""<!DOCTYPE html><html lang="ko"><head><meta charset="utf-8"><title>{html.escape(subject)}</title></head>
 <body style="font-family:Arial,'Malgun Gothic',sans-serif;font-size:13px;color:#222;line-height:1.55;">
@@ -6478,11 +6781,42 @@ def build_html(rows: pd.DataFrame, top3: pd.DataFrame) -> str:
 <div style="color:#555;margin-bottom:16px;">{RUN_DATE} | Samsung Electronics Customs & Trade Intelligence</div>
 <h3>1. Executive Summary</h3>{overall_html(rows, top3)}
 <h3 style="color:#C00000;">2. Samsung Customs Top3 Deep Analysis</h3>{top3_html(top3)}
-{table_html('3-1. Verified Regulation', verified, '#1F4E78')}
-{table_html('3-2. Verification Pending', pending, '#7F8C8D')}
-{table_html('4. Global Customs & Trade Policy News', news, '#548235')}
+<h3 style="color:#C65911;">3. Priority Policy Watch Top3</h3>{policy_watch_html(rows)}
+{table_html('4-1. Strategic Control Urgent Verification', strategic_pending, '#C65911')}
+{table_html('4-2. Verified Regulation', verified, '#1F4E78')}
+{table_html('4-3. Verification Pending', pending, '#7F8C8D')}
+{table_html('5. Global Customs & Trade Policy News', news, '#548235')}
 <p style="margin-top:18px;color:#666;font-size:12px;">법규와 뉴스는 동일 메일 엔진에서 처리하되 서로 다른 Direct 판정 기준을 적용합니다.</p>
 </div></body></html>"""
+
+
+_v334_save_excel_base = save_excel
+
+
+def save_excel(rows: pd.DataFrame, top3: pd.DataFrame, paths: dict[str, Path]) -> None:
+    _v334_save_excel_base(rows, top3, paths)
+    watch_top3 = choose_policy_watch_top3(rows)
+    book = load_workbook(paths["mail_xlsx"])
+    if "Policy Watch Top3" in book.sheetnames:
+        del book["Policy Watch Top3"]
+    ws = book.create_sheet("Policy Watch Top3")
+    export = watch_top3.copy()
+    for col in OUTPUT_COLUMNS:
+        if col not in export.columns:
+            export[col] = ""
+    ws.append(list(OUTPUT_COLUMNS))
+    for values in export[OUTPUT_COLUMNS].itertuples(index=False, name=None):
+        ws.append(list(values))
+    for cell in ws[1]:
+        cell.font = Font(bold=True, color="FFFFFF")
+        cell.fill = PatternFill("solid", fgColor="C65911")
+    for row in ws.iter_rows():
+        for cell in row:
+            cell.alignment = Alignment(vertical="top", wrap_text=True)
+    for col_cells in ws.columns:
+        width = min(max(len(str(c.value or "")) for c in col_cells) + 2, 60)
+        ws.column_dimensions[col_cells[0].column_letter].width = width
+    book.save(paths["mail_xlsx"])
 
 # ======================================================================
 # End of GTI STEP5 v319

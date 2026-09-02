@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-GTI STEP4-2 NEWS AI v35 QUALITY-CONTRACT FINAL
+GTI STEP4-2 NEWS AI v36 ARTICLE-NATIVE MAPPING + POLICY-EVENT CONTRACT
 - Input: 3-2.news_summary.xlsx
 - Strict published-date 24h guard
 - No legacy v18/v20/v23/v24 override chain
@@ -1132,6 +1132,12 @@ def build() -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
         ):
             return "US_DRONE_232_TARIFF"
         rules = [
+            ("KR_STRATEGIC_EXPORT_CONTROL_AI_CHIP", [["전략물자수출입고시", "전략물자 수출입고시"], ["ai 칩", "ai용 집적회로", "반도체 장비", "수출통제"]]),
+            ("KR_CHINA_BUTYL_ACRYLATE_AD", [["아크릴산 부틸", "butyl acrylate"], ["덤핑관세", "덤핑 관세", "반덤핑", "anti-dumping", "anti dumping", "duties"], ["중국", "china", "chinese"]]),
+            ("US_KR_COUPANG_SECTION301_TARIFF", [["쿠팡", "coupang"], ["301조", "section 301", "추가 관세", "관세 보복", "retaliatory tariff"]]),
+            ("KR_HOLIDAY_ORIGIN_MARKING_ENFORCEMENT", [["추석", "명절"], ["원산지표시", "국산 둔갑", "원산지 표시"], ["단속", "관세청"]]),
+            ("G20_TRADE_IMBALANCE_CHINA", [["g20"], ["무역 불균형", "trade imbalance"], ["중국", "china"]]),
+            ("EU_LOW_VALUE_DEMINIMIS_2026", [["eu", "유럽연합"], ["저가", "low-value", "de minimis", "150유로"], ["3유로", "€3", "면세 폐지", "tariff", "관세"]]),
             ("US_CANADA_50PCT_RETALIATORY_TARIFFS", [["미국", "美", "미,", "미-", "미·", "미 캐나다", "미 관세", "usa", "us ", "u.s.", "united states"], ["캐나다", "canada"], ["관세", "tariff"]]),
             ("KR_FLOOD_CUSTOMS_RELIEF", [["호우", "침수", "수해", "flood"], ["관세청", "세관", "customs"], ["납부기한", "관세조사", "원산지검증", "신속통관", "통관 지원", "지원책"]]),
             ("US_SECTION232_DRONE_COMPONENTS_TARIFF", [["드론", "drone", "무인기", "uas"], ["section 232", "무역확장법 232", "232조"], ["관세", "tariff"]]),
@@ -1213,6 +1219,126 @@ def build() -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
         })
     daily = pd.DataFrame(selected_rows, columns=OUTPUT_COLS)
 
+    # v36 final contract: remove non-policy business/news items that can pass
+    # solely because their body contains a tariff word, and invalidate master
+    # mappings unless the article itself names Samsung in customs context.
+    post_guard_removed = []
+    if not daily.empty:
+        def _post_text(row: pd.Series) -> str:
+            return " ".join(clean(row.get(c)) for c in [
+                "Headline", "Summary", "AI Analysis", "Direct Evidence",
+                "Article Body Evidence",
+            ]).lower()
+
+        def _article_native_text(row: pd.Series) -> str:
+            return " ".join(clean(row.get(c)) for c in [
+                "Headline", "Direct Evidence", "Article Body Evidence",
+            ]).lower()
+
+        def _hard_nonpolicy(row: pd.Series) -> bool:
+            title = clean(row.get("Headline")).lower()
+            text = _post_text(row)
+            title_noise = [
+                "으뜸이", "할랄시장 잡아라", "금리 압박", "수출액 늘었다고 경쟁력",
+                "인사 발령", "임원 인사", "수상자", "포상",
+            ]
+            if any(term in title for term in title_noise):
+                return True
+            article_text = _article_native_text(row)
+            if (
+                any(term in title for term in ["토요타", "toyota", "현대차", "hyundai", "general motors", "gm…"])
+                and not re.search(r"삼성전자|samsung electronics|samsung semiconductor", article_text, re.I)
+            ):
+                return True
+            enforcement_case = any(term in title for term in [
+                "accused of evading", "탈세 혐의", "관세 포탈", "세액 추징",
+            ])
+            policy_change = any(term in text for term in [
+                "법 개정", "고시 개정", "시행", "발효", "부과하기로", "도입", "폐지",
+                "official notice", "entered into force", "effective from",
+            ])
+            if enforcement_case and not policy_change:
+                return True
+            if ("fta" in title or "자유무역협정" in title) and not any(term in text for term in [
+                "서명", "발효", "타결", "개정", "업그레이드", "upgrade", "협상 개시",
+                "관세 철폐", "원산지 기준 변경",
+            ]):
+                return True
+            return False
+
+        hard_mask = daily.apply(_hard_nonpolicy, axis=1)
+        if hard_mask.any():
+            removed = daily.loc[hard_mask].copy()
+            removed["RejectReason"] = "V36_NON_POLICY_OR_INDIVIDUAL_CASE"
+            post_guard_removed.append(removed)
+            daily = daily.loc[~hard_mask].copy()
+
+        # Clear master-derived entity/product/HS/route when the original body
+        # does not explicitly connect Samsung, the product and customs policy.
+        mapping_downgraded = 0
+        for idx, row in daily.iterrows():
+            if clean(row.get("EntityDirectFlag")).upper() != "Y":
+                continue
+            text = _article_native_text(row)
+            samsung_named = bool(re.search(r"삼성전자|samsung electronics|samsung semiconductor", text, re.I))
+            mapped_product = clean(row.get("MappedProduct")).lower()
+            product_named = bool(mapped_product and _term_in_text(text, mapped_product))
+            customs_named = any(term in text for term in [
+                "관세", "통관", "수출통제", "반덤핑", "원산지", "tariff", "customs",
+                "export control", "anti-dumping", "section 232", "section 301",
+            ])
+            if not (samsung_named and product_named and customs_named):
+                daily.at[idx, "EntityDirectFlag"] = "N"
+                daily.at[idx, "MappedEntity"] = ""
+                daily.at[idx, "MappedProduct"] = ""
+                daily.at[idx, "MappedHS"] = ""
+                daily.at[idx, "TradeRoute"] = ""
+                daily.at[idx, "MappingEvidence"] = ""
+                daily.at[idx, "MappingStatus"] = "MAPPING_REQUIRED"
+                daily.at[idx, "RegulationMappingType"] = "POLICY_GENERAL"
+                daily.at[idx, "Top3 Eligible"] = "N"
+                mapping_downgraded += 1
+        if mapping_downgraded:
+            log(f"V36 ARTICLE-NATIVE MAPPING GUARD: downgraded={mapping_downgraded}")
+
+        def _issue_fix(row: pd.Series) -> str:
+            text = _post_text(row)
+            title = clean(row.get("Headline")).lower()
+            if any(x in title for x in ["수출통제", "전략물자", "export control"]): return "EXPORT_CONTROL"
+            if any(x in title for x in ["성실신고확인", "원산지표시", "특별단속", "통관"]): return "CUSTOMS"
+            if any(x in text for x in ["cbam", "탄소국경", "carbon border"]): return "CBAM_CARBON"
+            if any(x in text for x in ["반덤핑", "덤핑방지", "anti-dumping"]): return "AD_CVD"
+            if any(x in text for x in ["수출통제", "전략물자", "export control"]): return "EXPORT_CONTROL"
+            if any(x in title for x in ["fta", "자유무역협정", "원산지 기준"]): return "ORIGIN_FTA"
+            if any(x in title for x in ["품목분류", "hs code", "tariff classification"]): return "HS_CLASSIFICATION"
+            return clean(row.get("Issue")) or "TARIFF"
+        daily["Issue"] = daily.apply(_issue_fix, axis=1)
+
+        # Re-apply explicit event keys after AI enrichment. This also catches
+        # law/news wording and Korean/English translations missed before AI.
+        def _final_event_key(row: pd.Series) -> str:
+            text = _post_text(row)
+            rules = [
+                ("KR_STRATEGIC_EXPORT_CONTROL_AI_CHIP", [["전략물자수출입고시", "전략물자 수출입고시"], ["ai 칩", "ai용 집적회로", "반도체 장비", "수출통제"]]),
+                ("KR_CHINA_BUTYL_ACRYLATE_AD", [["아크릴산 부틸", "butyl acrylate"], ["덤핑관세", "덤핑 관세", "반덤핑", "anti-dumping", "anti dumping", "duties"]]),
+                ("US_KR_COUPANG_SECTION301_TARIFF", [["쿠팡", "coupang"], ["301조", "section 301", "추가 관세", "관세 보복"]]),
+                ("KR_HOLIDAY_ORIGIN_MARKING_ENFORCEMENT", [["추석", "명절"], ["원산지표시", "국산 둔갑", "원산지 표시"], ["단속", "관세청"]]),
+                ("G20_TRADE_IMBALANCE_CHINA", [["g20"], ["무역 불균형", "trade imbalance"], ["중국", "china"]]),
+                ("EU_LOW_VALUE_DEMINIMIS_2026", [["eu", "유럽연합"], ["저가", "low-value", "de minimis", "150유로"], ["3유로", "€3", "면세 폐지", "tariff", "관세"]]),
+            ]
+            for name, groups in rules:
+                if all(any(term in text for term in group) for group in groups):
+                    return name
+            return clean(row.get("Cluster")) or clean(row.get("Headline")).lower()
+
+        daily["_v36_event_key"] = daily.apply(_final_event_key, axis=1)
+        before_v36_dedup = len(daily)
+        daily = daily.drop_duplicates("_v36_event_key", keep="first").drop(columns="_v36_event_key")
+        if len(daily) != before_v36_dedup:
+            log(f"V36 FINAL EVENT DEDUP: {before_v36_dedup} -> {len(daily)}")
+        daily = daily.reset_index(drop=True)
+        daily["No"] = range(1, len(daily) + 1)
+
     rejected_ai = audit[~audit.index.isin(selected_audit_indices)].copy()
     if not rejected_ai.empty:
         def _reject_reason(row: pd.Series) -> str:
@@ -1225,7 +1351,7 @@ def build() -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
             if clean(row.get("Issue")).upper() == "OTHER": reasons.append("INVALID_ISSUE")
             return "|".join(reasons) or "NOT_SELECTED_AFTER_EVENT_DEDUP_OR_CAP"
         rejected_ai["RejectReason"] = rejected_ai.apply(_reject_reason, axis=1)
-    excluded = pd.concat([stale, pre_ai_duplicates, tail, rejected_ai], ignore_index=True, sort=False)
+    excluded = pd.concat([stale, pre_ai_duplicates, tail, rejected_ai, *post_guard_removed], ignore_index=True, sort=False)
 
     return daily, audit, excluded
 
@@ -1257,7 +1383,7 @@ def safe_write(path: Path, df: pd.DataFrame) -> None:
 
 
 def main() -> int:
-    log("GTI STEP4-2 NEWS AI v35 QUALITY-CONTRACT + NO-FORCED-FILL START")
+    log("GTI STEP4-2 NEWS AI v36 ARTICLE-NATIVE MAPPING + POLICY-EVENT CONTRACT START")
     log(f"MODEL={GEMINI_MODEL} / Gemini={'Y' if USE_GEMINI else 'N'} / 24h / max={TARGET_MAX}")
     daily, audit, excluded = build()
     cumulative = merge_cumulative(daily)

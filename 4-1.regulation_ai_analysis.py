@@ -48,7 +48,7 @@ EVENT_NOISE_TERMS = [
     "sơ bộ tình hình xuất nhập khẩu", "bắt giữ", "giả nhãn hiệu", "lịch bảo trì hệ thống",
 ]
 TOPIC_RULES = [
-    ("AD_CVD", ["anti-dumping", "anti dumping", "antidumping", "countervailing", "countervailing duty", "countervailing duties", "ad/cvd", "cvd", "dumping duties", "반덤핑", "덤핑방지관세", "덤핑사실", "국내산업피해", "조사개시결정", "상계관세", "무역구제"]),
+    ("AD_CVD", ["anti-dumping", "anti dumping", "antidumping", "countervailing", "countervailing duty", "countervailing duties", "ad/cvd", "cvd", "dumping duties", "반덤핑", "덤핑방지관세", "덤핑사실", "국내산업피해", "산업피해구제", "불공정무역행위", "조사개시결정", "상계관세", "무역구제"]),
     ("EXPORT_CONTROL", ["export control", "export controls", "entity list", "denied persons", "bureau of industry and security", "수출통제", "전략물자", "제재", "산업안보국", "산업보안국"]),
     ("CBAM_CARBON", ["cbam", "carbon border", "carbon border adjustment", "탄소국경"]),
     ("ORIGIN_FTA", ["fta", "cepa", "usmca", "rules of origin", "origin", "원산지", "자유무역협정", "tepa"]),
@@ -62,7 +62,7 @@ STRICT_TRADE_REG_TERMS = [
     "관세", "관세율", "관세청", "통관", "세관", "보세", "수입신고", "수출신고",
     "품목분류", "hs code", "hs코드", "원산지", "fta", "자유무역협정", "cepa",
     "anti-dumping", "antidumping", "countervailing", "ad/cvd", "반덤핑", "덤핑방지관세",
-    "덤핑사실", "국내산업피해", "조사개시결정",
+    "덤핑사실", "국내산업피해", "산업피해구제", "불공정무역행위", "조사개시결정",
     "상계관세", "무역구제", "수출통제", "전략물자", "entity list", "cbam", "carbon border",
     "customs", "tariff", "tariffs", "customs duty", "import duty", "section 301", "section 232",
 ]
@@ -767,6 +767,65 @@ def guard_unverified_dates(analysis: dict, row: pd.Series) -> dict:
         result[field] = value
     return result
 
+
+def enforce_unverified_evidence_contract(
+    analysis: dict, row: pd.Series, *, issue: str, headline: str
+) -> dict:
+    """Replace all unsupported narrative when the regulation body is unverified.
+
+    Partial regex cleanup is unsafe because a model can express dates, periods,
+    rates or product scope in many forms.  For Body Verified=N, retain only
+    title/metadata facts and explicitly list the facts that still require the
+    official body or amendment comparison table.
+    """
+    result = dict(analysis or {})
+    if clean(result.get("Body Verified", "N")).upper() == "Y":
+        return result
+
+    agency = clean(row.get("Agency", row.get("agency", ""))) or "공식기관"
+    issue_name = clean(issue) or "관세·통상 법규"
+    is_strategic = issue_name == "수출통제" or any(
+        term in clean(headline).lower()
+        for term in ["전략물자", "수출통제", "export control", "entity list"]
+    )
+    result["Summary"] = (
+        f"{agency}의 '{headline}'가 게시되었습니다. 제목상 {issue_name} 관련 공식 법규·고시 후보입니다. "
+        "원문 본문이 확보되지 않아 구체적인 개정내용, 대상 품목, HS/ECCN, 시행·발효일, "
+        "적용기간 및 신고·허가 요건은 확인되지 않았습니다. 해당 정보는 공식 원문과 개정 전후표 확인 후 확정해야 합니다."
+    )
+    if is_strategic:
+        result["AI Analysis"] = (
+            "전략물자·수출통제 변경은 삼성전자 제품, 부품, 제조장비 및 해외 거래의 허가·스크리닝 업무에 "
+            "중대한 영향을 줄 수 있으므로 긴급 원문확인 대상입니다. 다만 현재는 대상 품목, ECCN/전략물자 번호, "
+            "영향 법인과 거래경로가 확인되지 않아 Direct 영향으로 확정할 수 없습니다. 원문 확인 전에는 "
+            "기존 통제기준을 유지하고 신규 지정·삭제 및 허가요건 변경 여부를 우선 점검해야 합니다."
+        )
+        result["Action Plan"] = (
+            "즉시: 공식 원문과 개정 전후표를 확보하여 통제대상 품목, 전략물자 번호/ECCN, 허가·신고요건 및 시행일을 확인합니다. "
+            "| 1주 내: 확인된 변경사항을 삼성전자 Item Master, 수출통제 판정, 거래상대방·최종사용자 스크리닝과 대조합니다. "
+            "| 상시: 영향 법인과 사업부에 확정된 변경사항만 배포합니다. | Owner: HQ 수출통제·관세팀"
+        )
+    else:
+        result["AI Analysis"] = (
+            f"{issue_name} 관련 공식 조치 후보로서 삼성전자 관세업무 영향 가능성은 있으나, 원문과 적용범위가 "
+            "확인되지 않아 제품·HS·법인·거래경로의 직접 영향을 확정할 수 없습니다. 원문 검증과 실제 거래 매핑이 "
+            "완료될 때까지 Watch로 관리해야 합니다."
+        )
+        result["Action Plan"] = (
+            "즉시: 공식 원문과 개정 전후표를 확보하여 변경내용과 시행일을 확인합니다. "
+            "| 1개월 내: 확인된 품목·HS·요건을 삼성전자 거래 및 Master Data와 대조합니다. "
+            "| 상시: 원문 미확인 정보는 업무지침으로 배포하지 않습니다. | Owner: 관세·통상팀"
+        )
+    result["Evidence"] = ""
+    result["Missing Facts"] = (
+        "공식 원문 본문; 개정 전후표; 대상 품목/HS/ECCN; 시행·발효일; 적용기간; "
+        "신고·허가·증빙요건; 삼성전자 영향 법인 및 거래경로"
+    )
+    result["Samsung Impact"] = "Watch"
+    result["Top3 Eligible"] = "N"
+    result["Change Type"] = "기타"
+    return result
+
 def score_row(row):
     text = row_text(row)
     topic = detect_topic(text)
@@ -852,6 +911,9 @@ def score_row(row):
         content_type="Regulation",
     )
     analysis = guard_unverified_dates(analysis, row)
+    analysis = enforce_unverified_evidence_contract(
+        analysis, row, issue=issue, headline=headline
+    )
     mapping_type = clean(row.get("RegulationMappingType", "POLICY_GENERAL")) or "POLICY_GENERAL"
     if mapping_type == "ITEM_1TO1":
         mapping_type = "PRODUCT_1TO1"
@@ -1657,7 +1719,7 @@ def _gti_step4_extractor_log_once():
 # ======================================================================
 
 def main():
-    print("GTI STEP4-1 REGULATION AI v8.3 STRATEGIC CONTROL PRIORITY START")
+    print("GTI STEP4-1 REGULATION AI v8.5 TRADE-REMEDY COVERAGE START")
     print(f"[MODEL] {GEMINI_MODEL}")
     _gti_step4_gemini_log_once()
     _gti_step4_extractor_log_once()

@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-GTI PIPELINE v44 - FAIL-SAFE PARTIAL REPORT + LIVE WATCHDOG
+GTI PIPELINE v45 - QUALITY CONTRACT + FAIL-SAFE LIVE WATCHDOG
 ====================================================
 
 REGULATION BRANCH
@@ -105,7 +105,9 @@ PIPELINE_ENV_DEFAULTS = {
 
     # URL.
     "GTI_STEP2_RESOLVE_ORIGINAL_URL": "N",
-    "GTI_STEP3_RESOLVE_URL": "Y",
+    # Direct Google redirect resolution repeatedly returned 0/120. STEP4
+    # performs the authoritative body extraction, so avoid the daily delay.
+    "GTI_STEP3_RESOLVE_URL": "N",
 }
 
 
@@ -719,7 +721,7 @@ def run_mail(
 def print_result(results: list[tuple[str, str, str]]) -> None:
     log("")
     log("#" * 80)
-    log("GTI PIPELINE v44 RESULT")
+    log("GTI PIPELINE v45 RESULT")
     log("#" * 80)
 
     counts = {}
@@ -735,7 +737,7 @@ def print_result(results: list[tuple[str, str, str]]) -> None:
 
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(
-        description="GTI v44 fail-safe regulation/news pipeline"
+        description="GTI v45 quality-contract regulation/news pipeline"
     )
     p.add_argument("--no-archive", action="store_true")
     p.add_argument("--skip-mail", action="store_true")
@@ -756,7 +758,7 @@ def main() -> int:
     python_exe = get_python()
 
     log("#" * 80)
-    log("GTI PIPELINE v44 - FAIL-SAFE PARTIAL REPORT + LIVE WATCHDOG START")
+    log("GTI PIPELINE v45 - QUALITY CONTRACT + FAIL-SAFE LIVE WATCHDOG START")
     log("#" * 80)
     log(f"BASE_DIR : {BASE_DIR}")
     log(f"PYTHON   : {python_exe}")
@@ -809,13 +811,13 @@ def main() -> int:
         and (args.news_only or news_ok)
         and mail_ok
     ):
-        log("GTI PIPELINE v44 FINISHED")
+        log("GTI PIPELINE v45 FINISHED")
         return 0
 
     if mail_ok and (regulation_ok or news_ok):
-        log("GTI PIPELINE v44 FINISHED WITH PARTIAL REPORT")
+        log("GTI PIPELINE v45 FINISHED WITH PARTIAL REPORT")
     else:
-        log("GTI PIPELINE v44 FINISHED WITH ERROR")
+        log("GTI PIPELINE v45 FINISHED WITH ERROR")
     return 1
 
 

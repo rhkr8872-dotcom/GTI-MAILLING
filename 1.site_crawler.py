@@ -2679,18 +2679,26 @@ def main():
     if crawl_health:
         final_by_agency = final_df.groupby("agency").size().to_dict() if not final_df.empty else {}
         excluded_by_agency = excluded_df.groupby("agency").size().to_dict() if not excluded_df.empty else {}
+        excluded_reason_by_agency = {}
+        if not excluded_df.empty and "_final_exclude_reason" in excluded_df.columns:
+            for agency_name, group in excluded_df.groupby("agency"):
+                counts = group["_final_exclude_reason"].fillna("UNKNOWN").value_counts()
+                excluded_reason_by_agency[agency_name] = " | ".join(
+                    f"{reason}:{int(count)}" for reason, count in counts.items()
+                )
         for health in crawl_health:
             agency_name = health.get("site", "")
             valid_n = int(final_by_agency.get(agency_name, 0))
             excluded_n = int(excluded_by_agency.get(agency_name, 0))
             health["final_valid_count"] = valid_n
             health["final_excluded_count"] = excluded_n
+            health["final_exclude_reasons"] = excluded_reason_by_agency.get(agency_name, "")
             if health.get("status") == "FAIL":
                 health["final_status"] = "FAIL"
             elif valid_n > 0:
                 health["final_status"] = "VALID_REGULATION"
             elif int(health.get("real_posts_found", 0) or 0) > 0:
-                health["final_status"] = "NO_RECENT_VALID"
+                health["final_status"] = "ALL_FILTERED"
             else:
                 health["final_status"] = "NO_NEW"
 
@@ -2728,6 +2736,9 @@ def main():
     if not final_df.empty:
         overseas_final = final_df[final_df["agency"].map(is_overseas_agency)]
         print(f"🌏 해외 법규 최종 저장: {len(overseas_final)}건 / {overseas_final['agency'].nunique()}개 기관")
+        if not overseas_final.empty:
+            overseas_breakdown = overseas_final.groupby("agency").size().sort_values(ascending=False)
+            print("🌏 해외 기관별: " + " | ".join(f"{agency}={int(count)}" for agency, count in overseas_breakdown.items()))
     print(f"📁 전체 파일: {OUT_ALL_FILE}")
     print(f"📁 감사 파일: {OUT_AUDIT_FILE}")
     print(f"📁 법규 파일: {OUT_REG_FILE}")

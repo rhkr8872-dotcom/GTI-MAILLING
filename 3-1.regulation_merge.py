@@ -63,7 +63,7 @@ ITEM_SPECIFIC_TERMS = [
     'hs code','hs코드','품목분류','tariff classification','반덤핑','anti-dumping','antidumping',
     '덤핑방지관세','덤핑방지','anti dumping',
     '상계관세','countervailing','세이프가드','safeguard','쿼터','quota','대상품목','특정품목',
-    '덤핑사실','국내산업피해','조사개시결정','무역위원회공고',
+    '덤핑사실','국내산업피해','산업피해구제','불공정무역행위','조사개시결정','무역위원회공고',
     '수출통제','export control','entity list','전략물자','cbam','탄소국경',
 ]
 
@@ -277,7 +277,7 @@ STRONG_CUSTOMS_TERMS = [
     '품목분류','hs code','hs코드','tariff classification','harmonized system',
     'fta','cepa','epa','rcep','원산지','원산지증명','협정세율','특혜관세',
     'rules of origin','certificate of origin','preferential tariff',
-    '반덤핑','덤핑방지관세','덤핑사실','국내산업피해','조사개시결정',
+    '반덤핑','덤핑방지관세','덤핑사실','국내산업피해','산업피해구제','불공정무역행위','조사개시결정',
     '상계관세','세이프가드','무역구제',
     'anti-dumping','anti dumping','antidumping','countervailing','countervailing duty','safeguard',
     '수출통제','전략물자','제재','entity list','export control','export controls','sanctions','uflpa',
@@ -475,6 +475,16 @@ def regulation_event_key(row: pd.Series) -> str:
     return f"{title_key}|{event_type}|{day_key}"
 
 
+def cross_source_policy_identity(row: pd.Series) -> str:
+    """Stable identity for the same regulation reposted by different official sites."""
+    title = norm(clean(row.get('Headline', '')))
+    if '전략물자수출입고시' in title:
+        return 'kr strategic goods export import notice'
+    if '품목분류 적용기준에 관한 고시' in title:
+        return 'kr customs classification application standard notice'
+    return ''
+
+
 def same_day_dedup(df: pd.DataFrame) -> pd.DataFrame:
     if df.empty:
         return df
@@ -488,8 +498,19 @@ def same_day_dedup(df: pd.DataFrame) -> pd.DataFrame:
         for kidx in keep:
             kr = work.loc[kidx]
             kday = kr['Date'].date() if pd.notna(kr['Date']) else None
-            if day != kday:
+            identity_a = cross_source_policy_identity(row)
+            identity_b = cross_source_policy_identity(kr)
+            near_day_same_policy = bool(
+                identity_a and identity_a == identity_b and day and kday
+                and abs((day - kday).days) <= 2
+                and regulation_event_type(row.get('Headline', '')) == 'OTHER'
+                and regulation_event_type(kr.get('Headline', '')) == 'OTHER'
+            )
+            if day != kday and not near_day_same_policy:
                 continue
+            if near_day_same_policy:
+                dup = True
+                break
             other = norm_title(kr.get('Headline',''))
             event_a = regulation_event_key(row)
             event_b = regulation_event_key(kr)
@@ -655,7 +676,7 @@ def safe_write(path: Path, df: pd.DataFrame):
         print(f'[WARN] locked: {path.name} -> {alt.name}')
 
 def main():
-    print('GTI v5.8 STEP3-1 REGULATION POLICY CONTRACT START')
+    print('GTI v5.9 STEP3-1 CROSS-SOURCE POLICY IDENTITY START')
     if not INPUT_FILE.exists():
         raise FileNotFoundError(INPUT_FILE)
 
@@ -812,7 +833,7 @@ def main():
         safe_write(cumulative_removed_path, cumulative_removed)
 
     print(f'[STEP3-1] raw={len(raw)} selected={len(sel)} new={len(today)} excluded={len(exc)} cumulative={len(combined)}')
-    print('GTI v5.8 STEP3-1 DONE')
+    print('GTI v5.9 STEP3-1 DONE')
 
 if __name__ == '__main__':
     main()
