@@ -5862,7 +5862,7 @@ def choose_top3(rows: pd.DataFrame) -> pd.DataFrame:
 # Regulation remains event-based and is not subjected to the news 24h rule.
 # ======================================================================
 
-GTI_STEP5_VERSION = "v335 PANDAS DTYPE SAFE + INDIRECT INTEGRITY + POLICY WATCH"
+GTI_STEP5_VERSION = "v337 MORNING NEWS AGE SAFE + DAILY CUSTOMS SENSING"
 
 for _v330_col in [
     "Article Extract Status", "Article Source Type", "Article Body Evidence",
@@ -6020,7 +6020,12 @@ def read_step4_results() -> pd.DataFrame:
     use_news = NEWS_INPUT_FILE.exists() and not LAW_ONLY_MODE
     if use_news:
         # 실패한 STEP4-2가 남긴 과거 결과를 재사용하지 않는다.
-        max_input_age_hours = int(os.getenv("GTI_STEP5_INPUT_MAX_AGE_HOURS", "8"))
+        # Morning operation commonly uses STEP4-2 output generated during the
+        # previous afternoon/evening. Eight hours is therefore a warning, not
+        # a hard rejection. Row-level 24H GUARD remains the final freshness
+        # authority. Files older than 30h are still blocked by default.
+        warn_input_age_hours = int(os.getenv("GTI_STEP5_INPUT_WARN_AGE_HOURS", "8"))
+        max_input_age_hours = int(os.getenv("GTI_STEP5_INPUT_MAX_AGE_HOURS", "30"))
         file_age_hours = (time.time() - NEWS_INPUT_FILE.stat().st_mtime) / 3600
         if file_age_hours > max_input_age_hours:
             message = (
@@ -6031,6 +6036,12 @@ def read_step4_results() -> pd.DataFrame:
                 raise RuntimeError(message + ". Run 4-2 successfully before STEP5.")
             print(f"[STEP5 STALE NEWS SKIP] {message}; regulation report continues")
             use_news = False
+        elif file_age_hours > warn_input_age_hours:
+            print(
+                f"[STEP5 NEWS FILE AGE WARN] age={file_age_hours:.1f}h > "
+                f"warning={warn_input_age_hours}h; continuing to article-level 24H GUARD "
+                f"(hard_limit={max_input_age_hours}h)"
+            )
         step32_input = NEWS_INPUT_FILE.parent / "3-2.news_summary.xlsx"
         if use_news and step32_input.exists() and NEWS_INPUT_FILE.stat().st_mtime < step32_input.stat().st_mtime:
             message = (
@@ -6659,12 +6670,15 @@ def choose_policy_watch_top3(rows: pd.DataFrame) -> pd.DataFrame:
     def _watch_score(row: pd.Series) -> float:
         numeric = pd.to_numeric(row.get("AIRelevanceScore"), errors="coerce")
         relevance = 0.0 if pd.isna(numeric) else float(numeric)
-        return (
+        legacy_score = (
             relevance * 10 + issue_bonus.get(_issue_family(row), 10)
             + (18 if clean(row.get("Policy Stage")) == "OPERATIVE" else 0)
             + (12 if _v330_official_primary(row.get("Official Evidence")) else 0)
             + (8 if clean(row.get("EntityDirectFlag")).upper() == "Y" else 0)
         )
+        # v336 executive relevance prevents a third-party steel/fish/general
+        # declaration story from outranking a Samsung-product customs signal.
+        return legacy_score + _v336_daily_score(row)
     pool["_policy_watch_score"] = pool.apply(_watch_score, axis=1)
     pool = pool.sort_values(["_policy_watch_score", "_sort_date"], ascending=[False, False])
     selected, used = [], set()
@@ -6672,11 +6686,211 @@ def choose_policy_watch_top3(rows: pd.DataFrame) -> pd.DataFrame:
         issue = _issue_family(row)
         if issue in used:
             continue
+        if _v336_daily_score(row) < 100:
+            continue
         selected.append(row)
         used.add(issue)
         if len(selected) == 3:
             break
     return pd.DataFrame(selected).drop(columns=["_policy_watch_score"], errors="ignore").reset_index(drop=True)
+
+
+# ======================================================================
+# STEP5 v336 - ALWAYS-ON DAILY CUSTOMS POLICY SENSING
+# Direct Top3 may legitimately be empty.  Build a separate, evidence-safe
+# executive signal from the best verified Direct/Indirect/Watch events.
+# This never changes Samsung Impact and never manufactures an event that is
+# absent from the day's source rows.
+# ======================================================================
+def _v336_daily_text(row: pd.Series) -> str:
+    return " ".join(clean(row.get(c)) for c in [
+        "Headline", "Major Changes", "Summary", "AI Analysis", "Action Plan",
+        "Country", "Issue", "MappedProduct", "TradeRoute", "Official Evidence",
+    ]).lower()
+
+
+def _v336_signal_family(row: pd.Series) -> str:
+    text = _v336_daily_text(row)
+    fact_text = " ".join(clean(row.get(c)) for c in [
+        "Headline", "Major Changes", "Summary", "Article Body Evidence",
+    ]).lower()
+    if ("베트남" in text or "vietnam" in text) and any(x in text for x in [
+        "원산지", "우회수출", "불법환적", "환적", "transshipment", "origin", "cbp",
+    ]):
+        return "VIETNAM_ORIGIN"
+    semiconductor = any(x in text for x in ["반도체", "semiconductor", "memory chip", "메모리"])
+    tariff_measure = any(x in fact_text for x in [
+        "관세", "tariff", "section 232", "232조", "현지생산", "local production",
+    ])
+    if semiconductor and tariff_measure:
+        return "SEMICONDUCTOR_TARIFF"
+    if any(x in text for x in ["전략물자", "수출통제", "export control", "entity list"]):
+        return "EXPORT_CONTROL"
+    if any(x in text for x in ["cbam", "탄소국경", "carbon border"]):
+        return "CBAM"
+    if any(x in text for x in ["원산지", "우회수출", "불법환적", "transshipment", "origin verification"]):
+        return "ORIGIN_TRACEABILITY"
+    if any(x in text for x in ["품목분류", "hs code", "tariff classification"]):
+        return "HS_CLASSIFICATION"
+    if any(x in text for x in ["반덤핑", "상계관세", "덤핑관세", "anti-dumping", "countervailing", "ad/cvd"]):
+        return "AD_CVD"
+    if any(x in text for x in ["de minimis", "면세 철폐", "저가물품", "저가 소포"]):
+        return "DE_MINIMIS"
+    if any(x in text for x in ["section 301", "section 232", "301조", "232조", "관세", "tariff"]):
+        return "TARIFF_POLICY"
+    if any(x in text for x in ["fta", "자유무역협정"]):
+        return "FTA_ORIGIN"
+    return clean(row.get("Issue")).upper().replace("/", "_") or "OTHER"
+
+
+def _v336_concrete_measure(row: pd.Series) -> bool:
+    text = _v336_daily_text(row)
+    return any(x in text for x in [
+        "시행", "발효", "부과", "확정", "최종판정", "조사 개시", "현장점검", "현장 점검",
+        "개정", "행정예고", "공고", "고시", "세율", "면세 철폐", "검증 강화", "지정",
+        "effective", "entered into force", "imposed", "final determination", "investigation",
+        "inspection", "audit", "rate", "notice", "amendment",
+    ])
+
+
+def _v336_daily_score(row: pd.Series) -> float:
+    text = _v336_daily_text(row)
+    title = clean(row.get("Headline")).lower()
+    article_native = " ".join(clean(row.get(c)) for c in [
+        "Headline", "Article Body Evidence", "Direct Evidence",
+    ]).lower()
+    family = _v336_signal_family(row)
+    score = 0.0
+    relevance = pd.to_numeric(row.get("AIRelevanceScore"), errors="coerce")
+    if not pd.isna(relevance):
+        score += min(float(relevance), 10.0) * 5
+    importance = pd.to_numeric(row.get("Importance Score"), errors="coerce")
+    if not pd.isna(importance):
+        score += min(float(importance), 100.0) * 0.20
+    if clean(row.get("Samsung Impact")) == "Direct": score += 45
+    elif clean(row.get("Samsung Impact")) == "Indirect": score += 25
+    else: score += 8
+    if clean(row.get("Body Verified")).upper() == "Y": score += 18
+    if _v330_official_primary(row.get("Official Evidence")): score += 14
+    if clean(row.get("Content Type")) == "Regulation": score += 8
+    if _v336_concrete_measure(row): score += 18
+    if any(x in text for x in ["삼성전자", "samsung electronics", "samsung semiconductor"]): score += 28
+    if any(x in text for x in ["반도체", "semiconductor", "메모리", "display", "디스플레이", "배터리"]): score += 18
+    score += {
+        "VIETNAM_ORIGIN": 34, "SEMICONDUCTOR_TARIFF": 32, "EXPORT_CONTROL": 28,
+        "ORIGIN_TRACEABILITY": 27, "HS_CLASSIFICATION": 22, "CBAM": 18,
+        "DE_MINIMIS": 16, "AD_CVD": 12, "TARIFF_POLICY": 16, "FTA_ORIGIN": 15,
+    }.get(family, 5)
+    # Penalize low-actionability or third-party-only signals.  They can remain
+    # in the report but should not displace Samsung-relevant executive signals.
+    if any(x in text for x in ["교육", "세미나", "설명회", "수상", "포상", "스테이블코인"]): score -= 55
+    if any(x in title for x in ["g20", "의장성명", "공동성명"]): score -= 50
+    third_party = any(x in title for x in [
+        "현대제철", "포스코", "토요타", "toyota", "현대자동차", "tilapia", "화장지",
+        "냉연강판", "stainless steel", "철강업계", "raw sugar", "원당",
+    ])
+    samsung_or_electronics = any(x in article_native for x in [
+        "삼성전자", "samsung electronics", "반도체", "semiconductor", "전자제품", "electronics",
+    ])
+    if third_party and not samsung_or_electronics: score -= 38
+    if not _v336_concrete_measure(row): score -= 16
+    return score
+
+
+def choose_daily_customs_sensing(rows: pd.DataFrame, top3: pd.DataFrame | None = None) -> pd.DataFrame:
+    """Select one to three executive signals without forcing weak filler."""
+    if rows.empty:
+        return rows.copy()
+    pool = rows.copy()
+    verified = pool.get("Body Verified", pd.Series("N", index=pool.index)).astype(str).str.upper().eq("Y")
+    policy = pool.get("Policy Event", pd.Series("N", index=pool.index)).astype(str).str.upper().eq("Y")
+    strategic_pending = pool.apply(_v332_strategic_pending, axis=1)
+    direct = pool.get("Samsung Impact", pd.Series("", index=pool.index)).astype(str).eq("Direct")
+    pool = pool[(verified & policy) | strategic_pending | direct].copy()
+    if pool.empty:
+        return pool
+    pool["Daily Sensing Score"] = pool.apply(_v336_daily_score, axis=1)
+    pool["Daily Sensing Family"] = pool.apply(_v336_signal_family, axis=1)
+    pool = pool.sort_values(["Daily Sensing Score", "_sort_date"], ascending=[False, False])
+    selected, used = [], set()
+    for _, row in pool.iterrows():
+        family = clean(row.get("Daily Sensing Family"))
+        if family in used:
+            continue
+        # No forced fill: weak/general signals stay in the detailed report.
+        threshold = 95 if _v332_strategic_pending(row) else 130
+        if float(row.get("Daily Sensing Score", 0)) < threshold:
+            continue
+        selected.append(row)
+        used.add(family)
+        if len(selected) == 3:
+            break
+    out = pd.DataFrame(selected).reset_index(drop=True)
+    if not out.empty:
+        out["Daily Sensing Rank"] = range(1, len(out) + 1)
+    return out
+
+
+def _v336_signal_title(row: pd.Series) -> str:
+    family = _v336_signal_family(row)
+    text = _v336_daily_text(row)
+    us = any(x in text for x in ["미국", " usa ", " u.s.", "united states", "cbp"])
+    return {
+        "VIETNAM_ORIGIN": "美 CBP·베트남 생산품 원산지/우회수출 검증",
+        "SEMICONDUCTOR_TARIFF": "美 반도체 관세·현지생산 압박" if us else "반도체 관세·통상정책 변화",
+        "EXPORT_CONTROL": "전략물자·수출통제 제도 변경",
+        "ORIGIN_TRACEABILITY": "원산지·우회수출 검증 강화",
+        "HS_CLASSIFICATION": "품목분류·HS 적용기준 변경",
+        "CBAM": "EU CBAM·탄소배출 검증 강화",
+        "DE_MINIMIS": "저가물품 면세·통관제도 변경",
+        "AD_CVD": "반덤핑·상계관세 조치 강화",
+        "TARIFF_POLICY": "글로벌 관세정책 변경",
+        "FTA_ORIGIN": "FTA·원산지 제도 변경",
+    }.get(family, short_text(row.get("Headline"), "관세·통상정책 변화", 70))
+
+
+def _v336_response_direction(row: pd.Series) -> str:
+    family = _v336_signal_family(row)
+    responses = {
+        "VIETNAM_ORIGIN": "베트남 생산품의 BOM·원산지증빙·제조공정·선적경로를 연결하고 CBP 질의 대응자료를 사전 점검",
+        "SEMICONDUCTOR_TARIFF": "대미 반도체의 HS·거래경로별 관세 Cost와 미국 현지생산 전환 효과 및 생산거점 전략 분석",
+        "EXPORT_CONTROL": "대상 품목·HS/ECCN·시행일·허가요건을 공식 원문에서 확인하고 수출통제 대상 거래를 점검",
+        "ORIGIN_TRACEABILITY": "BOM·원산지증빙·제조공정·선적경로 기반 Origin Traceability와 우회수출 통제를 강화",
+        "HS_CLASSIFICATION": "적용 대상 HS와 기존 품목분류 마스터의 차이를 확인하고 신고 기준을 사전 정비",
+        "CBAM": "대상 제품의 탄소배출량 산정·검증자료와 EU 수출법인의 신고 준비상태를 점검",
+        "DE_MINIMIS": "소액·저가물품 거래의 면세기준, 신고방식과 물류비·관세 Cost 변화를 점검",
+        "AD_CVD": "대상 품목·생산자·세율·적용기간을 확인하고 직접 및 공급망 간접영향을 구분해 모니터링",
+        "TARIFF_POLICY": "대상 제품·HS·국가·세율·시행일을 확인하고 거래경로별 관세 Cost를 재산정",
+        "FTA_ORIGIN": "협정별 원산지기준과 증빙·사후검증 요건을 확인하고 적용 거래를 점검",
+    }
+    return responses.get(family, short_text(row.get("Action Plan"), "대상 품목·법인·거래경로와 시행일을 확인", 220))
+
+
+def daily_customs_sensing_html(rows: pd.DataFrame, top3: pd.DataFrame) -> str:
+    sensing = choose_daily_customs_sensing(rows, top3)
+    if sensing.empty:
+        return "<div style='padding:13px;background:#F6F8FA;border-left:6px solid #7F8C8D;'>금일은 임원 요약에 사용할 만큼 검증된 관세정책 신호가 없습니다. 상세 Watch 항목을 임의로 승격하지 않았습니다.</div>"
+    titles = [_v336_signal_title(r) for _, r in sensing.iterrows()]
+    actions = [_v336_response_direction(r) for _, r in sensing.iterrows()]
+    title_phrase = "·".join(titles[:2]) if len(titles) <= 2 else f"{titles[0]}, {titles[1]} 등"
+    action_phrase = actions[0] if len(actions) == 1 else f"{actions[0]}하는 한편, {actions[1]}"
+    overall = (
+        f"금일 GTI Radar는 {title_phrase}이 포착됨에 따라 삼성전자는 {action_phrase}할 필요가 있습니다."
+    )
+    blocks = []
+    for _, row in sensing.iterrows():
+        evidence_group = clean(row.get("Verification Group")) or "검증상태 확인 필요"
+        blocks.append(f"""
+          <tr>
+            <td style="width:42%;padding:10px;border:1px solid #D9E2F3;font-weight:bold;color:#1F4E78;vertical-align:top;">{html.escape(_v336_signal_title(row))}<br><span style="font-size:11px;color:#777;font-weight:normal;">{html_link(row.get('Headline'), row.get('URL'))}</span></td>
+            <td style="padding:10px;border:1px solid #D9E2F3;vertical-align:top;">{html.escape(_v336_response_direction(row))}<br><span style="font-size:11px;color:#7F6000;">근거수준: {html.escape(evidence_group)} / Direct 승격 여부와 별개</span></td>
+          </tr>""")
+    return f"""
+    <div style="padding:16px;background:#EAF2F8;border-left:6px solid #1F4E78;margin-bottom:16px;line-height:1.7;">
+      <div style="font-size:16px;font-weight:bold;color:#1F4E78;margin-bottom:7px;">오늘의 관세정책 센싱</div>
+      <div style="font-size:14px;font-weight:bold;">{html.escape(overall)}</div>
+      <table style="width:100%;border-collapse:collapse;margin-top:12px;background:#FFFFFF;">{''.join(blocks)}</table>
+    </div>"""
 
 
 def policy_watch_html(rows: pd.DataFrame) -> str:
@@ -6779,13 +6993,14 @@ def build_html(rows: pd.DataFrame, top3: pd.DataFrame) -> str:
 <div style="max-width:1600px;margin:0 auto;">
 <h2 style="margin-bottom:3px;color:#1F4E78;">[GTI Radar] Global Trade Intelligence</h2>
 <div style="color:#555;margin-bottom:16px;">{RUN_DATE} | Samsung Electronics Customs & Trade Intelligence</div>
-<h3>1. Executive Summary</h3>{overall_html(rows, top3)}
-<h3 style="color:#C00000;">2. Samsung Customs Top3 Deep Analysis</h3>{top3_html(top3)}
-<h3 style="color:#C65911;">3. Priority Policy Watch Top3</h3>{policy_watch_html(rows)}
-{table_html('4-1. Strategic Control Urgent Verification', strategic_pending, '#C65911')}
-{table_html('4-2. Verified Regulation', verified, '#1F4E78')}
-{table_html('4-3. Verification Pending', pending, '#7F8C8D')}
-{table_html('5. Global Customs & Trade Policy News', news, '#548235')}
+<h3>1. 오늘의 관세정책 센싱</h3>{daily_customs_sensing_html(rows, top3)}
+<h3>2. Executive Summary</h3>{overall_html(rows, top3)}
+<h3 style="color:#C00000;">3. Samsung Customs Top3 Deep Analysis</h3>{top3_html(top3)}
+<h3 style="color:#C65911;">4. Priority Policy Watch Top3</h3>{policy_watch_html(rows)}
+{table_html('5-1. Strategic Control Urgent Verification', strategic_pending, '#C65911')}
+{table_html('5-2. Verified Regulation', verified, '#1F4E78')}
+{table_html('5-3. Verification Pending', pending, '#7F8C8D')}
+{table_html('6. Global Customs & Trade Policy News', news, '#548235')}
 <p style="margin-top:18px;color:#666;font-size:12px;">법규와 뉴스는 동일 메일 엔진에서 처리하되 서로 다른 Direct 판정 기준을 적용합니다.</p>
 </div></body></html>"""
 
@@ -6816,6 +7031,36 @@ def save_excel(rows: pd.DataFrame, top3: pd.DataFrame, paths: dict[str, Path]) -
     for col_cells in ws.columns:
         width = min(max(len(str(c.value or "")) for c in col_cells) + 2, 60)
         ws.column_dimensions[col_cells[0].column_letter].width = width
+
+    if "Daily Customs Sensing" in book.sheetnames:
+        del book["Daily Customs Sensing"]
+    daily_ws = book.create_sheet("Daily Customs Sensing", 1)
+    daily_ws.append([
+        "Rank", "오늘의 핵심 센싱", "삼성전자 대응 방향", "근거수준",
+        "Samsung Impact", "Country", "Issue", "Headline", "URL", "Daily Sensing Score",
+    ])
+    daily = choose_daily_customs_sensing(rows, top3)
+    for _, row in daily.iterrows():
+        daily_ws.append([
+            int(row.get("Daily Sensing Rank", 0)),
+            _v336_signal_title(row),
+            _v336_response_direction(row),
+            clean(row.get("Verification Group")) or "검증상태 확인 필요",
+            clean(row.get("Samsung Impact")), clean(row.get("Country")), clean(row.get("Issue")),
+            clean(row.get("Headline")), clean(row.get("URL")),
+            round(float(row.get("Daily Sensing Score", 0)), 1),
+        ])
+    for cell in daily_ws[1]:
+        cell.font = Font(bold=True, color="FFFFFF")
+        cell.fill = PatternFill("solid", fgColor="1F4E78")
+    widths = [8, 34, 70, 32, 16, 20, 18, 70, 50, 20]
+    for col_idx, width in enumerate(widths, 1):
+        daily_ws.column_dimensions[daily_ws.cell(1, col_idx).column_letter].width = width
+    for row_cells in daily_ws.iter_rows():
+        for cell in row_cells:
+            cell.alignment = Alignment(vertical="top", wrap_text=True)
+    daily_ws.freeze_panes = "A2"
+    daily_ws.auto_filter.ref = daily_ws.dimensions
     book.save(paths["mail_xlsx"])
 
 # ======================================================================
@@ -6834,6 +7079,11 @@ def main() -> None:
         )
         return
     top3 = choose_top3(rows)
+    daily_sensing = choose_daily_customs_sensing(rows, top3)
+    print(
+        f"[STEP5 DAILY CUSTOMS SENSING] selected={len(daily_sensing)} / "
+        f"direct_top3={len(top3)} / forced_fill=0"
+    )
     html_body = build_html(rows, top3)
     save_excel(rows, top3, paths)
     paths["mail_html"].write_text(html_body, encoding="utf-8")

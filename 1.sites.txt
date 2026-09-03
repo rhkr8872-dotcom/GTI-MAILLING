@@ -1,0 +1,227 @@
+[PROJECT] Global Trade Policy Intelligence System (GTI)
+0.MASTER
+ ├─ sites.xlsx
+ ├─ keyword.xlsx (8개 언어 포함 : KR / EN / CN / VI / HI / TR / ES / PT)
+ └─ TOOL
+        GEMINI_API_KEY = "AIzaSyC10h9WdXAR-E7VmmvSPDNJCSSKe0BMEss"
+        GEMINI_MODEL = "gemini-1.5-flash"
+        SERPAPI_KEY = "7eafa278ec0bf5cc0e99347c1497bfe57d1bae3df4ae519ba558a98b4f02a740"
+        NEWS_API="https://newsapi.org/v2/everything"
+        NEWS_KEY="3643868c050b4fc6bf19c6ea396e6afd"
+        NAVER API : client ID = "9UlPlXyaXYVEzAdNmvra"
+        NAVER API : client SECRET = "MedSQxOnsH"
+
+$env:SERPAPI_KEY="7eafa278ec0bf5cc0e99347c1497bfe57d1bae3df4ae519ba558a98b4f02a740"
+$env:NEWS_API_KEY="3643868c050b4fc6bf19c6ea396e6afd"
+$env:NAVER_CLIENT_ID="9UlPlXyaXYVEzAdNmvra"
+$env:NAVER_CLIENT_SECRET="MedSQxOnsH"
+
+python C:\Temp\4-2.news_ai_analysis.py
+
+
+우선 개선 항목
+
+1.site_crawler.py에 해외 공식 법규 no_date 보존 로직 추가
+날짜가 없어도 출처가 DGFT, TAXUD, GACC, WCO, CBP, USTR, Federal Register, Vietnam MOIT 등이고 제목에 관세/수입/수출/HS/원산지/반덤핑/상계관세가 있으면 바로 버리지 말고 검토 파일로 저장해야 합니다.
+
+1-1.regulation_raw.xlsx 외에 1-1.regulation_review_raw.xlsx 생성
+확정 법규는 regulation_raw, 날짜 불확실하지만 공식성이 높은 문서는 review_raw로 분리하면 해외 법규 누락이 크게 줄어듭니다.
+
+관보 장문 제목 제외 기준 완화
+공식 관보 문서는 제목이 길어도 버리면 안 됩니다. title_too_long_over_180은 일반 뉴스에는 적용하되, 관보/법령/행정예고에는 적용하지 않는 편이 안전합니다.
+
+법규 3-1은 통과입니다.
+뉴스 3-2 article summary는 현재 상태로 4-2.news_ai_analysis.py에 넘기면 안 됩니다.
+
+원인은 명확합니다.
+
+3-1.regulation_merge.py의 뉴스 처리부가 3-2.news_summary.xlsx를 우선 사용하지 못하고, raw 파일 fallback으로 300건을 다시 뽑고 있습니다. 이 과정에서 3-2.news_merge.py가 만든 FinalScore, Tier, IssueKey, SamsungSignal, ClusterSize 같은 핵심 선정 정보가 사라졌습니다.
+
+수정 우선순위
+
+3-1.regulation_merge.py 뉴스 입력은 반드시 C:\Temp\3-2.news_summary.xlsx를 1순위로 읽게 수정
+raw 파일 fallback은 3-2.news_summary.xlsx가 없을 때만 사용
+FinalScore, Tier, IssueKey, SamsungImpactScore, SamsungSignal, SelectReason 컬럼 보존
+클러스터 대표 선정 시 FinalScore=0이면 대표 선정 금지 또는 후순위
+epaselect, 스포츠, 게임, 채용, 행사성 뉴스는 article 단계에서 추가 제거
+요약하면, 법규 본문 복구는 성공했고, 이제 병목은 뉴스 article 단계의 입력 파일 선택 오류입니다.
+
+
+현재 3-2.news_merge.py 결과는 뉴스 후보군 생성용으로는 통과입니다.
+하지만 4-2.news_ai_analysis.py에서 Top 30을 뽑기 전에 아래 보정이 필요합니다.
+
+news.google.com URL은 원문 URL 복원 실패 시 CORE 우선순위 낮추기
+성과급, 수주, 재외동포, 주가, 코스피, YouTube, 채용, 행사 등은 CORE 제외
+삼성 단순 언급만으로 Direct 영향 처리하지 않기
+삼성 Direct는 삼성/반도체/디스플레이/배터리와 관세/수출통제/CBAM/원산지/HS/FTA가 함께 있을 때만 부여
+클러스터 크기가 큰 이슈는 대표기사 품질을 더 엄격히 선택
+결론적으로, 3-2는 300건 후보 생성기로는 잘 작동하고 있습니다. 다만 지금 상태 그대로 Top 30 분석에 넣으면 일부 일반 삼성 뉴스가 상위로 올라갈 수 있으므로, 후단 4-2 또는 3-2 말단에서 CORE 노이즈 필터를 한 번 더 거는 것이 좋습니다.
+
+
+
+
+해외 사이트별 날짜 파서 보강
+지금 품질의 병목은 “수집”보다 “날짜 인식”입니다. EU, 인도, 중국, 미국, 베트남 사이트별 날짜 위치/형식을 따로 잡아야 합니다.
+
+CBP 채용/행사/일반 단속 홍보성 콘텐츠 필터 강화
+법규 섹션에는 들어오지 않게 하고, 뉴스 섹션에서도 낮은 우선순위로 보내는 게 좋습니다.
+
+결론적으로, 현재 결과는 한국 법규 일일 센싱용으로는 꽤 양호, 하지만 글로벌 생산국/주요국 법규 센싱용으로는 날짜 파싱과 공식 해외 후보 보존 로직이 아직 부족합니다. 다음 수정은 1.site_crawler.py에서 “공식 해외 법규 후보를 버리지 않는 구조”를 넣는 것이 1순위입니다.
+
+
+
+STEP5 빈 보고서 방지와 날짜 기준 통합.
+법규 URL/본문 추출 복구.
+뉴스 URL 없는 Top30 제외.
+Direct 판정 기준 강화.
+깨진 한글 문자열 정리.
+전체 배치 실행 로그/품질 리포트 추가.
+현재는 “수집량”보다 “보고서까지 살아남는 품질 게이트”가 가장 큰 병목입니다. 이 부분만 잡아도 임원용 보고서 안정성이 확 올라갈 상태입니다.
+
+개선 우선순위
+
+Top3/CORE 선정 기준 강화
+
+관세율, 관세부과, AD/CVD, 세이프가드, Section 301/232, HS, 원산지, FTA, 수출통제, CBAM 실무 영향이 제목 또는 본문에 명확한 건만 CORE 후보로 유지.
+전시회, 환율, 일반 공급망, 일반 시장동향은 기본적으로 USABLE 또는 제외.
+Direct 기준 재정의
+Direct는 아래 중 하나 이상이 명확할 때만 부여하는 것이 좋습니다.
+
+삼성 법인 국가와 정책 대상국 일치
+반도체/디스플레이/배터리/전자부품 등 삼성 품목 직접 언급
+HS code, 관세율, 시행일, 수출통제 대상, 원산지 기준 확인 가능
+실제 통관/FTA/수출통제 업무 액션이 필요한 경우
+Filtered Noise 재검토 로직 추가
+
+관세, 무관세, 철강관세, EU, 세이프가드, 쿼터, AD/CVD가 있으면 Noise로 바로 버리지 말고 “관세정책 후보”로 재심사해야 합니다.
+Summary/AI Analysis 재생성 순서 수정
+
+STEP5에서 Samsung Impact를 재판정하면 Summary와 AI Analysis도 그 결과 기준으로 다시 써야 합니다.
+현재는 Summary 안의 Direct/Indirect가 최종 컬럼과 충돌합니다.
+법규 본문 추출 보완
+
+법령 사이트 URL은 본문 HTML 파싱 실패 시에도 제목/개정문 링크/법령 ID 기준으로 분석 가능하게 fallback 필요.
+법규 0건은 가능하지만, 본문 추출 상태가 계속 TOO_SHORT인 것은 별도 수정 대상입니다.
+종합 평가
+
+이번 실행은 자동화 안정성은 좋아졌습니다. 이제 “보고서가 생성되는가”는 통과했고, 다음 단계는 임원 보고에 들어갈 가치가 있는 뉴스만 고르는 정확도입니다. 특히 Top3 선정과 Direct 판정만 조정하면 실무 사용성이 꽤 올라갈 상태입니다.
+
+
+
+
+1.crawler : 지금 코드는 데이터를 모으는 엔진으로 전체 80%이상 비중임.
+ 1.site_crawler.py   ✔ 완료
+ ├─ 1.site_news_final_excluded.xlsx
+ ├─ 1.site_news_audit.xlsx
+ ├─ 1.site_news_reject_debug.xlsx
+ ├─ 1.site_news_raw.xlsx
+ ├─ 1-1.regulation_raw.xlsx
+ └─ 1-2.site_news_raw.xlsx
+ **** 1.site_news_cumulative.xlsx ***
+
+ 전체 파일: C:\temp\1.site_news_raw.xlsx
+📁 감사 파일: C:\temp\1.site_news_audit.xlsx
+📁 법규 파일: C:\temp\1-1.regulation_raw.xlsx
+📁 뉴스 파일: C:\temp\1-2.site_news_raw.xlsx
+📁 최종 제외 파일: C:\temp\1.site_news_final_excluded.xlsx
+🧾 제외 로그: C:\temp\1.site_news_reject_debug.xlsx
+📊 RAW 증가: 1485
+PS C:\temp> 
+일 :
+   - 동일 url
+   - 유사 제목의 중복 제거
+   - 관세, 무역, 통상과 관련이 없는 정보, 정확하지 않은 정보, 출처가 불분명한 정보(노이즈 제거)
+   - 해당 SITE에 등록일이 검색기간(24시간)을 벗어낫 정보 제거
+   - 누적파일 (1.site_news_cumulative.xlsx)에 등록된 정보 제거
+
+5. 결과물 저장
+  - 1일 뉴스 1.site_news_raw.xlsxx 저장
+  - 누적 뉴스 1.site_news_cumulative.xlsx 업데이트
+ - 1일 관세 법규 게시물 : 1-1.regulation_raw.xlsx
+ - 1일 관세 관련 뉴스 : 1-2.site_news_raw.xlsx
+
+=============================================================================
+
+5. 주요뉴스 선정
+   - 중요도 분류(회사) : 당사 제품/생산국/관세 직접영향 (상), 간점영향(중), 그 외 (하)
+   - 중요도 분류(업무) : 관세율 / HS코드 / 수입규제(상), 통관 규정 / 인증 / 수출입 절차(중), 일반 통상 동향(하)
+  - 정책 뉴스만 추출
+  - 건수 제한 : 중요도( 상/중/하) 순으로  최대 200개 선정 
+
+   * 뉴스 수집시 확인: ①date, ②Headline, ⑥Country, ⑦agency, ⑧importance, ⑨URL, ⑩date source
+   ** 분석 단계에서 확인: ③ Summary, ④ AI Analysis, ⑤  Action Plan
+
+3. 결과물 저장 규격 (10개 필드 고정)
+site_news_raw.xlsx 저장 시 아래의 필드 순서와 형식을 반드시 준수해야 합니다.
+순서필드명데이터 구성 및 조건
+1 Date인터넷 등록 날짜 (yyyy:mm:dd:hh)
+2Headline굵게, 파란색, 원본 URL 하이퍼링크 적용
+3SummaryAI가 생성한 본문 2~3줄 요약4
+AI Analysis삼성전자 관세·통상 업무 영향도 분석
+5Action Plan관세 전문가 관점의 대응 방안 (1~3줄)
+6Country관련 국가 (최대 2개국)
+7agency관련 정부기관 또는 국제기구
+8importance상/중/하 표기 (업무 영향도 기반)
+9URL뉴스 원본 전체 주소
+10data source수집 도구 명시 (Naver, Google, RSS, Site Name 등)
+
+  - file feild(10개 순서고정) : Date / Headline / importance / 출처URL / source / last_checked
+Summary / AI Analysis / Action Plan / Country / agency /
+    ① date: 게시물/뉴스이 인터넷에 등록된 날짜(yyyy:mm:dd:hh)
+    ② Headline : 게시물/뉴스의 제목표기, 글씨는 굵게, 파란색, 원본URL LINK
+    ③ Summary : 게시물/뉴스의 내용요약 또는 본문 2~3줄로 표기
+    ④ AI Analysis : 게시물/뉴스가 삼성전자의 관세.통상 업무에 미치는 영향 2~3줄로 표기
+    ⑤  Action Plan:  AI Analysis에 대한 관세 전문가로서 대응방안 1~3줄로 표기
+    ⑥ Country:  게시물/뉴스가 관련된 국가 (대표 2개국 이하 표기)
+    ⑦ agency	:게시물/뉴스가 관련된 정부기관이나 국제기구 (대표 2개 이하 표기)
+    ⑧ importance : 삼성전자 생산국, 제품 + 업무 조합으로 평가해서 '상/중/하'로 표기 
+    ⑨ URL ; 게시물/뉴스이 등록된 url 주소
+    ⑩ date source :  게시물/뉴스를 수집한 tool (naver, google, rss, site name) 
+
+결과 파일 이름은 '1.site_news_raw.xlsx
+
+form은 date / title / url / source /collected_at
+
+date : 원문등록일
+title : 게시물 제목
+url : 게시물 url
+source :  출처/원문 url
+collected_at : 검색일시
+
+
+
+7.workflow
+  정부 site  → custom_queries 기반 필터 (주요 40개) → 24시간 필터
+  → trade keyword filter → URL 중복 제거 → 제목 정규화 → 유사도 중복 제거 → cumulative 제거
+  → 노이즈 제거(관세.통상 관련없는 내용 제거 ) → 중요도 분류 → 상/중/하 정렬 → 최대 200개
+  → site_news_raw.xlsx 저장 → site_news_cumulative.xlsx 업데이트
+
+
+8.SITE UPDATE
+  - 사용자는 수시로 확인해서 up_date 해야 함
+  - 메일 발송( )한 후에 AI가 판단한 각국 정부/공인단체 사이트 추가
+  - AI가 자동으로 감시해야 하는 핵심 사이트
+    국가	기관
+   ===================================== 
+      미국	USTR / USITC / CBP / Commerce
+       EU	European Commission Trade
+      한국	기재부 / 산업부 / 관세청
+      중국	MOFCOM / GACC
+      베트남	MOIT / Customs  
+      인도	Ministry of Commerce
+      멕시코	SAT / Economy
+      브라질	Receita Federal
+      터키	Ministry of Trade
+      폴란드 / 슬로바키아	EU Trade
+
+
+[진행경과]
+
+해당 프로젝트는 기초자로 수집이 약80%비중입니다.
+상기 요구사항화  첨부의 실행결과 비교 분석해서 
+코딩 보완 해 주세요
+
+첨부.
+keyword.xlsx, sites.xlsx, (sample)Global Trade Intelligence Daily Brief(2026-03-20).eml
+1.site_crawler.py, site_news_raw.xlsx, site_news_cumulative.xlsx
+
