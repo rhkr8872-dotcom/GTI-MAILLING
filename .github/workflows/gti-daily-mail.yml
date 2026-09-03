@@ -2,7 +2,7 @@ name: GTI Daily Mail
 
 on:
   schedule:
-    # UTC 21:00 = KST 06:00 (next day)
+    # UTC 20:00 = KST 05:00 (next day)
     - cron: "0 21 * * *"
   workflow_dispatch:
     inputs:
