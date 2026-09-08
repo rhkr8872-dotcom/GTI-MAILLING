@@ -21,6 +21,7 @@ Search period:
 - HOURS_BACK = 72
 """
 
+import os
 import re
 import time
 import warnings
@@ -57,16 +58,20 @@ REJECT_FILE = BASE_DIR / "1.site_news_reject_debug.xlsx"
 FINAL_EXCLUDED_FILE = BASE_DIR / "1.site_news_final_excluded.xlsx"
 CRAWL_HEALTH_FILE = BASE_DIR / "1.site_crawl_health.xlsx"
 
-HOURS_BACK = 72
-OVERSEAS_HOURS_BACK = 168
+HOURS_BACK = max(24, int(os.getenv("GTI_REGULATION_HOURS_BACK", "72")))
+OVERSEAS_HOURS_BACK = max(24, int(os.getenv("GTI_OVERSEAS_HOURS_BACK", "168")))
 MAX_PER_SITE = 30
 MAX_GWANBO_ITEMS = 250
+LAWMAKING_MAX_PAGES = max(1, int(os.getenv("GTI_LAWMAKING_MAX_PAGES", "20")))
+# Set to 30 for a one-time recovery run. Zero keeps the normal 72-hour window.
+LAWMAKING_BACKFILL_DAYS = max(0, int(os.getenv("GTI_LAWMAKING_BACKFILL_DAYS", "0")))
 SLEEP_SEC = 0.5
 
 results = []
 rejects = []
 crawl_health = []
 site_run_status = {}
+site_coverage_status = {}
 
 BAD_TITLE_CONTAINS = [
     "로그인", "회원가입", "사이트맵", "skip", "menu", "home",
@@ -457,7 +462,7 @@ def add_reject(reason, date_value, title, url, source, agency, site_type=""):
     })
 
 
-def add_result(date_value, title, url, source, agency, site_type):
+def add_result(date_value, title, url, source, agency, site_type, freshness_days=None):
     title = clean_text(title)
     url = str(url or "").strip()
     source = str(source or "").strip()
@@ -485,7 +490,12 @@ def add_result(date_value, title, url, source, agency, site_type):
         date_status = "no_date"
     else:
         date_out = dt.strftime("%Y-%m-%d %H:%M:%S")
-        date_status = "recent" if is_recent(dt, agency) else "old_date"
+        if freshness_days is None:
+            recent = is_recent(dt, agency)
+        else:
+            start_date = datetime.now().date() - timedelta(days=max(0, int(freshness_days)))
+            recent = start_date <= dt.date() <= datetime.now().date()
+        date_status = "recent" if recent else "old_date"
 
     results.append({
         "date": date_out,
@@ -520,6 +530,60 @@ def fetch_html(url):
         return r
     except Exception:
         return None
+
+
+def diagnose_zero_yield(url, site_recent_dt=None):
+    """Distinguish a defensible NO_NEW from a silent parser failure."""
+    res = fetch_html(url)
+    if not res:
+        return {
+            "zero_yield_status": "FAIL",
+            "zero_yield_reason": "ZERO_YIELD_HTTP_FAILED",
+            "probe_html_bytes": 0,
+            "probe_candidate_links": 0,
+            "probe_dated_candidates": 0,
+        }
+
+    text = res.text or ""
+    low = text.lower()
+    if len(text.encode("utf-8", errors="ignore")) < 500 or any(x in low for x in (
+        "access denied", "captcha", "cf-chl-", "enable javascript to continue", "robot check"
+    )):
+        return {
+            "zero_yield_status": "FAIL",
+            "zero_yield_reason": "ZERO_YIELD_BLOCKED_OR_EMPTY_HTML",
+            "probe_html_bytes": len(text.encode("utf-8", errors="ignore")),
+            "probe_candidate_links": 0,
+            "probe_dated_candidates": 0,
+        }
+
+    soup = BeautifulSoup(text, "html.parser")
+    candidates = []
+    dated = 0
+    for anchor in soup.find_all("a", href=True):
+        title = clean_text(anchor.get_text(" ", strip=True))
+        link = urljoin(url, anchor.get("href", ""))
+        if not is_valid_title(title) or is_menu_or_category_link(title, link, url):
+            continue
+        candidates.append((title, link))
+        parent_text = clean_text((anchor.parent or anchor).get_text(" ", strip=True))
+        if extract_date_from_text(parent_text):
+            dated += 1
+
+    recent_hint = bool(site_recent_dt and is_recent(site_recent_dt))
+    if len(candidates) >= 3 or dated > 0 or recent_hint:
+        reason = "RECENT_HINT_BUT_ZERO" if recent_hint else "POST_LIKE_CONTENT_BUT_ZERO"
+        status = "CHECK_REQUIRED"
+    else:
+        reason = "ACCESS_OK_NO_POST_SIGNAL"
+        status = "NO_NEW"
+    return {
+        "zero_yield_status": status,
+        "zero_yield_reason": reason,
+        "probe_html_bytes": len(text.encode("utf-8", errors="ignore")),
+        "probe_candidate_links": len(candidates),
+        "probe_dated_candidates": dated,
+    }
 
 
 def fetch_selenium_html(url, wait_sec=4):
@@ -1012,6 +1076,110 @@ def crawl_rss(source_url, agency, site_type):
             allow_keywords=["news", "notice", "공지", "공고", "rss", "article"],
         )
 
+    return len(results) - before
+
+
+def _url_with_query_value(url, key, value):
+    """Return *url* with one query-string value replaced safely."""
+    parsed = urlparse(url)
+    query = parse_qs(parsed.query, keep_blank_values=True)
+    query[key] = [str(value)]
+    return parsed._replace(query=urlencode(query, doseq=True)).geturl()
+
+
+def crawl_lawmaking_bills(source_url, agency, site_type):
+    """Crawl National Assembly bill status until the freshness cutoff is reached.
+
+    The board exposes only about 20 bills on its first page.  The former generic
+    table parser therefore missed relevant bills as soon as newer, unrelated
+    bills pushed them to page 2 or later.  This parser follows ``pageIndex`` and
+    stops only after it has observed a bill date older than the inclusive cutoff.
+    """
+    before = len(results)
+    normal_days = max(0, int(HOURS_BACK // 24))
+    window_days = max(normal_days, LAWMAKING_BACKFILL_DAYS)
+    cutoff = datetime.now().date() - timedelta(days=window_days)
+    pages_scanned = 0
+    cutoff_reached = False
+    fetch_failed = False
+    oldest_seen = None
+    latest_seen = None
+    seen_urls = set()
+    page_row_counts = []
+
+    for page_index in range(1, LAWMAKING_MAX_PAGES + 1):
+        page_url = _url_with_query_value(source_url, "pageIndex", page_index)
+        page_url = _url_with_query_value(page_url, "blockStartPage", ((page_index - 1) // 10) * 10 + 1)
+        res = fetch_html(page_url)
+        if not res:
+            fetch_failed = True
+            break
+
+        pages_scanned += 1
+        soup = BeautifulSoup(res.text, "html.parser")
+        page_dates = []
+        page_added = 0
+
+        for row in soup.find_all("tr"):
+            anchor = row.find(
+                "a",
+                href=re.compile(r"/gcom/nsmLmSts/out/\d+/detailRP(?:$|[?#])"),
+            )
+            if not anchor:
+                continue
+
+            title = clean_text(anchor.get_text(" ", strip=True))
+            link = urljoin(source_url, anchor.get("href", ""))
+            if not title or not link or link in seen_urls:
+                continue
+
+            row_text = clean_text(row.get_text(" ", strip=True))
+            post_date = extract_date_from_tag(row) or extract_date_from_text(row_text)
+            if post_date is None:
+                continue
+
+            seen_urls.add(link)
+            page_dates.append(post_date.date())
+            oldest_seen = post_date.date() if oldest_seen is None else min(oldest_seen, post_date.date())
+            latest_seen = post_date.date() if latest_seen is None else max(latest_seen, post_date.date())
+
+            if add_result(
+                post_date, title, link, source_url, agency, site_type,
+                freshness_days=window_days,
+            ):
+                page_added += 1
+
+        page_row_counts.append(page_added)
+        if not page_dates:
+            break
+
+        # The cutoff day itself is in scope. Continue while a page contains
+        # only cutoff-day rows because more rows from the same day can spill
+        # onto the next page.
+        if min(page_dates) < cutoff:
+            cutoff_reached = True
+            break
+
+        # Repeated/empty result pages indicate that pagination did not advance.
+        if page_added == 0:
+            break
+
+    partial = fetch_failed or not cutoff_reached
+    site_coverage_status[source_url] = {
+        "coverage_status": "PARTIAL_COVERAGE" if partial else "COMPLETE_TO_CUTOFF",
+        "collection_mode": "BACKFILL" if LAWMAKING_BACKFILL_DAYS > normal_days else "DAILY",
+        "window_days": window_days,
+        "pages_scanned": pages_scanned,
+        "cutoff_date": cutoff.isoformat(),
+        "cutoff_reached": "Y" if cutoff_reached else "N",
+        "oldest_date_seen": oldest_seen.isoformat() if oldest_seen else "",
+        "latest_date_seen": latest_seen.isoformat() if latest_seen else "",
+        "page_row_counts": ",".join(str(x) for x in page_row_counts),
+        "coverage_error": "PAGE_FETCH_FAILED" if fetch_failed else (
+            "MAX_PAGES_BEFORE_CUTOFF" if not cutoff_reached and pages_scanned >= LAWMAKING_MAX_PAGES
+            else "CUTOFF_NOT_REACHED"
+        ) if partial else "",
+    }
     return len(results) - before
 
 
@@ -2447,7 +2615,11 @@ def apply_final_sites_status(sites, final_df, checked_indices):
         # A successful fetch with zero new/valid posts is normal. FAIL is
         # reserved for transport/parser failure after rescue also failed.
         sites.at[idx, "status"] = (
-            "FAIL" if run_state.get("failed") else get_status(count)
+            "FAIL" if run_state.get("failed") else (
+                "CHECK_REQUIRED" if run_state.get("check_required") else (
+                    "PARTIAL_COVERAGE" if run_state.get("partial") else get_status(count)
+                )
+            )
         )
         if "status_detail" not in sites.columns:
             sites["status_detail"] = ""
@@ -2571,7 +2743,9 @@ def main():
             elif parser == "nsp_parser":
                 count = crawl_nsp(source_url, agency, site_type)
             elif parser == "table_date":
-                if "fta.motir.go.kr/ftamain/promo/news/trend" in source_url.lower():
+                if "opinion.lawmaking.go.kr/gcom/nsmlmsts/out" in source_url.lower():
+                    count = crawl_lawmaking_bills(source_url, agency, site_type)
+                elif "fta.motir.go.kr/ftamain/promo/news/trend" in source_url.lower():
                     count = crawl_fta_trend(source_url, agency, site_type)
                 else:
                     count = crawl_table(source_url, agency, site_type)
@@ -2595,20 +2769,44 @@ def main():
                 primary_failed = True
                 primary_error = (primary_error + " | " if primary_error else "") + f"RESCUE:{type(rescue_exc).__name__}: {rescue_exc}"
 
-        run_failed = primary_failed and count == 0 and rescue_strategy == "RESCUE_FAILED"
+        coverage = site_coverage_status.get(source_url, {})
+        partial_coverage = coverage.get("coverage_status") == "PARTIAL_COVERAGE"
+        zero_diagnostic = {}
+        if count == 0 and rescue_strategy != "RESCUE_FAILED":
+            zero_diagnostic = diagnose_zero_yield(source_url, site_recent_dt)
+        zero_status = zero_diagnostic.get("zero_yield_status", "")
+        silent_failure = zero_status == "CHECK_REQUIRED"
+        run_failed = (
+            primary_failed and count == 0 and rescue_strategy == "RESCUE_FAILED"
+        ) or zero_status == "FAIL"
         site_run_status[idx] = {
             "failed": run_failed,
-            "detail": primary_error if run_failed else ("NO_NEW" if count == 0 else rescue_strategy),
+            "partial": partial_coverage or silent_failure,
+            "check_required": silent_failure,
+            "detail": primary_error if run_failed else (
+                coverage.get("coverage_error", "PARTIAL_COVERAGE")
+                if partial_coverage else (
+                    zero_diagnostic.get("zero_yield_reason", "CHECK_REQUIRED")
+                    if silent_failure else ("NO_NEW" if count == 0 else rescue_strategy)
+                )
+            ),
         }
 
-        crawl_health.append({
+        health_row = {
             "checked_at": now_str(), "site": site_name, "url": source_url,
             "parser": parser, "primary_or_rescue": rescue_strategy,
             "real_posts_found": count,
-            "status": "FAIL" if run_failed else ("OK" if count > 0 else "NO_NEW"),
-            "error": primary_error if run_failed else "",
+            "status": "FAIL" if run_failed else (
+                "PARTIAL_COVERAGE" if partial_coverage else (
+                    "CHECK_REQUIRED" if silent_failure else ("OK" if count > 0 else "NO_NEW")
+                )
+            ),
+            "error": primary_error or zero_diagnostic.get("zero_yield_reason", "") if run_failed else "",
             "latest_date_hint": clean_text(row.get(recent_post_col, "")) if recent_post_col else "",
-        })
+        }
+        health_row.update(coverage)
+        health_row.update(zero_diagnostic)
+        crawl_health.append(health_row)
 
         print(f" → {count}건")
 
@@ -2695,6 +2893,10 @@ def main():
             health["final_exclude_reasons"] = excluded_reason_by_agency.get(agency_name, "")
             if health.get("status") == "FAIL":
                 health["final_status"] = "FAIL"
+            elif health.get("status") == "CHECK_REQUIRED":
+                health["final_status"] = "CHECK_REQUIRED"
+            elif health.get("status") == "PARTIAL_COVERAGE":
+                health["final_status"] = "PARTIAL_COVERAGE"
             elif valid_n > 0:
                 health["final_status"] = "VALID_REGULATION"
             elif int(health.get("real_posts_found", 0) or 0) > 0:

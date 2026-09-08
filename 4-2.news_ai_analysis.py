@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-GTI STEP4-2 NEWS AI v36 ARTICLE-NATIVE MAPPING + POLICY-EVENT CONTRACT
+GTI STEP4-2 NEWS AI v43 GOLD-CONTRACT SELECTION ENGINE
 - Input: 3-2.news_summary.xlsx
 - Strict published-date 24h guard
 - No legacy v18/v20/v23/v24 override chain
@@ -17,8 +17,20 @@ from urllib.parse import urlparse
 import pandas as pd
 import requests
 
+try:
+    from gti_quality_contract import apply_quality_contract, VERSION as CONTRACT_VERSION
+except ImportError as exc:
+    raise RuntimeError(
+        "gti_quality_contract.py must be placed in the same folder as this script"
+    ) from exc
+
 BASE_DIR = Path(os.getenv("GTI_BASE_DIR", r"C:\Temp"))
 INPUT_FILE = BASE_DIR / "3-2.news_summary.xlsx"
+REQUIRED_COLLECTOR_FILES = [
+    BASE_DIR / "2-1.naver_news_raw.xlsx",
+    BASE_DIR / "2-2.google_news_raw.xlsx",
+    BASE_DIR / "2-3.rss_news_raw.xlsx",
+]
 OUT_SUMMARY = BASE_DIR / "4-2.news_ai_summary.xlsx"
 OUT_CUMULATIVE = BASE_DIR / "4-2.news_ai_cumulative.xlsx"
 OUT_AUDIT = BASE_DIR / "4-2.news_ai_audit_candidates.xlsx"
@@ -506,6 +518,26 @@ def domain(u: str) -> str:
 
 
 def load_input() -> pd.DataFrame:
+    unreadable = []
+    newer = []
+    for source_path in REQUIRED_COLLECTOR_FILES:
+        if not source_path.exists():
+            unreadable.append(f"MISSING:{source_path.name}")
+            continue
+        try:
+            pd.read_excel(source_path, nrows=1)
+        except Exception as exc:
+            unreadable.append(f"UNREADABLE:{source_path.name}:{type(exc).__name__}")
+            continue
+        if INPUT_FILE.exists() and source_path.stat().st_mtime > INPUT_FILE.stat().st_mtime + 1:
+            newer.append(source_path.name)
+    if unreadable or newer:
+        detail = "; ".join(unreadable + (["NEWER_THAN_STEP3:" + ",".join(newer)] if newer else []))
+        raise RuntimeError(
+            "STEP4-2 BLOCKED: STEP3-2 did not produce a trustworthy current-run input. "
+            + detail
+            + ". Run all three collectors and STEP3-2 successfully. Existing STEP4 outputs are preserved."
+        )
     if not INPUT_FILE.exists():
         raise FileNotFoundError(f"input not found: {INPUT_FILE}")
     file_age_hours = max(0.0, (datetime.now().timestamp() - INPUT_FILE.stat().st_mtime) / 3600)
@@ -1093,22 +1125,22 @@ def build() -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
             "Fail-closed: existing summary/mail inputs were not overwritten. Check API key, quota and model access."
         )
 
-    # 메일 후보는 원문·정책사건·AI 관련성 최소기준을 모두 충족해야 한다.
-    min_relevance = int(os.getenv("GTI_STEP4_MIN_RELEVANCE", "3"))
-    selected = audit[
-        audit["AIRelevant"].eq("Y")
-        & audit["Body Verified"].eq("Y")
-        & audit["Policy Event"].eq("Y")
-        & ~audit["_EventOnly"].fillna(False)
-        & pd.to_numeric(audit["AIRelevanceScore"], errors="coerce").fillna(0).ge(min_relevance)
+    # Final selection is fail-closed. STEP4's article-native verification gates
+    # and the shared deterministic contract must both pass. A row rejected as
+    # non-policy or non-relevant cannot be resurrected by a looser keyword hit.
+    selected, deterministic_rejected = apply_quality_contract(audit, include_reference=False)
+    selected = selected[
+        selected["Body Verified"].eq("Y")
+        & ~selected["_EventOnly"].fillna(False)
     ].copy()
     selected = selected.sort_values(
-        ["SelectionScore", "PreScore", "Date"], ascending=[False, False, False], kind="stable"
+        ["ExecutiveScore", "SelectionScore", "PreScore", "Date"],
+        ascending=[False, False, False, False], kind="stable"
     )
     selected["_supplemental_watch"] = False
     # REPORT_TARGET은 최대 표시 건수다. 품질 미달 행으로 30건을 강제 충원하지 않는다.
     log(
-        f"QUALITY CONTRACT: strict_pass={len(selected)} / target_cap={REPORT_TARGET} / "
+        f"GOLD QUALITY CONTRACT {CONTRACT_VERSION}: strict_pass={len(selected)} / target_cap={REPORT_TARGET} / "
         f"shortfall={max(0, REPORT_TARGET-len(selected)) if REPORT_TARGET > 0 else 0} / forced_fill=0"
     )
 
@@ -1132,6 +1164,9 @@ def build() -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
         ):
             return "US_DRONE_232_TARIFF"
         rules = [
+            ("CN_JP_DICHLOROSILANE_AD_2026", [["디클로로실란", "반도체 가스", "반도체 핵심소재"], ["반덤핑", "보증금", "99.2%", "99.2％"], ["중국", "china"]]),
+            ("VN_IN_CERAMIC_TILE_AD_2026", [["세라믹 타일", "ceramic tile"], ["반덤핑", "anti-dumping"], ["인도", "india"]]),
+            ("KR_CN_HGI_GI_AD_GAP_2026", [["hgi", "gi", "용융아연도금"], ["반덤핑", "관세"], ["중국", "china"]]),
             ("KR_STRATEGIC_EXPORT_CONTROL_AI_CHIP", [["전략물자수출입고시", "전략물자 수출입고시"], ["ai 칩", "ai용 집적회로", "반도체 장비", "수출통제"]]),
             ("KR_CHINA_BUTYL_ACRYLATE_AD", [["아크릴산 부틸", "butyl acrylate"], ["덤핑관세", "덤핑 관세", "반덤핑", "anti-dumping", "anti dumping", "duties"], ["중국", "china", "chinese"]]),
             ("US_KR_COUPANG_SECTION301_TARIFF", [["쿠팡", "coupang"], ["301조", "section 301", "추가 관세", "관세 보복", "retaliatory tariff"]]),
@@ -1319,6 +1354,9 @@ def build() -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
         def _final_event_key(row: pd.Series) -> str:
             text = _post_text(row)
             rules = [
+                ("CN_JP_DICHLOROSILANE_AD_2026", [["디클로로실란", "반도체 가스", "반도체 핵심소재"], ["반덤핑", "보증금", "99.2%", "99.2％"], ["중국", "china"]]),
+                ("VN_IN_CERAMIC_TILE_AD_2026", [["세라믹 타일", "ceramic tile"], ["반덤핑", "anti-dumping"], ["인도", "india"]]),
+                ("KR_CN_HGI_GI_AD_GAP_2026", [["hgi", "gi", "용융아연도금"], ["반덤핑", "관세"], ["중국", "china"]]),
                 ("KR_STRATEGIC_EXPORT_CONTROL_AI_CHIP", [["전략물자수출입고시", "전략물자 수출입고시"], ["ai 칩", "ai용 집적회로", "반도체 장비", "수출통제"]]),
                 ("KR_CHINA_BUTYL_ACRYLATE_AD", [["아크릴산 부틸", "butyl acrylate"], ["덤핑관세", "덤핑 관세", "반덤핑", "anti-dumping", "anti dumping", "duties"]]),
                 ("US_KR_COUPANG_SECTION301_TARIFF", [["쿠팡", "coupang"], ["301조", "section 301", "추가 관세", "관세 보복"]]),
@@ -1383,9 +1421,20 @@ def safe_write(path: Path, df: pd.DataFrame) -> None:
 
 
 def main() -> int:
-    log("GTI STEP4-2 NEWS AI v36 ARTICLE-NATIVE MAPPING + POLICY-EVENT CONTRACT START")
+    log("GTI STEP4-2 NEWS AI v44 UNIFIED GOLD-CONTRACT ENGINE START")
     log(f"MODEL={GEMINI_MODEL} / Gemini={'Y' if USE_GEMINI else 'N'} / 24h / max={TARGET_MAX}")
     daily, audit, excluded = build()
+    before_contract = len(daily)
+    daily, contract_rejected = apply_quality_contract(daily, include_reference=False)
+    if not contract_rejected.empty:
+        contract_rejected = contract_rejected.copy()
+        contract_rejected["RejectReason"] = "GOLD_CONTRACT:" + contract_rejected["ContractReason"].astype(str)
+        excluded = pd.concat([excluded, contract_rejected], ignore_index=True, sort=False)
+    daily["No"] = range(1, len(daily) + 1)
+    log(
+        f"GOLD QUALITY CONTRACT {CONTRACT_VERSION}: before={before_contract} / "
+        f"selected={len(daily)} / rejected={len(contract_rejected)} / forced_fill=0"
+    )
     cumulative = merge_cumulative(daily)
     safe_write(OUT_SUMMARY, daily)
     safe_write(OUT_CUMULATIVE, cumulative)
