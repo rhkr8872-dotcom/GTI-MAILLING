@@ -148,6 +148,38 @@ OPINION_TITLE_TERMS = [
     "[세풍", "[사설", "[칼럼", "[기고", "오피니언", "column", "opinion", "editorial",
 ]
 
+# v45.0: article-body verification alone does not make a reportable policy.
+MARKET_COMPANY_NOISE_TERMS = [
+    "주가", "급락", "급등", "신용등급", "실적 개선", "매출 증가", "시장점유율",
+    "제품 가격", "가격 인상", "판매 증가", "시장 공략", "기업들", "날개 달고",
+    "stock price", "shares fell", "shares rose", "credit rating", "earnings",
+]
+FOOD_SUPPLY_NOISE_TERMS = [
+    "수입콩", "국산콩", "두부", "식품업계", "농식품부", "재고 한계", "원료 절벽",
+]
+POLICY_INSTRUMENT_TERMS = [
+    "법률안", "개정안", "시행령", "시행규칙", "행정명령", "고시", "공고",
+    "예비판정", "최종판정", "조사 개시", "조사개시", "관세율", "추가관세",
+    "면세 폐지", "면세기준", "쿼터", "할당관세", "수입금지", "수출금지",
+    "regulation", "decree", "executive order", "official notice",
+    "preliminary determination", "final determination", "investigation initiated",
+    "tariff rate", "additional tariff", "duty-free", "quota", "import ban",
+]
+
+
+def concrete_policy_delta(text: object) -> bool:
+    """Require an identifiable new/changed government customs measure."""
+    t = clean(text).lower()
+    if not t:
+        return False
+    has_instrument = any(x in t for x in POLICY_INSTRUMENT_TERMS)
+    has_measure = any(x in t for x in CONCRETE_MEASURE_TERMS)
+    has_authority = any(x in t for x in [
+        "정부", "관세청", "세관", "상무부", "재무부", "무역위원회", "국회",
+        "commission", "customs", "department of commerce", "ministry", "wto",
+    ])
+    return has_instrument and (has_measure or has_authority)
+
 
 def event_only_noise(title: object, body: object = "") -> bool:
     title_text = clean(title).lower()
@@ -296,6 +328,14 @@ def _event_anchor(row: pd.Series) -> str:
         return "EVENT|US_CANADA_50PCT_RETALIATORY_TARIFFS"
     if any(x in context for x in ["호우", "침수", "수해", "flood"]) and any(x in context for x in ["관세", "세관", "customs", "납부기한", "관세조사", "원산지검증", "신속통관", "통관 지원", "지원책"]):
         return "EVENT|KR_FLOOD_CUSTOMS_RELIEF"
+    if any(x in context for x in ["300억달러", "30 billion", "$30 billion"]) and any(x in context for x in ["미중", "미·중", "미국", "중국", "u.s.", "china"]) and any(x in context for x in ["상호 관세", "관세인하", "관세 인하", "tariff reduction"]):
+        return "EVENT|US_CHINA_30B_TARIFF_NEGOTIATION"
+    if any(x in context for x in ["tbfc", "무역기반 재정", "무역기반 금융", "특별수사단", "특수단"]) and any(x in context for x in ["관세청", "관세 범죄", "시장교란", "부정수급"]):
+        return "EVENT|KR_TBFC_TASK_FORCE"
+    if any(x in context for x in ["공시송달", "온라인 게시", "유니패스", "국가관세종합정보시스템"]) and any(x in context for x in ["관세법", "국세기본법", "조승래"]):
+        return "EVENT|KR_CUSTOMS_PUBLIC_NOTICE_BILL"
+    if any(x in context for x in ["수입콩", "두부", "국산콩"]) and any(x in context for x in ["부족", "공급", "재고", "할당"]):
+        return "EVENT|KR_SOYBEAN_SUPPLY"
     countries = [
         "미국", "중국", "멕시코", "캐나다", "한국", "일본", "인도", "베트남", "브라질",
         "유럽", "eu", "usa", "china", "mexico", "canada", "korea", "japan", "india",
@@ -1279,6 +1319,9 @@ def build() -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
             ]
             if any(term in title for term in title_noise):
                 return True
+            if any(term in title for term in MARKET_COMPANY_NOISE_TERMS + FOOD_SUPPLY_NOISE_TERMS):
+                if not concrete_policy_delta(_article_native_text(row)):
+                    return True
             article_text = _article_native_text(row)
             if (
                 any(term in title for term in ["토요타", "toyota", "현대차", "hyundai", "general motors", "gm…"])
@@ -1354,6 +1397,10 @@ def build() -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
         def _final_event_key(row: pd.Series) -> str:
             text = _post_text(row)
             rules = [
+                ("US_CHINA_30B_TARIFF_NEGOTIATION", [["300억달러", "30 billion", "$30 billion"], ["미중", "미·중", "미국", "중국", "u.s.", "china"], ["상호 관세", "관세인하", "관세 인하", "tariff reduction"]]),
+                ("KR_TBFC_TASK_FORCE", [["tbfc", "무역기반 재정", "무역기반 금융", "특별수사단", "특수단"], ["관세청", "관세 범죄", "시장교란", "부정수급"]]),
+                ("KR_CUSTOMS_PUBLIC_NOTICE_BILL", [["공시송달", "온라인 게시", "유니패스", "국가관세종합정보시스템"], ["관세법", "국세기본법", "조승래"]]),
+                ("KR_SOYBEAN_SUPPLY", [["수입콩", "두부", "국산콩"], ["부족", "공급", "재고", "할당"]]),
                 ("CN_JP_DICHLOROSILANE_AD_2026", [["디클로로실란", "반도체 가스", "반도체 핵심소재"], ["반덤핑", "보증금", "99.2%", "99.2％"], ["중국", "china"]]),
                 ("VN_IN_CERAMIC_TILE_AD_2026", [["세라믹 타일", "ceramic tile"], ["반덤핑", "anti-dumping"], ["인도", "india"]]),
                 ("KR_CN_HGI_GI_AD_GAP_2026", [["hgi", "gi", "용융아연도금"], ["반덤핑", "관세"], ["중국", "china"]]),
@@ -1375,6 +1422,15 @@ def build() -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
         if len(daily) != before_v36_dedup:
             log(f"V36 FINAL EVENT DEDUP: {before_v36_dedup} -> {len(daily)}")
         daily = daily.reset_index(drop=True)
+        outlook_terms = ["전망", "퇴임해도", "기회", "관측", "가능성", "could", "may", "outlook"]
+        for idx, row in daily.iterrows():
+            title = clean(row.get("Headline")).lower()
+            native = _article_native_text(row)
+            if any(term in title for term in outlook_terms) and not concrete_policy_delta(native):
+                daily.at[idx, "Samsung Impact"] = "Watch"
+                daily.at[idx, "Top3 Eligible"] = "N"
+                daily.at[idx, "Policy Stage"] = "COMMENTARY_OR_OUTLOOK"
+                daily.at[idx, "MappingStatus"] = "MONITORING_ONLY"
         daily["No"] = range(1, len(daily) + 1)
 
     rejected_ai = audit[~audit.index.isin(selected_audit_indices)].copy()
@@ -1421,7 +1477,7 @@ def safe_write(path: Path, df: pd.DataFrame) -> None:
 
 
 def main() -> int:
-    log("GTI STEP4-2 NEWS AI v44 UNIFIED GOLD-CONTRACT ENGINE START")
+    log("GTI STEP4-2 NEWS AI v45.0 EVENT-FAMILY POLICY-DELTA ENGINE START")
     log(f"MODEL={GEMINI_MODEL} / Gemini={'Y' if USE_GEMINI else 'N'} / 24h / max={TARGET_MAX}")
     daily, audit, excluded = build()
     before_contract = len(daily)

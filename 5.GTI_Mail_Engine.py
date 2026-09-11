@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""GTI STEP5 v44 evidence-gated executive report engine.
+"""GTI STEP5 v45.3 upstream-authoritative evidence-gated report engine.
 
 One preparation path, one quality contract, one send path.  --preview and
 --no-email never mutate cumulative history.
@@ -32,12 +32,48 @@ SMTP_HOST = os.getenv("GTI_SMTP_HOST", "smtp.naver.com")
 SMTP_PORT = int(os.getenv("GTI_SMTP_PORT", "465"))
 SMTP_USER = os.getenv("GTI_SMTP_USER", "kch8872@naver.com").strip()
 SMTP_PASS = (os.getenv("GTI_SMTP_PASS") or os.getenv("GTI_MAIL_PW") or "").strip()
+ENGINE_VERSION = "v45.3"
 
 
 def s(v) -> str:
     if v is None or (isinstance(v, float) and pd.isna(v)):
         return ""
     return re.sub(r"\s+", " ", str(v)).strip()
+
+
+def publication_date(v) -> str:
+    """Return the source publication date used for sensing, never the run date."""
+    dt = pd.to_datetime(v, errors="coerce")
+    if pd.isna(dt):
+        return s(v)[:10] or "원문 확인 필요"
+    return dt.strftime("%Y-%m-%d")
+
+
+def row_publication_date(row: pd.Series) -> str:
+    for col in ("Original Publish Date", "Publish Date", "Date"):
+        value = row.get(col, "")
+        if value is not None and not pd.isna(value) and s(value):
+            return publication_date(value)
+    return "원문 확인 필요"
+
+
+def regulation_event_key(row: pd.Series) -> str:
+    """Preserve bill/document identity so same-title bills never collapse."""
+    existing = s(row.get("EventKey"))
+    identity = s(row.get("DocumentIdentity"))
+    bill_no = re.sub(r"\.0$", "", s(row.get("BillNo")))
+    url = s(row.get("URL"))
+    bill_match = re.search(r"/out/(\d+)/", url)
+    if identity:
+        return identity.lower()
+    if bill_no:
+        return f"bill:{bill_no.lower()}"
+    if bill_match:
+        return f"bill:{bill_match.group(1)}"
+    if existing:
+        return existing
+    headline = re.sub(r"\W+", "_", s(row.get("Headline")).lower())[:130]
+    return f"REG_{headline}_{publication_date(row.get('Date'))}"
 
 
 def read_excel_safe(path: Path) -> pd.DataFrame:
@@ -80,7 +116,8 @@ def normalize_regulation(df: pd.DataFrame) -> pd.DataFrame:
     out["ExecutiveScore"] = score.where(verified, score.clip(upper=59))
     out["ExecutiveTier"] = "WATCH"
     out.loc[verified & score.ge(85), "ExecutiveTier"] = "PRIORITY_WATCH"
-    out["EventKey"] = "REG_" + out["Headline"].map(lambda x: re.sub(r"\W+", "_", s(x).lower())[:150])
+    out["Original Publish Date"] = out["Date"].map(publication_date)
+    out["EventKey"] = out.apply(regulation_event_key, axis=1)
     out["ContractReason"] = "공식 원문 검증 완료: 적용범위·시행일 및 삼성 거래 매핑 확인"
     out.loc[~verified, "ContractReason"] = "공식 게시물이나 원문 본문 미확인: 확인 완료 전 경영진 우선정책 승격 금지"
     out["SamsungDirectFlag"] = "N"
@@ -143,15 +180,23 @@ def historical_keys(df: pd.DataFrame) -> set[str]:
     return keys
 
 
-def remove_history(rows: pd.DataFrame, old: pd.DataFrame) -> tuple[pd.DataFrame, int]:
+def remove_history(rows: pd.DataFrame, old: pd.DataFrame, report_date: str = "") -> tuple[pd.DataFrame, int]:
     if rows.empty or old.empty:
         return rows.copy(), 0
-    known = historical_keys(old)
+    compare = old.copy()
+    # A rerun for the same report date must rebuild the same report instead of
+    # treating that morning's first run as historical noise.
+    if report_date and "ReportDate" in compare.columns:
+        compare = compare[compare["ReportDate"].fillna("").astype(str).str[:10].ne(report_date)]
+    known = historical_keys(compare)
     mask = []
     for _, r in rows.iterrows():
         url = s(r.get("URL")).lower()
         headline = re.sub(r"\W+", "", s(r.get("Headline")).lower())
-        mask.append((bool(url) and "U:" + url in known) or (bool(headline) and "H:" + headline in known))
+        # A valid official URL is the document identity.  Headline fallback is
+        # used only when URL is absent, because separate bills can share the
+        # exact same title (for example multiple 관세법 일부개정법률안).
+        mask.append(("U:" + url in known) if url else (bool(headline) and "H:" + headline in known))
     dup = pd.Series(mask, index=rows.index)
     return rows[~dup].copy(), int(dup.sum())
 
@@ -204,14 +249,15 @@ def build_html(rows: pd.DataFrame, run_date: str) -> str:
         <p><b>임원 판단</b> {esc(r.get('ContractReason'))}</p>
         <p><b>삼성전자 관세업무</b> {esc(r.get('AI Analysis')) or '직접 비용은 미확정이며 적용범위 검증이 필요합니다.'}</p>
         <p><b>지시사항</b> {esc(action_text(r))}</p>
-        <p class='meta'>{esc(r.get('Country'))} · {esc(r.get('Agency') or r.get('Source'))} · <a href='{esc(r.get('URL'))}'>원문</a></p></div>""")
+        <p class='meta'><b>원본 게시일자</b> {esc(row_publication_date(r))} · {esc(r.get('Country'))} · {esc(r.get('Agency') or r.get('Source'))} · <a href='{esc(r.get('URL'))}'>원문</a></p></div>""")
     if not cards:
         cards.append("<div class='empty'><b>신규 Action Queue 없음</b><br>Direct 확정 또는 원문 검증을 통과한 우선 검토대상이 없습니다.</div>")
 
     def table_rows(frame: pd.DataFrame) -> str:
         rendered = []
         for _, r in frame.iterrows():
-            rendered.append(f"<tr><td>{esc(r.get('DecisionStatus'))}</td><td><a href='{esc(r.get('URL'))}'>{esc(r.get('Headline'))}</a></td><td>{esc(r.get('Country'))}</td><td>{esc(r.get('ContractReason'))}</td></tr>")
+            original_date = row_publication_date(r)
+            rendered.append(f"<tr><td>{esc(r.get('DecisionStatus'))}</td><td>{esc(original_date)}</td><td><a href='{esc(r.get('URL'))}'>{esc(r.get('Headline'))}</a></td><td>{esc(r.get('Country'))}</td><td>{esc(r.get('ContractReason'))}</td></tr>")
         return "".join(rendered)
 
     verified = rows[rows.get("VerificationStatus", pd.Series("PENDING", index=rows.index)).eq("VERIFIED")]
@@ -228,9 +274,9 @@ def build_html(rows: pd.DataFrame, run_date: str) -> str:
     <section class='section'><h2>1. 오늘의 관세정책 센싱</h2><p class='lead'><b>{esc(executive_sentence(rows))}</b></p>
     <span class='metric'>보고 {len(rows)}건</span><span class='metric'>Action Required {direct_n}건</span><span class='metric'>Urgent Verification {urgent_n}건</span><span class='metric'>Scenario {scenario_n}건</span><span class='metric'>Monitoring {monitoring_n}건</span><span class='metric'>Verification Pending {pending_n}건</span></section>
     <section class='section'><h2>2. Samsung Customs Action Queue</h2>{''.join(cards)}</section>
-    <section class='section verified'><h2>3. 원문 검증 완료 ({len(verified)}건)</h2><table><tr><th>상태</th><th>정책 신호</th><th>국가</th><th>선정 근거</th></tr>{table_rows(verified)}</table></section>
-    <section class='section pending'><h2>4. 원문 확인 필요 ({len(pending)}건)</h2><table><tr><th>상태</th><th>정책 신호</th><th>국가</th><th>확인 사유</th></tr>{table_rows(pending)}</table></section>
-    <section class='section'><small>정책 존재는 기사 원문·공식출처로만 판정하며 AI 분석문은 증거로 사용하지 않습니다. Contract {CONTRACT_VERSION}</small></section></body></html>"""
+    <section class='section verified'><h2>3. 원문 검증 완료 ({len(verified)}건)</h2><table><tr><th>상태</th><th>원본 게시일자</th><th>정책 신호</th><th>국가</th><th>선정 근거</th></tr>{table_rows(verified)}</table></section>
+    <section class='section pending'><h2>4. 원문 확인 필요 ({len(pending)}건)</h2><table><tr><th>상태</th><th>원본 게시일자</th><th>정책 신호</th><th>국가</th><th>확인 사유</th></tr>{table_rows(pending)}</table></section>
+    <section class='section'><small>정책 존재는 기사 원문·공식출처로만 판정하며 AI 분석문은 증거로 사용하지 않습니다. Engine {ENGINE_VERSION} · Contract {CONTRACT_VERSION}</small></section></body></html>"""
 
 
 def write_xlsx(path: Path, rows: pd.DataFrame) -> None:
@@ -279,14 +325,29 @@ def send_mail(body: str, xlsx: Path, run_date: str) -> None:
 
 
 def main() -> int:
-    ap = argparse.ArgumentParser(); ap.add_argument("--preview", action="store_true"); ap.add_argument("--no-email", action="store_true"); ap.add_argument("--date")
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--preview", action="store_true")
+    ap.add_argument("--no-email", action="store_true")
+    ap.add_argument("--date")
+    # Pipeline-runner compatibility.  Defaults preserve standalone execution.
+    ap.add_argument("--regulation-input", default=str(REG_FILE))
+    ap.add_argument("--news-input", default=str(NEWS_FILE))
+    ap.add_argument("--output-dir", default=str(OUT_DIR))
+    ap.add_argument("--enforce-step5-history", action="store_true")
     args = ap.parse_args()
+    regulation_input = Path(args.regulation_input)
+    news_input = Path(args.news_input)
+    output_dir = Path(args.output_dir)
     now_text = os.getenv("GTI_NOW", "").strip()
     now = datetime.fromisoformat(now_text) if now_text else datetime.now()
     run_date = args.date or now.strftime("%Y-%m-%d")
-    print("[INFO] GTI STEP5 v44 EVIDENCE-GATED EXECUTIVE ENGINE START")
-    news = read_excel_safe(NEWS_FILE); reg = read_excel_safe(REG_FILE)
-    news, stale = within_24h(news, now)
+    print("[INFO] GTI STEP5 v45.3 UPSTREAM-AUTHORITATIVE ORIGINAL-DATE ENGINE START")
+    news = read_excel_safe(news_input); reg = read_excel_safe(regulation_input)
+    # STEP4-2 has already enforced and audited the report window. Reapplying a
+    # moving 24-hour cutoff here made valid morning results disappear when
+    # STEP5 was rerun later in the day.
+    stale = pd.DataFrame(columns=news.columns)
+    print(f"[STEP5 WINDOW] trust_upstream=Y / news_rows={len(news)} / runtime_refilter=OFF")
     news, rejected = apply_quality_contract(news, include_reference=False)
     reg = normalize_regulation(reg)
     frames = [x for x in (reg, news) if not x.empty]
@@ -295,12 +356,22 @@ def main() -> int:
         rows = rows.sort_values("ExecutiveScore", ascending=False, kind="stable").drop_duplicates("EventKey", keep="first")
         rows = enrich_decision_status(rows)
     old = pd.DataFrame() if args.preview else read_excel_safe(CUM_FILE)
-    rows, historical_removed = remove_history(rows, old)
+    # STEP3-1 and STEP3-2 already own historical novelty. STEP5 must not apply
+    # a second historical gate to their daily outputs, otherwise a polluted or
+    # previously tested mail ledger can turn a valid report into zero rows.
+    if args.enforce_step5_history:
+        rows, historical_removed = remove_history(rows, old, report_date=run_date)
+        print("[STEP5 HISTORY] upstream_authoritative=N / secondary_history_gate=ON")
+    else:
+        historical_removed = 0
+        print("[STEP5 HISTORY] upstream_authoritative=Y / secondary_history_gate=OFF")
     rows = rows.reset_index(drop=True)
+    if not rows.empty:
+        rows["ReportDate"] = run_date
     print(f"[STEP5 CONTRACT] news_input={len(news)+len(rejected)} / selected={len(news)} / rejected={len(rejected)} / stale={len(stale)}")
     print(f"[STEP5 LIVE NOVELTY] removed={historical_removed} / report={len(rows)} / forced_fill=0")
-    OUT_DIR.mkdir(parents=True, exist_ok=True)
-    stem = f"[GTI Radar] Global Trade Intelligence({run_date})"; html_path = OUT_DIR / f"{stem}.html"; xlsx_path = OUT_DIR / f"{stem}.xlsx"
+    output_dir.mkdir(parents=True, exist_ok=True)
+    stem = f"[GTI Radar] Global Trade Intelligence({run_date})"; html_path = output_dir / f"{stem}.html"; xlsx_path = output_dir / f"{stem}.xlsx"
     body = build_html(rows, run_date); html_path.write_text(body, encoding="utf-8"); write_xlsx(xlsx_path, rows)
     if not args.preview:
         cumulative = pd.concat([old, rows], ignore_index=True, sort=False)

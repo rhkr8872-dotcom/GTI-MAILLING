@@ -7,7 +7,7 @@ import re
 from datetime import datetime
 from difflib import SequenceMatcher
 from pathlib import Path
-from urllib.parse import parse_qsl, quote, unquote, urlencode, urlparse, urlunparse
+from urllib.parse import parse_qsl, urlencode, urlparse, urlunparse
 
 import pandas as pd
 
@@ -123,11 +123,7 @@ def norm_url(v) -> str:
         for k, val in parse_qsl(p.query, keep_blank_values=True):
             if k.lower() not in {'utm_source','utm_medium','utm_campaign','utm_term','utm_content','gclid','fbclid'}:
                 keep.append((k,val))
-        # Normalize path spaces, %20 and mixed percent-encoding to one form.
-        # Without this, the same DGFT PDF can be emitted again as a new item.
-        path = quote(unquote(p.path), safe='/@:~!$&\'()*+,;=-._')
-        query = urlencode(sorted(keep), doseq=True)
-        return urlunparse((p.scheme.lower(), p.netloc.lower(), path.rstrip('/'), '', query, ''))
+        return urlunparse((p.scheme.lower(), p.netloc.lower(), p.path.rstrip('/'), '', urlencode(keep), ''))
     except Exception:
         return u.lower()
 
@@ -409,31 +405,13 @@ def canonical_regulation_title(v) -> str:
 
 def regulation_number(v) -> str:
     """관세청고시제2026-50호와 같은 법규번호를 안정적으로 추출한다."""
-    raw = clean(v)
-    # Match a numbered enactment at the beginning of a title or inside an
-    # official parenthetical citation.  The boundary prevents the preceding
-    # regulation title from being swallowed as part of the ministry name.
-    m = re.search(
-        r"(?:^|[\s(（])([가-힣]{2,20}(?:부령|총리령|대통령령|법률))\s*[,，]?\s*제?\s*(\d+)호",
-        raw,
-    )
-    if m:
-        return f"{m.group(1)}제{m.group(2)}호".lower()
-
-    t = re.sub(r"[\s,，()（）·ㆍ]+", "", raw)
+    t = clean(v).replace(" ", "")
     m = re.search(
         r"(관세청(?:고시|공고|훈령|예규)제?20\d{2}[-–]\d+호)",
         t,
     )
     if m:
         return re.sub(r"[-–]", "-", m.group(1)).lower()
-
-    # Ministry ordinances and other numbered enactments often appear in two
-    # official forms: "재정경제부령제49호" and "(재정경제부령, 제49호)".
-    # Treat both as the same legal document across Gazette and law.go.kr.
-    m = re.search(r"^([가-힣]{2,20}(?:부령|총리령|대통령령|법률))제?(\d+)호", t)
-    if m:
-        return f"{m.group(1)}제{m.group(2)}호".lower()
 
     m = re.search(
         r"([가-힣]{2,20}(?:고시|공고|훈령|예규)제?20\d{2}[-–]\d+호)",
@@ -517,9 +495,6 @@ def regulation_event_key(row: pd.Series) -> str:
     bill_no = national_assembly_bill_no(row.get("URL", ""))
     if bill_no:
         return f"bill:{bill_no}"
-    number = regulation_number(row.get("Headline", ""))
-    if number:
-        return f"regno:{number}"
     title_key = canonical_regulation_title(row.get("Headline", ""))
     event_type = regulation_event_type(row.get("Headline", ""))
     dt = pd.to_datetime(row.get("Date", ""), errors="coerce")
@@ -529,9 +504,6 @@ def regulation_event_key(row: pd.Series) -> str:
 
 def cross_source_policy_identity(row: pd.Series) -> str:
     """Stable identity for the same regulation reposted by different official sites."""
-    number = regulation_number(row.get('Headline', ''))
-    if number:
-        return f'regno:{number}'
     title = norm(clean(row.get('Headline', '')))
     if '전략물자수출입고시' in title:
         return 'kr strategic goods export import notice'
@@ -543,25 +515,8 @@ def cross_source_policy_identity(row: pd.Series) -> str:
 def same_day_dedup(df: pd.DataFrame) -> pd.DataFrame:
     if df.empty:
         return df
-    work = df.copy()
-    def source_rank(row):
-        text = (clean(row.get('URL', '')) + ' ' + clean(row.get('Source', ''))).lower()
-        if 'law.go.kr' in text:
-            return 100
-        if 'gwanbo.go.kr' in text:
-            return 90
-        if any(x in text for x in ['customs.go.kr', 'motie.go.kr', 'mofe.go.kr', 'moleg.go.kr']):
-            return 80
-        if 'clhs.co.kr' in text:
-            return 40
-        return 60
-    work['_source_rank'] = work.apply(source_rank, axis=1)
-    work = work.sort_values(['Date','_source_rank','Headline'], ascending=[False,False,True]).copy()
+    work = df.sort_values(['Date','Headline'], ascending=[False,True]).copy()
     work['Headline'] = work['Headline'].apply(clean_gazette_headline)
-    work['AlternateURLs'] = work.get('AlternateURLs', pd.Series('', index=work.index)).fillna('').astype(str)
-    work['AlternateSources'] = work.get('AlternateSources', pd.Series('', index=work.index)).fillna('').astype(str)
-    source_count = work['SourceCount'] if 'SourceCount' in work.columns else pd.Series(1, index=work.index)
-    work['SourceCount'] = pd.to_numeric(source_count, errors='coerce').fillna(1).astype(int)
     keep = []
     for idx, row in work.iterrows():
         day = row['Date'].date() if pd.notna(row['Date']) else None
@@ -587,12 +542,7 @@ def same_day_dedup(df: pd.DataFrame) -> pd.DataFrame:
                 and regulation_event_type(row.get('Headline', '')) == 'OTHER'
                 and regulation_event_type(kr.get('Headline', '')) == 'OTHER'
             )
-            # A unique legal instrument number is stable across official
-            # publication sites and does not require identical title wording.
-            number_a = regulation_number(row.get('Headline', ''))
-            number_b = regulation_number(kr.get('Headline', ''))
-            same_number = bool(number_a and number_a == number_b)
-            if day != kday and not near_day_same_policy and not same_number:
+            if day != kday and not near_day_same_policy:
                 continue
             if near_day_same_policy:
                 dup = True
@@ -606,6 +556,8 @@ def same_day_dedup(df: pd.DataFrame) -> pd.DataFrame:
 
             canonical_a = canonical_regulation_title(row.get('Headline',''))
             canonical_b = canonical_regulation_title(kr.get('Headline',''))
+            number_a = regulation_number(row.get('Headline', ''))
+            number_b = regulation_number(kr.get('Headline', ''))
             if number_a and number_a == number_b:
                 dup = True
                 break
@@ -615,16 +567,9 @@ def same_day_dedup(df: pd.DataFrame) -> pd.DataFrame:
             if title and other and SequenceMatcher(None,title,other).ratio() >= SAME_DAY_SIMILARITY:
                 dup = True
                 break
-        if dup:
-            kept_idx = kidx
-            alt_urls = [x for x in [clean(work.at[kept_idx, 'AlternateURLs']), clean(row.get('URL', ''))] if x]
-            alt_sources = [x for x in [clean(work.at[kept_idx, 'AlternateSources']), clean(row.get('Source', ''))] if x]
-            work.at[kept_idx, 'AlternateURLs'] = ' | '.join(dict.fromkeys(' | '.join(alt_urls).split(' | ')))
-            work.at[kept_idx, 'AlternateSources'] = ' | '.join(dict.fromkeys(' | '.join(alt_sources).split(' | ')))
-            work.at[kept_idx, 'SourceCount'] = int(work.at[kept_idx, 'SourceCount']) + 1
-        else:
+        if not dup:
             keep.append(idx)
-    return work.loc[keep].drop(columns=['_source_rank'], errors='ignore').copy()
+    return work.loc[keep].copy()
 
 
 def cumulative_row_is_valid(row: pd.Series, keywords: list[str]) -> tuple[bool, str]:
@@ -767,7 +712,7 @@ def safe_write(path: Path, df: pd.DataFrame):
         print(f'[WARN] locked: {path.name} -> {alt.name}')
 
 def main():
-    print('GTI v6.0 STEP3-1 REGULATION-NUMBER IDENTITY START')
+    print('GTI v5.9 STEP3-1 CROSS-SOURCE POLICY IDENTITY START')
     if not INPUT_FILE.exists():
         raise FileNotFoundError(INPUT_FILE)
 
@@ -874,13 +819,7 @@ def main():
 
     clean_old, cumulative_removed = clean_cumulative(legacy_cumulative, keywords)
     if len(legacy_cumulative) != len(clean_old):
-        total_delta = max(0, len(legacy_cumulative) - len(clean_old))
-        invalid_removed = len(cumulative_removed)
-        identity_merged = max(0, total_delta - invalid_removed)
-        print(
-            f'[CUMULATIVE CLEAN] {len(legacy_cumulative)} -> {len(clean_old)} '
-            f'/ invalid_removed={invalid_removed} / identity_merged={identity_merged}'
-        )
+        print(f'[CUMULATIVE CLEAN] {len(legacy_cumulative)} -> {len(clean_old)} / removed={len(cumulative_removed)}')
 
     if not sel.empty:
         sel = same_day_dedup(sel)
@@ -938,7 +877,7 @@ def main():
         safe_write(cumulative_removed_path, cumulative_removed)
 
     print(f'[STEP3-1] raw={len(raw)} selected={len(sel)} new={len(today)} excluded={len(exc)} cumulative={len(combined)}')
-    print('GTI v6.0 STEP3-1 REGULATION-NUMBER IDENTITY DONE')
+    print('GTI v5.9 STEP3-1 DONE')
 
 if __name__ == '__main__':
     main()

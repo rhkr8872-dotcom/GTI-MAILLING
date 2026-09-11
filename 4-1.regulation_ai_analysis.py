@@ -179,6 +179,7 @@ for _quality_col in [
     "Top3 Eligible", "Body Verified", "Change Type", "Evidence", "Missing Facts",
     "RegulationMappingType", "MappingStatus", "RequiredMappingKeys", "EntityDirectFlag",
     "SamsungRelevanceScore", "CustomsTradePolicyScore", "DirectImpactScore", "WeightedScore",
+    "DecisionStatus", "PriorityEligible", "Policy Stage", "BillNo", "DocumentIdentity", "EventKey",
 ]:
     if _quality_col not in OUTPUT_COLS:
         OUTPUT_COLS.append(_quality_col)
@@ -957,12 +958,38 @@ def score_row(row):
     direct_score = 100 if ai_impact == "Direct" else 65 if ai_impact == "Indirect" else 35
     samsung_relevance = 100 if mapping_status in {"ENTITY_CONFIRMED", "MAPPED"} else 50
     weighted_score = round(policy_score * 0.4 + direct_score * 0.4 + samsung_relevance * 0.2)
-    top3 = "Y" if body_ok and ai_impact == "Direct" and weighted_score >= 80 else "N"
+    # A verified, high-materiality customs regulation must reach the executive
+    # verification queue even when Samsung entity/product mapping is pending.
+    # This does not relax the Direct gate: Direct still requires evidence-backed
+    # entity/product/route mapping above.
+    high_materiality = body_ok and policy_score >= 85
+    top3 = "Y" if (body_ok and ai_impact == "Direct" and weighted_score >= 80) or high_materiality else "N"
+    if not body_ok:
+        decision_status = "Verification Pending"
+    elif ai_impact == "Direct":
+        decision_status = "Action Required"
+    elif high_materiality:
+        decision_status = "Urgent Verification"
+    else:
+        decision_status = "Monitoring"
+
+    headline_low = headline.lower()
+    proposed = any(x in headline_low for x in [
+        "법률안", "입법예고", "행정예고", "proposal", "proposed", "draft",
+    ])
+    policy_stage = "PROPOSED_OR_MONITORING" if proposed else "ENACTED_OR_EFFECTIVE"
+    bill_no = clean(row.get("BillNo", ""))
+    document_identity = clean(row.get("DocumentIdentity", ""))
+    source_event_key = clean(row.get("EventKey", ""))
+    if document_identity:
+        source_event_key = document_identity.lower()
+    elif bill_no:
+        source_event_key = f"bill:{bill_no.split('.')[0]}"
 
     effective_hint = clean(row.get("effective_date_hint", ""))
     if not any(x in " ".join([clean(row.get("article_body", "")), clean(row.get("regulation_fallback_body", "")), clean(analysis.get("Evidence", ""))]).lower() for x in ["시행", "적용", "발효", "effective", "takes effect", "enters into force"]):
         effective_hint = "본문에서 확인 불가"
-    return {"selected": selected, "RejectReason": "; ".join(rejects), "Issue": issue, "topic": topic, "score": score, "Risk": risk, "URL": url, "Headline": headline, "Date": clean(date_val), "Country": clean(row.get("Country", row.get("country", ""))), "Agency": clean(row.get("Agency", row.get("agency", ""))), "Source": clean(row.get("Source", row.get("source", ""))), "Summary": analysis.get("Summary", ""), "AI Analysis": analysis.get("AI Analysis", ""), "Action Plan": analysis.get("Action Plan", action), "Owner": owner, "KeywordMatches": "; ".join(keyword_hits[:12]), "tariff_rate_hint": extract_tariff_rate(text), "effective_date_hint": effective_hint or "본문에서 확인 불가", "hs_hint": hs_value or "본문에서 확인 불가", "article_extract_status": analysis.get("article_extract_status", ""), "Samsung Impact": ai_impact, "Top3 Eligible": top3, "Body Verified": analysis.get("Body Verified", "N"), "Change Type": analysis.get("Change Type", "기타"), "Evidence": analysis.get("Evidence", ""), "Missing Facts": analysis.get("Missing Facts", ""), "RegulationMappingType": mapping_type, "MappingStatus": mapping_status, "RequiredMappingKeys": clean(row.get("RequiredMappingKeys", "")), "EntityDirectFlag": "Y" if mapping_type == "ENTITY_DIRECT" else "N", "SamsungRelevanceScore": samsung_relevance, "CustomsTradePolicyScore": policy_score, "DirectImpactScore": direct_score, "WeightedScore": weighted_score}
+    return {"selected": selected, "RejectReason": "; ".join(rejects), "Issue": issue, "topic": topic, "score": score, "Risk": risk, "URL": url, "Headline": headline, "Date": clean(date_val), "Country": clean(row.get("Country", row.get("country", ""))), "Agency": clean(row.get("Agency", row.get("agency", ""))), "Source": clean(row.get("Source", row.get("source", ""))), "Summary": analysis.get("Summary", ""), "AI Analysis": analysis.get("AI Analysis", ""), "Action Plan": analysis.get("Action Plan", action), "Owner": owner, "KeywordMatches": "; ".join(keyword_hits[:12]), "tariff_rate_hint": extract_tariff_rate(text), "effective_date_hint": effective_hint or "본문에서 확인 불가", "hs_hint": hs_value or "본문에서 확인 불가", "article_extract_status": analysis.get("article_extract_status", ""), "Samsung Impact": ai_impact, "Top3 Eligible": top3, "PriorityEligible": top3, "DecisionStatus": decision_status, "Policy Stage": policy_stage, "BillNo": bill_no, "DocumentIdentity": document_identity, "EventKey": source_event_key, "Body Verified": analysis.get("Body Verified", "N"), "Change Type": analysis.get("Change Type", "기타"), "Evidence": analysis.get("Evidence", ""), "Missing Facts": analysis.get("Missing Facts", ""), "RegulationMappingType": mapping_type, "MappingStatus": mapping_status, "RequiredMappingKeys": clean(row.get("RequiredMappingKeys", "")), "EntityDirectFlag": "Y" if mapping_type == "ENTITY_DIRECT" else "N", "SamsungRelevanceScore": samsung_relevance, "CustomsTradePolicyScore": policy_score, "DirectImpactScore": direct_score, "WeightedScore": weighted_score}
 
 def read_input():
     input_path = INPUT_FILE if INPUT_FILE.exists() else FALLBACK_INPUT_FILE
@@ -1023,6 +1050,8 @@ def to_output(df, content_type="Regulation"):
             "Priority Group": "CORE" if strategic_priority or int(r["score"])>=85 else "USABLE",
             "Issue": r["Issue"], "Cluster": r["Headline"], "URL": r["URL"], "Source": r["Source"], "Source File": "3-1.regulation_article_summary.xlsx",
             "Top3 Eligible": r.get("Top3 Eligible", "N"), "Body Verified": r.get("Body Verified", "N"), "Change Type": r.get("Change Type", "기타"), "Evidence": r.get("Evidence", ""), "Missing Facts": r.get("Missing Facts", ""),
+            "PriorityEligible": r.get("PriorityEligible", r.get("Top3 Eligible", "N")), "DecisionStatus": r.get("DecisionStatus", "Monitoring"), "Policy Stage": r.get("Policy Stage", ""),
+            "BillNo": r.get("BillNo", ""), "DocumentIdentity": r.get("DocumentIdentity", ""), "EventKey": r.get("EventKey", ""),
             "RegulationMappingType": r.get("RegulationMappingType", ""), "MappingStatus": r.get("MappingStatus", ""), "RequiredMappingKeys": r.get("RequiredMappingKeys", ""), "EntityDirectFlag": r.get("EntityDirectFlag", "N"),
             "SamsungRelevanceScore": r.get("SamsungRelevanceScore", 0), "CustomsTradePolicyScore": r.get("CustomsTradePolicyScore", 0), "DirectImpactScore": r.get("DirectImpactScore", 0), "WeightedScore": r.get("WeightedScore", 0),
             "RejectReason": r.get("RejectReason", ""), "KeywordMatches": r.get("KeywordMatches", ""), "effective_date_hint": r.get("effective_date_hint", "본문에서 확인 불가"), "hs_hint": r.get("hs_hint", "본문에서 확인 불가"), "tariff_rate_hint": r.get("tariff_rate_hint", "본문에서 확인 불가")
@@ -1111,7 +1140,17 @@ def _clean_legacy_cumulative(df):
         r["RequiredMappingKeys"] = required
         r["EntityDirectFlag"] = "Y" if mapping_type == "ENTITY_DIRECT" else "N"
         r["Samsung Impact"] = impact
-        r["Top3 Eligible"] = "Y" if impact == "Direct" and body_ok else "N"
+        policy_score_hint = max(
+            pd.to_numeric(pd.Series([r.get("CustomsTradePolicyScore", 0), r.get("Importance Score", 0)]), errors="coerce").fillna(0)
+        )
+        high_materiality = body_ok and policy_score_hint >= 85
+        r["Top3 Eligible"] = "Y" if (impact == "Direct" and body_ok) or high_materiality else "N"
+        r["PriorityEligible"] = r["Top3 Eligible"]
+        r["DecisionStatus"] = (
+            "Verification Pending" if not body_ok else
+            "Action Required" if impact == "Direct" else
+            "Urgent Verification" if high_materiality else "Monitoring"
+        )
         r["SamsungRelevanceScore"] = 100 if impact == "Direct" else 50
         r["DirectImpactScore"] = 100 if impact == "Direct" else 35
         score_value = pd.to_numeric(
@@ -1132,8 +1171,14 @@ def _clean_legacy_cumulative(df):
         cleaned["Date"], errors="coerce", format="mixed"
     ).dt.strftime("%Y-%m-%d").fillna("")
     cleaned["_title_key"] = cleaned["Headline"].fillna("").astype(str).str.lower().str.replace(r"\s+", " ", regex=True).str.strip()
-    cleaned = cleaned.drop_duplicates(["_title_key", "_date_key"], keep="last")
-    return normalize_cum_cols(cleaned.drop(columns=["_title_key", "_date_key"], errors="ignore"))
+    identity = cleaned.get("DocumentIdentity", pd.Series("", index=cleaned.index)).fillna("").astype(str).str.lower().str.strip()
+    event_key = cleaned.get("EventKey", pd.Series("", index=cleaned.index)).fillna("").astype(str).str.lower().str.strip()
+    url_key = cleaned["URL"].fillna("").astype(str).str.lower().str.strip()
+    cleaned["_document_key"] = identity.where(identity.ne(""), event_key.where(event_key.ne(""), url_key))
+    fallback_key = cleaned["_title_key"] + "|" + cleaned["_date_key"]
+    cleaned["_document_key"] = cleaned["_document_key"].where(cleaned["_document_key"].ne(""), fallback_key)
+    cleaned = cleaned.drop_duplicates(["_document_key"], keep="last")
+    return normalize_cum_cols(cleaned.drop(columns=["_title_key", "_date_key", "_document_key"], errors="ignore"))
 
 def merge_cumulative(daily):
     global CUMULATIVE_REMOVED_DF
@@ -1215,6 +1260,11 @@ def _is_bad_cached_analysis(item: dict, headline: str) -> bool:
     if status and not status.startswith("GEMINI_OK"):
         # v5 fallback cache. Re-analyze when possible.
         return True
+    if clean(item.get("Body Verified", "N")).upper() != "Y" and any(
+        x in status for x in ["FETCH_FAILED", "BODY_TOO_SHORT", "INVALID_GAZETTE_SHELL", "NO_INPUT_BODY"]
+    ):
+        # A newly available official alternate URL must get another chance.
+        return True
     return False
 
 def _extract_terms_for_analysis(text: str) -> dict:
@@ -1254,6 +1304,44 @@ def _is_navigation_or_gazette_shell(text: str) -> bool:
         sum(m in t for m in markers) >= 3
         and not any(m in t for m in legal_markers)
     )
+
+
+def _official_url_candidates(row: pd.Series, primary_url: str) -> list[str]:
+    """Return primary + cross-source official URLs without duplicating them."""
+    values = [primary_url, clean(row.get("original_url", "")), clean(row.get("AlternateURLs", ""))]
+    candidates: list[str] = []
+    for value in values:
+        if not value:
+            continue
+        found = re.findall(r"https?://[^\s|;,]+", value)
+        if not found and value.startswith("http"):
+            found = [value]
+        for candidate in found:
+            candidate = candidate.strip().rstrip(").]")
+            if candidate and candidate not in candidates:
+                candidates.append(candidate)
+    return candidates
+
+
+def _fetch_official_body_with_fallback(row: pd.Series, primary_url: str) -> tuple[str, str, str]:
+    """Try every official source and retain the best non-navigation legal body."""
+    best_body, best_status, best_url, best_score = "", "NO_OFFICIAL_BODY", primary_url, -1
+    legal_markers = [
+        "부칙", "시행", "적용", "별표", "세율", "관세", "원산지", "품목번호",
+        "반덤핑", "상계관세", "effective", "tariff", "customs", "article",
+    ]
+    for candidate in _official_url_candidates(row, primary_url):
+        body, status = fetch_article_body_for_ai(candidate)
+        if not body or _is_navigation_or_gazette_shell(body):
+            continue
+        marker_score = sum(m in body.lower() for m in legal_markers)
+        score = min(len(body), ARTICLE_MAX_CHARS) + marker_score * 500
+        if len(body) >= 80 and score > best_score:
+            best_body, best_status, best_url, best_score = body, status, candidate, score
+    if best_body:
+        source_kind = "PRIMARY" if safe_url(best_url) == safe_url(primary_url) else "ALTERNATE"
+        return best_body, f"{source_kind}_OFFICIAL:{best_status}", best_url
+    return "", best_status, best_url
 
 def _fallback_gti_analysis_from_body(*, body: str, headline: str, issue: str, impact: str, products_text: str, default_action: str, content_type: str) -> dict:
     summary = _simple_body_summary(body, headline)
@@ -1359,7 +1447,9 @@ def build_gti_ai_analysis(row: pd.Series, *, headline: str, url: str, issue: str
     """v6 override: Gemini first; ignore stale fallback cache; useful fallback if Gemini unavailable."""
     body, status = _fallback_source_body(row, headline)
     if not body:
-        body, status = fetch_article_body_for_ai(url)
+        body, status, evidence_url = _fetch_official_body_with_fallback(row, url)
+    else:
+        evidence_url = url
 
     if _is_navigation_or_gazette_shell(body):
         body = ""
@@ -1411,6 +1501,7 @@ Direct 판정 조건:
 - Samsung Impact: {impact}
 - Affected Products: {products_text}
 - URL: {url}
+- Evidence URL: {evidence_url}
 - Headline: {headline}
 - Default Action Hint: {default_action}
 
@@ -1719,7 +1810,7 @@ def _gti_step4_extractor_log_once():
 # ======================================================================
 
 def main():
-    print("GTI STEP4-1 REGULATION AI v8.5 TRADE-REMEDY COVERAGE START")
+    print("GTI STEP4-1 REGULATION AI v8.7 OFFICIAL-ALTERNATE BODY FALLBACK START")
     print(f"[MODEL] {GEMINI_MODEL}")
     _gti_step4_gemini_log_once()
     _gti_step4_extractor_log_once()
