@@ -7,7 +7,7 @@ from urllib.parse import urlparse
 import pandas as pd
 
 
-VERSION = "2026.09.12-gold3"
+VERSION = "2026.09.13-gold4"
 
 
 def _s(value) -> str:
@@ -79,12 +79,14 @@ def official_source(row: pd.Series) -> bool:
 
 def classify_nature(row: pd.Series) -> str:
     t, x = _title(row), _native(row)
-    if _has(t, "대학생의 시각", "경진대회", "시상식", "포토", "기념"):
+    if _has(t, "대학생의 시각", "경진대회", "시상식", "포토", "기념", "설명회", "세미나", "대응전략 제시", "전방위 지원"):
         return "EVENT"
     if _has(t, "추석", "명절", "24시간 통관", "관세환급 특별 지원", "성수품"):
         return "ADMIN_SUPPORT"
-    if _has(t, "집행유예", "포탈", "탈루", "탈세 적발", "특별수사단", "특수단", "피하려", "초과 물량", "evading", "accused"):
+    if _has(t, "집행유예", "포탈", "탈루", "탈세 적발", "특별수사단", "특수단", "통관번호 도용", "적발액", "피하려", "초과 물량", "evading", "accused"):
         return "ENFORCEMENT_CASE"
+    if _has(t, "kepco", "한국전력", "전기요금", "전기 요금", "power bills", "power bill"):
+        return "NON_CUSTOMS_BUSINESS"
     if _has(t, "수입콩", "국산콩", "두부공장", "두부 못", "원료 절벽", "재고 한계"):
         return "FOOD_SUPPLY"
     if _has(t, "신용등급", "실적", "영업이익", "배당", "주가", "급락", "급등", "earnings", "credit rating"):
@@ -93,6 +95,10 @@ def classify_nature(row: pd.Series) -> str:
         return "CORPORATE_RESPONSE"
     if _has(t, "차업계", "車업계", "자동차", "중국차", "하이브리드", "드론", "ai칩 지정학", "무역 적자", "잔디밭", "청소로봇"):
         return "INDUSTRY_ANALYSIS"
+    if _has(t, "보호무역 상시화", "공급망 다변화 기회", "대응전략"):
+        return "BACKGROUND_ANALYSIS"
+    if _has(t, "브릭스", "brics") and not _has(t, "부과", "시행", "발효", "조사 개시", "예비판정", "최종판정"):
+        return "GEOPOLITICAL_COMMENTARY"
     concrete = _has(x, "시행", "발효", "부과", "관세율", "고시", "circular no.", "effective", "entered into force")
     proposal = _has(x, "검토", "압박", "예고", "추진", "가능성", "proposal", "consider", "would impose")
     if concrete:
@@ -117,6 +123,12 @@ def event_key(row: pd.Series) -> str:
         return "US_CN_30BN_TARIFF_NEGOTIATION"
     if _has(t, "공시송달") and _has(t, "관세", "관세법", "유니패스"):
         return "KR_CUSTOMS_E_SERVICE_BILL_2026"
+    if _has(t, "코트라", "kotra") and _has(t, "관세", "통상", "인증") and _has(t, "설명회", "대응전략", "지원"):
+        return "KR_KOTRA_TRADE_COMPLIANCE_BRIEFING_202609"
+    if _has(t, "대미 투자", "대미투자") and _has(t, "최종 조율", "합의 근접", "1호 프로젝트"):
+        return "KR_US_INVESTMENT_NEGOTIATION_202609"
+    if _has(t, "브릭스", "brics") and _has(t, "뉴델리", "중동", "탈달러", "반미"):
+        return "BRICS_NEW_DELHI_DECLARATION_202609"
     rules = (
         ("CN_JP_DICHLOROSILANE_AD_2026", ("디클로로실란", "반도체 가스", "반도체 핵심소재"), ("반덤핑", "보증금", "99.2%", "99.2％"), ("중국", "china")),
         ("VN_IN_CERAMIC_TILE_AD_2026", ("세라믹 타일", "ceramic tile"), ("반덤핑", "anti-dumping"), ("인도", "india")),
@@ -148,6 +160,27 @@ def policy_family(row: pd.Series) -> str:
     if _has(x, "반덤핑", "anti-dumping", "countervailing"): return "TRADE_REMEDY"
     if _has(x, "관세", "tariff"): return "TARIFF"
     return "OTHER"
+
+
+def customs_policy_central(row: pd.Series) -> bool:
+    """Require customs policy to be the article event, not incidental background."""
+    t, x = _title(row), _native(row)
+    title_signal = _has(
+        t, "관세", "통관", "세관", "원산지", "fta", "반덤핑", "상계관세",
+        "수출통제", "제재 명단", "cbam", "tariff", "customs", "duty", "duties",
+        "trade remedy", "export control", "rules of origin", "무역위 판정", "무역위원회 판정",
+    )
+    action_signal = _has(
+        x, "부과", "인하", "인상", "면제", "폐지", "발효", "시행", "개정", "고시",
+        "조사 개시", "예비판정", "최종판정", "종료재심", "가격약속", "수입금지",
+        "impose", "reduce", "increase", "exempt", "entered into force", "effective",
+        "amended", "investigation initiated", "preliminary determination", "final determination",
+    )
+    authority_signal = _has(
+        x, "관세청", "세관", "무역위원회", "상무부", "재무부", "국회", "정부",
+        "customs authority", "commission", "department of commerce", "ministry", "parliament",
+    )
+    return title_signal and action_signal and authority_signal
 
 
 @dataclass(frozen=True)
@@ -190,9 +223,9 @@ def decide(row: pd.Series) -> Decision:
 
     # Gold-labelled business-scope exclusions. These are content categories,
     # not publisher/title blacklists used to force a quota.
-    if nature in {"EVENT", "ADMIN_SUPPORT", "ENFORCEMENT_CASE", "FOOD_SUPPLY", "MARKET_COMPANY"}:
+    if nature in {"ADMIN_SUPPORT", "ENFORCEMENT_CASE", "FOOD_SUPPLY", "MARKET_COMPANY", "NON_CUSTOMS_BUSINESS"}:
         return Decision(nature, "EXCLUDE", f"{nature}: 임원 정책센싱 대상 아님", 0, False)
-    if nature in {"CORPORATE_RESPONSE", "INDUSTRY_ANALYSIS"}:
+    if nature in {"EVENT", "CORPORATE_RESPONSE", "INDUSTRY_ANALYSIS", "BACKGROUND_ANALYSIS", "GEOPOLITICAL_COMMENTARY"}:
         return Decision(nature, "REFERENCE", f"{nature}: 신규 정책조치가 아니라 배경자료", 25, False)
     if _has(t, "spanish agri", "bangladesh resolves"):
         return Decision(nature, "REFERENCE", "삼성전자 품목·경로 연결이 없는 타 산업 동향", 20, False)
@@ -205,11 +238,12 @@ def decide(row: pd.Series) -> Decision:
         return Decision(nature, "WATCH", "한국 적용조건 확인이 필요한 관세협상 후속 신호", 67, False)
     if event_key(row) == "US_GOOGLE_301_RETALIATION":
         return Decision("POLICY_PROPOSAL", "REFERENCE", "보복 가능성 보도이며 확정된 통상조치가 아님", 30, False)
-    if proposed and samsung and customs:
+    central = customs_policy_central(row)
+    if proposed and samsung and customs and central:
         return Decision(nature, "PRIORITY_WATCH", "삼성 명시 정책제안: 발효 전 모니터링", 75, False)
-    if operative and customs:
+    if operative and customs and central:
         return Decision(nature, "PRIORITY_WATCH" if official_source(row) else "WATCH", "구체 정책조치 확인", 72 if official_source(row) else 62, direct)
-    if proposed and customs:
+    if proposed and customs and central:
         return Decision(nature, "WATCH", "정책 제안·협상 단계", 55, False)
     return Decision(nature, "REFERENCE", "구체 정책조치·삼성 연결 근거 부족", 20, False)
 

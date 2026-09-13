@@ -587,6 +587,11 @@ HARD_SCOPE_EXCLUDE_TITLE_TERMS = [
     # 기술탈취·영업비밀·형사사건: 기술보호/법무 영역
     "기술 탈취", "기술탈취", "기술 유출", "산업기술 유출", "영업비밀", "폭탄 증언",
     "trade secret theft", "technology theft", "industrial espionage",
+    # 관세와 무관한 기업 재무·공공요금 이슈. 본문에 과거 tariff 표현이
+    # 있어도 Customs AI 검토 슬롯을 소비하지 않도록 제목 단계에서 차단.
+    "kepco", "한국전력", "전기요금", "전기 요금", "power bills", "power bill",
+    # 통관정책 변경이 아닌 개인통관번호 도용 통계·사건
+    "통관번호 도용", "개인통관고유부호 도용",
 ]
 
 MACRO_NOISE_TITLE_TERMS = [

@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-GTI STEP4-2 NEWS AI v46.0 GLOBAL-POLICY-COVERAGE ENGINE
+GTI STEP4-2 NEWS AI v46.1 CUSTOMS-CENTRALITY ENGINE
 - Input: 3-2.news_summary.xlsx
 - Strict published-date 24h guard
 - No legacy v18/v20/v23/v24 override chain
@@ -1254,7 +1254,7 @@ def build() -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
     # Final selection is fail-closed. STEP4's article-native verification gates
     # and the shared deterministic contract must both pass. A row rejected as
     # non-policy or non-relevant cannot be resurrected by a looser keyword hit.
-    selected, deterministic_rejected = apply_quality_contract(audit, include_reference=False)
+    selected, deterministic_rejected = apply_quality_contract(audit, include_reference=True)
     selected = selected[
         selected["Body Verified"].eq("Y")
         & ~selected["_EventOnly"].fillna(False)
@@ -1571,11 +1571,11 @@ def safe_write(path: Path, df: pd.DataFrame) -> None:
 
 
 def main() -> int:
-    log("GTI STEP4-2 NEWS AI v46.0 GLOBAL-POLICY-COVERAGE ENGINE START")
+    log("GTI STEP4-2 NEWS AI v46.1 CUSTOMS-CENTRALITY ENGINE START")
     log(f"MODEL={GEMINI_MODEL} / Gemini={'Y' if USE_GEMINI else 'N'} / 24h / max={TARGET_MAX}")
     daily, audit, excluded = build()
     before_contract = len(daily)
-    daily, contract_rejected = apply_quality_contract(daily, include_reference=False)
+    daily, contract_rejected = apply_quality_contract(daily, include_reference=True)
     if not contract_rejected.empty:
         contract_rejected = contract_rejected.copy()
         contract_rejected["RejectReason"] = "GOLD_CONTRACT:" + contract_rejected["ContractReason"].astype(str)
