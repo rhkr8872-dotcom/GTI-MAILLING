@@ -19,7 +19,7 @@ import urllib.request
 import urllib.error
 from pathlib import Path
 from datetime import datetime
-from urllib.parse import quote, unquote, urlparse
+from urllib.parse import quote, unquote, urlparse, urljoin
 
 import pandas as pd
 
@@ -1323,6 +1323,36 @@ def _official_url_candidates(row: pd.Series, primary_url: str) -> list[str]:
     return candidates
 
 
+def _discover_official_document_links(page_url: str) -> list[str]:
+    """Discover linked legal documents (PDF/HWP/statute/detail) on an official page."""
+    try:
+        raw, content_type, fetch_status = _fetch_url_bytes(page_url)
+        if not raw or not str(fetch_status).startswith("FETCH_OK"):
+            return []
+        html_text = _decode_bytes(raw, content_type)
+    except Exception:
+        return []
+    try:
+        from bs4 import BeautifulSoup
+        hrefs = [a.get("href", "") for a in BeautifulSoup(html_text, "html.parser").find_all("a")]
+    except Exception:
+        hrefs = re.findall(r'''href=["']([^"']+)["']''', html_text, flags=re.I)
+    discovered: list[str] = []
+    for href in hrefs:
+        absolute = urljoin(page_url, clean(href))
+        low = absolute.lower()
+        if not absolute.startswith(("http://", "https://")):
+            continue
+        if not any(token in low for token in (
+            ".pdf", ".hwp", ".hwpx", "download", "attach", "lsinfop.do",
+            "detailrp", "gwanbo", "law.go.kr/lsw", "filedown", "filedownload",
+        )):
+            continue
+        if absolute not in discovered:
+            discovered.append(absolute)
+    return discovered[:20]
+
+
 def _fetch_official_body_with_fallback(row: pd.Series, primary_url: str) -> tuple[str, str, str]:
     """Try every official source and retain the best non-navigation legal body."""
     best_body, best_status, best_url, best_score = "", "NO_OFFICIAL_BODY", primary_url, -1
@@ -1330,7 +1360,13 @@ def _fetch_official_body_with_fallback(row: pd.Series, primary_url: str) -> tupl
         "부칙", "시행", "적용", "별표", "세율", "관세", "원산지", "품목번호",
         "반덤핑", "상계관세", "effective", "tariff", "customs", "article",
     ]
-    for candidate in _official_url_candidates(row, primary_url):
+    base_candidates = _official_url_candidates(row, primary_url)
+    candidates = list(base_candidates)
+    for page_url in base_candidates:
+        for linked in _discover_official_document_links(page_url):
+            if linked not in candidates:
+                candidates.append(linked)
+    for candidate in candidates:
         body, status = fetch_article_body_for_ai(candidate)
         if not body or _is_navigation_or_gazette_shell(body):
             continue
@@ -1810,7 +1846,7 @@ def _gti_step4_extractor_log_once():
 # ======================================================================
 
 def main():
-    print("GTI STEP4-1 REGULATION AI v8.7 OFFICIAL-ALTERNATE BODY FALLBACK START")
+    print("GTI STEP4-1 REGULATION AI v8.8 OFFICIAL-LINKED-DOCUMENT FALLBACK START")
     print(f"[MODEL] {GEMINI_MODEL}")
     _gti_step4_gemini_log_once()
     _gti_step4_extractor_log_once()

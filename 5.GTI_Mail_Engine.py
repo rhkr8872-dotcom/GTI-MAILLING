@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""GTI STEP5 v45.3 upstream-authoritative evidence-gated report engine.
+"""GTI STEP5 v46.0 upstream-authoritative evidence-gated report engine.
 
 One preparation path, one quality contract, one send path.  --preview and
 --no-email never mutate cumulative history.
@@ -32,7 +32,7 @@ SMTP_HOST = os.getenv("GTI_SMTP_HOST", "smtp.naver.com")
 SMTP_PORT = int(os.getenv("GTI_SMTP_PORT", "465"))
 SMTP_USER = os.getenv("GTI_SMTP_USER", "kch8872@naver.com").strip()
 SMTP_PASS = (os.getenv("GTI_SMTP_PASS") or os.getenv("GTI_MAIL_PW") or "").strip()
-ENGINE_VERSION = "v45.3"
+ENGINE_VERSION = "v46.0"
 
 
 def s(v) -> str:
@@ -118,13 +118,15 @@ def normalize_regulation(df: pd.DataFrame) -> pd.DataFrame:
     out.loc[verified & score.ge(85), "ExecutiveTier"] = "PRIORITY_WATCH"
     out["Original Publish Date"] = out["Date"].map(publication_date)
     out["EventKey"] = out.apply(regulation_event_key, axis=1)
-    out["ContractReason"] = "공식 원문 검증 완료: 적용범위·시행일 및 삼성 거래 매핑 확인"
+    out["ContractReason"] = "공식 법규 본문 확인: 삼성 품목·법인·거래 매핑은 별도 확인 필요"
     out.loc[~verified, "ContractReason"] = "공식 게시물이나 원문 본문 미확인: 확인 완료 전 경영진 우선정책 승격 금지"
     out["SamsungDirectFlag"] = "N"
     out["DirectConfirmedFlag"] = "N"
     out["OfficialSourceFlag"] = "Y"
     out["VerificationStatus"] = verified.map({True: "VERIFIED", False: "PENDING"})
-    out["DecisionStatus"] = verified.map({True: "Urgent Verification", False: "Verification Pending"})
+    out["DecisionStatus"] = "Monitoring"
+    out.loc[~verified, "DecisionStatus"] = "Verification Pending"
+    out.loc[verified & score.ge(85), "DecisionStatus"] = "Urgent Verification"
     out["PriorityEligible"] = (verified & score.ge(85)).map({True: "Y", False: "N"})
     return out
 
@@ -149,6 +151,14 @@ def enrich_decision_status(rows: pd.DataFrame) -> pd.DataFrame:
     news = out.get("Content Type", pd.Series("", index=out.index)).astype(str).str.lower().eq("news")
     direct = direct_confirmed_mask(out)
     proposed = out.get("Policy Stage", pd.Series("", index=out.index)).astype(str).str.upper().eq("PROPOSED_OR_MONITORING")
+    commentary_stage = out.get("Policy Stage", pd.Series("", index=out.index)).astype(str).str.upper().isin(
+        ["COMMENTARY_OR_OUTLOOK", "COMMENTARY", "OUTLOOK", "ANALYSIS"]
+    )
+    title = out.get("Headline", pd.Series("", index=out.index)).astype(str).str.lower()
+    commentary_title = title.str.contains(
+        r"전망|관측|퇴임해도|포럼|기고|칼럼|오피니언|전문가|could|may|outlook|forum|opinion",
+        regex=True, na=False,
+    )
     verified = out["VerificationStatus"].eq("VERIFIED")
     score = pd.to_numeric(out.get("ExecutiveScore", 0), errors="coerce").fillna(0)
     priority_signal = out.get("ExecutiveTier", pd.Series("", index=out.index)).isin(["EXECUTIVE", "PRIORITY_WATCH"])
@@ -157,7 +167,22 @@ def enrich_decision_status(rows: pd.DataFrame) -> pd.DataFrame:
     out.loc[news & verified & ~proposed & priority_signal & ~direct, "DecisionStatus"] = "Urgent Verification"
     out.loc[direct, "DecisionStatus"] = "Action Required"
     out.loc[news & verified & (direct | priority_signal) & score.ge(70), "PriorityEligible"] = "Y"
+    # 전망·포럼·논평은 정책 존재의 증거가 아니다. 구체 정책변경이 이미
+    # 확인되었더라도 경영진 Action Queue가 아니라 모니터링에 둔다.
+    commentary = news & (commentary_stage | commentary_title) & ~direct
+    out.loc[commentary, "DecisionStatus"] = "Monitoring"
+    out.loc[commentary, "PriorityEligible"] = "N"
     return out
+
+
+def evidence_grade(row: pd.Series) -> str:
+    """Separate official legal evidence from a verified media article body."""
+    verified = s(row.get("VerificationStatus")).upper() == "VERIFIED" or s(row.get("Body Verified")).upper() == "Y"
+    if not verified:
+        return "확인 필요"
+    if s(row.get("OfficialSourceFlag")).upper() == "Y" or s(row.get("Content Type")).lower() == "regulation":
+        return "공식 근거 확인"
+    return "기사 본문 확인"
 
 
 def select_priority(rows: pd.DataFrame, limit: int = 3) -> pd.DataFrame:
@@ -257,7 +282,7 @@ def build_html(rows: pd.DataFrame, run_date: str) -> str:
         rendered = []
         for _, r in frame.iterrows():
             original_date = row_publication_date(r)
-            rendered.append(f"<tr><td>{esc(r.get('DecisionStatus'))}</td><td>{esc(original_date)}</td><td><a href='{esc(r.get('URL'))}'>{esc(r.get('Headline'))}</a></td><td>{esc(r.get('Country'))}</td><td>{esc(r.get('ContractReason'))}</td></tr>")
+            rendered.append(f"<tr><td>{esc(r.get('DecisionStatus'))}</td><td>{esc(original_date)}</td><td><a href='{esc(r.get('URL'))}'>{esc(r.get('Headline'))}</a></td><td>{esc(r.get('Country'))}</td><td>{esc(evidence_grade(r))}</td><td>{esc(r.get('ContractReason'))}</td></tr>")
         return "".join(rendered)
 
     verified = rows[rows.get("VerificationStatus", pd.Series("PENDING", index=rows.index)).eq("VERIFIED")]
@@ -274,8 +299,8 @@ def build_html(rows: pd.DataFrame, run_date: str) -> str:
     <section class='section'><h2>1. 오늘의 관세정책 센싱</h2><p class='lead'><b>{esc(executive_sentence(rows))}</b></p>
     <span class='metric'>보고 {len(rows)}건</span><span class='metric'>Action Required {direct_n}건</span><span class='metric'>Urgent Verification {urgent_n}건</span><span class='metric'>Scenario {scenario_n}건</span><span class='metric'>Monitoring {monitoring_n}건</span><span class='metric'>Verification Pending {pending_n}건</span></section>
     <section class='section'><h2>2. Samsung Customs Action Queue</h2>{''.join(cards)}</section>
-    <section class='section verified'><h2>3. 원문 검증 완료 ({len(verified)}건)</h2><table><tr><th>상태</th><th>원본 게시일자</th><th>정책 신호</th><th>국가</th><th>선정 근거</th></tr>{table_rows(verified)}</table></section>
-    <section class='section pending'><h2>4. 원문 확인 필요 ({len(pending)}건)</h2><table><tr><th>상태</th><th>원본 게시일자</th><th>정책 신호</th><th>국가</th><th>확인 사유</th></tr>{table_rows(pending)}</table></section>
+    <section class='section verified'><h2>3. 본문 확인 정책 후보 ({len(verified)}건)</h2><table><tr><th>상태</th><th>원본 게시일자</th><th>정책 신호</th><th>국가</th><th>증거 등급</th><th>선정 근거</th></tr>{table_rows(verified)}</table></section>
+    <section class='section pending'><h2>4. 원문 확인 필요 ({len(pending)}건)</h2><table><tr><th>상태</th><th>원본 게시일자</th><th>정책 신호</th><th>국가</th><th>증거 등급</th><th>확인 사유</th></tr>{table_rows(pending)}</table></section>
     <section class='section'><small>정책 존재는 기사 원문·공식출처로만 판정하며 AI 분석문은 증거로 사용하지 않습니다. Engine {ENGINE_VERSION} · Contract {CONTRACT_VERSION}</small></section></body></html>"""
 
 
@@ -341,7 +366,7 @@ def main() -> int:
     now_text = os.getenv("GTI_NOW", "").strip()
     now = datetime.fromisoformat(now_text) if now_text else datetime.now()
     run_date = args.date or now.strftime("%Y-%m-%d")
-    print("[INFO] GTI STEP5 v45.3 UPSTREAM-AUTHORITATIVE ORIGINAL-DATE ENGINE START")
+    print("[INFO] GTI STEP5 v46.0 EVIDENCE-GRADE ORIGINAL-DATE ENGINE START")
     news = read_excel_safe(news_input); reg = read_excel_safe(regulation_input)
     # STEP4-2 has already enforced and audited the report window. Reapplying a
     # moving 24-hour cutoff here made valid morning results disappear when

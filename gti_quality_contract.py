@@ -7,7 +7,7 @@ from urllib.parse import urlparse
 import pandas as pd
 
 
-VERSION = "2026.09.07-gold1"
+VERSION = "2026.09.12-gold3"
 
 
 def _s(value) -> str:
@@ -32,6 +32,37 @@ def _has(text: str, *terms: str) -> bool:
     return any(t.lower() in text for t in terms)
 
 
+def _yn(value) -> bool:
+    return _s(value).upper() in {"Y", "YES", "TRUE", "1"}
+
+
+def _first(row: pd.Series, *columns: str) -> str:
+    for column in columns:
+        value = _s(row.get(column))
+        if value:
+            return value
+    return ""
+
+
+def explicit_quality_reject(row: pd.Series) -> str:
+    """Honor STEP4's article-native gates when those columns are present.
+
+    STEP4 already verifies the article body and policy-event status.  Re-running
+    a looser keyword classifier must never resurrect a row that failed those
+    gates.  Older fixtures without these columns remain classifiable.
+    """
+    quality = _first(row, "Quality Contract", "QualityContract")
+    if quality and quality.upper() != "STRICT_PASS":
+        return f"QUALITY_CONTRACT={quality}"
+    if "Policy Event" in row.index and not _yn(row.get("Policy Event")):
+        return "POLICY_EVENT=N"
+    if "AIRelevant" in row.index and not _yn(row.get("AIRelevant")):
+        return "AI_RELEVANT=N"
+    if "Body Verified" in row.index and not _yn(row.get("Body Verified")):
+        return "BODY_VERIFIED=N"
+    return ""
+
+
 def official_source(row: pd.Series) -> bool:
     url = _s(row.get("URL"))
     host = urlparse(url).netloc.lower().split(":")[0]
@@ -52,11 +83,15 @@ def classify_nature(row: pd.Series) -> str:
         return "EVENT"
     if _has(t, "추석", "명절", "24시간 통관", "관세환급 특별 지원", "성수품"):
         return "ADMIN_SUPPORT"
-    if _has(t, "집행유예", "포탈", "탈루", "피하려", "초과 물량", "evading", "accused"):
+    if _has(t, "집행유예", "포탈", "탈루", "탈세 적발", "특별수사단", "특수단", "피하려", "초과 물량", "evading", "accused"):
         return "ENFORCEMENT_CASE"
+    if _has(t, "수입콩", "국산콩", "두부공장", "두부 못", "원료 절벽", "재고 한계"):
+        return "FOOD_SUPPLY"
+    if _has(t, "신용등급", "실적", "영업이익", "배당", "주가", "급락", "급등", "earnings", "credit rating"):
+        return "MARKET_COMPANY"
     if _has(t, "공장 건설", "첫삽", "합작제철소", "조달", "고려아연", "제련", "도시광산", "정유사", "현대제철", "포스코"):
         return "CORPORATE_RESPONSE"
-    if _has(t, "차업계", "車업계", "자동차", "중국차", "하이브리드", "드론", "ai칩 지정학", "무역 적자"):
+    if _has(t, "차업계", "車업계", "자동차", "중국차", "하이브리드", "드론", "ai칩 지정학", "무역 적자", "잔디밭", "청소로봇"):
         return "INDUSTRY_ANALYSIS"
     concrete = _has(x, "시행", "발효", "부과", "관세율", "고시", "circular no.", "effective", "entered into force")
     proposal = _has(x, "검토", "압박", "예고", "추진", "가능성", "proposal", "consider", "would impose")
@@ -76,7 +111,16 @@ def event_key(row: pd.Series) -> str:
         return "US_JP_15PCT_TARIFF_CAP_KR"
     if _has(t, "반도체 표적 관세"):
         return "US_SEMICON_TARGET_TARIFF_LOCAL_PRODUCTION"
+    if _has(t, "300억달러", "30 billion") and (
+        _has(t, "미중", "u.s.-china", "us-china") or ("中" in _s(row.get("Headline")) and "美" in _s(row.get("Headline")))
+    ):
+        return "US_CN_30BN_TARIFF_NEGOTIATION"
+    if _has(t, "공시송달") and _has(t, "관세", "관세법", "유니패스"):
+        return "KR_CUSTOMS_E_SERVICE_BILL_2026"
     rules = (
+        ("CN_JP_DICHLOROSILANE_AD_2026", ("디클로로실란", "반도체 가스", "반도체 핵심소재"), ("반덤핑", "보증금", "99.2%", "99.2％"), ("중국", "china")),
+        ("VN_IN_CERAMIC_TILE_AD_2026", ("세라믹 타일", "ceramic tile"), ("반덤핑", "anti-dumping"), ("인도", "india")),
+        ("KR_CN_HGI_GI_AD_GAP_2026", ("hgi", "gi", "용융아연도금"), ("반덤핑", "관세"), ("중국", "china")),
         ("VN_SMART_BORDER_CUSTOMS_128_2026", ("smart border", "스마트 국경"), ("128/2026", "october 15", "10월 15")),
         ("US_JP_15PCT_TARIFF_CAP_KR", ("15%", "15％"), ("일본", "japan"), ("한국", "korea")),
         ("US_SEMICON_TARGET_TARIFF_LOCAL_PRODUCTION", ("반도체",), ("관세", "tariff"), ("미국", "트럼프", "us ")),
@@ -119,15 +163,34 @@ def decide(row: pd.Series) -> Decision:
     t, x = _title(row), _native(row)
     nature = classify_nature(row)
     family = policy_family(row)
+    hard_reject = explicit_quality_reject(row)
+    if hard_reject:
+        return Decision(nature, "EXCLUDE", hard_reject, 0, False)
+
     samsung = _has(x, "삼성전자", "samsung electronics", "삼전", "samsung semiconductor")
     customs = family != "OTHER"
     operative = nature == "POLICY_MEASURE"
     proposed = nature == "POLICY_PROPOSAL"
-    direct = bool(samsung and customs and operative and _has(x, "제품", "반도체", "수출", "수입", "생산"))
+    official_evidence = official_source(row) or bool(_first(row, "Official Evidence", "OfficialEvidence"))
+    direct_evidence = bool(_first(row, "Direct Evidence", "DirectEvidence", "Evidence"))
+    mapping_evidence = bool(_first(row, "MappingEvidence", "Mapping Evidence"))
+    mapping_status = _first(row, "MappingStatus", "Mapping Status").upper()
+    mapping_ok = mapping_evidence and mapping_status not in {"", "MAPPING_REQUIRED", "POLICY_REVIEW", "UNMAPPED"}
+    direct = bool(
+        samsung
+        and customs
+        and operative
+        and _first(row, "Samsung Impact", "SamsungImpact").upper() == "DIRECT"
+        and _first(row, "Policy Stage", "PolicyStage").upper() == "OPERATIVE"
+        and _yn(row.get("Top3 Eligible"))
+        and official_evidence
+        and direct_evidence
+        and mapping_ok
+    )
 
     # Gold-labelled business-scope exclusions. These are content categories,
     # not publisher/title blacklists used to force a quota.
-    if nature in {"EVENT", "ADMIN_SUPPORT", "ENFORCEMENT_CASE"}:
+    if nature in {"EVENT", "ADMIN_SUPPORT", "ENFORCEMENT_CASE", "FOOD_SUPPLY", "MARKET_COMPANY"}:
         return Decision(nature, "EXCLUDE", f"{nature}: 임원 정책센싱 대상 아님", 0, False)
     if nature in {"CORPORATE_RESPONSE", "INDUSTRY_ANALYSIS"}:
         return Decision(nature, "REFERENCE", f"{nature}: 신규 정책조치가 아니라 배경자료", 25, False)
@@ -166,6 +229,7 @@ def apply_quality_contract(df: pd.DataFrame, include_reference: bool = False) ->
     out["EventKey"] = [event_key(r) for _, r in out.iterrows()]
     out["OfficialSourceFlag"] = ["Y" if official_source(r) else "N" for _, r in out.iterrows()]
     out["SamsungDirectFlag"] = ["Y" if d.direct else "N" for d in decisions]
+    out["DirectConfirmedFlag"] = out["SamsungDirectFlag"]
     keep = {"EXECUTIVE", "PRIORITY_WATCH", "WATCH"}
     if include_reference:
         keep.add("REFERENCE")
@@ -174,5 +238,14 @@ def apply_quality_contract(df: pd.DataFrame, include_reference: bool = False) ->
     tier_rank = {"EXECUTIVE": 0, "PRIORITY_WATCH": 1, "WATCH": 2, "REFERENCE": 3}
     accepted["_tier_rank"] = accepted["ExecutiveTier"].map(tier_rank).fillna(9)
     accepted = accepted.sort_values(["_tier_rank", "ExecutiveScore"], ascending=[True, False], kind="stable")
-    accepted = accepted.drop_duplicates("EventKey", keep="first").drop(columns="_tier_rank").reset_index(drop=True)
+    duplicate_mask = accepted.duplicated("EventKey", keep="first")
+    if duplicate_mask.any():
+        duplicates = accepted.loc[duplicate_mask].drop(columns="_tier_rank").copy()
+        duplicates["ExecutiveTier"] = "EXCLUDE"
+        duplicates["ContractReason"] = "DUPLICATE_POLICY_EVENT=" + duplicates["EventKey"].astype(str)
+        duplicates["ExecutiveScore"] = 0
+        duplicates["SamsungDirectFlag"] = "N"
+        duplicates["DirectConfirmedFlag"] = "N"
+        rejected = pd.concat([rejected, duplicates], ignore_index=True, sort=False)
+    accepted = accepted.loc[~duplicate_mask].drop(columns="_tier_rank").reset_index(drop=True)
     return accepted, rejected.reset_index(drop=True)

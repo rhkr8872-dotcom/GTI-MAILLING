@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-GTI STEP4-2 NEWS AI v43 GOLD-CONTRACT SELECTION ENGINE
+GTI STEP4-2 NEWS AI v46.0 GLOBAL-POLICY-COVERAGE ENGINE
 - Input: 3-2.news_summary.xlsx
 - Strict published-date 24h guard
 - No legacy v18/v20/v23/v24 override chain
@@ -46,6 +46,7 @@ AI_REVIEW_MAX = int(os.getenv("GTI_STEP4_AI_REVIEW_MAX", "120"))
 REPORT_TARGET = int(os.getenv("GTI_STEP4_NEWS_REPORT_TARGET", "30"))  # 품질 통과 건수의 상한, 강제 충원 목표가 아님
 WATCH_MIN_RELEVANCE = int(os.getenv("GTI_STEP4_WATCH_MIN_RELEVANCE", "3"))
 AI_TARIFF_QUOTA = int(os.getenv("GTI_STEP4_AI_TARIFF_QUOTA", "60"))
+AI_POLICY_COVERAGE_QUOTA = int(os.getenv("GTI_STEP4_AI_POLICY_COVERAGE_QUOTA", "60"))
 GEMINI_MODEL = os.getenv("GTI_GEMINI_MODEL", "gemini-2.5-flash-lite").strip()
 GEMINI_TIMEOUT = int(os.getenv("GTI_GEMINI_TIMEOUT", "20"))
 GEMINI_API_KEY = (
@@ -598,7 +599,7 @@ def load_input() -> pd.DataFrame:
         "Source": ["Source", "source"],
         "Publisher": ["Publisher", "publisher", "Agency", "agency"],
         "Issue": ["IssueKey", "Issue", "issue_type", "topic"],
-        "Gate": ["CandidateGate", "Gate", "priority_group"],
+        "Gate": ["CandidateGate", "Gate", "priority_group", "Tier", "Priority Group"],
         "Score": ["FinalScore", "final_score", "RuleScore", "score"],
         "Cluster": ["EventKey", "Cluster", "cluster_key"],
     }
@@ -608,7 +609,11 @@ def load_input() -> pd.DataFrame:
         out[target] = raw[c] if c else ""
 
     # audit fields if available
-    for c in ["InputKeyword", "InputFile", "GateReason", "URLStatus"]:
+    for c in [
+        "InputKeyword", "InputFile", "GateReason", "URLStatus", "Country", "Agency",
+        "OriginalURLVerified", "URLQuality", "TitleKeywordFlag", "CustomsGateFlag",
+        "RegulationRelated", "SourceScoreReason", "ClusterSize", "ClusterSources",
+    ]:
         src = pick_col(raw, [c])
         out[c] = raw[src] if src else ""
 
@@ -647,12 +652,100 @@ def pre_score(row: pd.Series) -> int:
     s = base + ISSUE_WEIGHT.get(issue, 5)
     if gate == "CORE":
         s += 10
+    elif gate == "USABLE":
+        s += 5
     if any(x in text for x in SAMSUNG_TERMS):
         s += 10
     d = domain(row.get("URL", ""))
     if any(x in d for x in [".gov", ".go.kr", "europa.eu", "wto.org", "ustr.gov", "cbp.gov", "usitc.gov"]):
         s += 6
+    if clean(row.get("OriginalURLVerified")).upper() == "Y":
+        s += 7
+    if clean(row.get("URLQuality")).upper() == "ORIGINAL_VERIFIED":
+        s += 4
+    if concrete_policy_delta(text):
+        s += 12
     return min(150, s)
+
+
+def policy_coverage_score(row: pd.Series) -> int:
+    """Rank globally material policy instruments before Samsung-keyword bias."""
+    text = " ".join([
+        clean(row.get("Headline")), clean(row.get("Summary")), clean(row.get("Issue")),
+        clean(row.get("Country")), clean(row.get("Agency")),
+    ]).lower()
+    issue = clean(row.get("Issue")).upper()
+    score = 0
+    if issue in {"AD_CVD", "EXPORT_CONTROL", "ORIGIN_FTA", "HS_CLASSIFICATION", "CBAM_CARBON"}:
+        score += 35
+    elif issue in {"TARIFF", "CUSTOMS"}:
+        score += 25
+    if concrete_policy_delta(text):
+        score += 30
+    if clean(row.get("OriginalURLVerified")).upper() == "Y":
+        score += 18
+    if domain(row.get("URL", "")).endswith((".gov", ".gov.uk", ".go.kr")) or any(
+        x in domain(row.get("URL", "")) for x in ["europa.eu", "wto.org", "ustr.gov", "cbp.gov", "usitc.gov"]
+    ):
+        score += 18
+    if any(x in text for x in [
+        "fta", "free trade agreement", "자유무역협정", "public procurement", "공공조달",
+        "반덤핑", "anti-dumping", "상계관세", "countervailing", "수출통제", "export control",
+        "관세법", "customs law", "조사 개시", "예비판정", "최종판정",
+    ]):
+        score += 20
+    # Sunset/review votes that keep an AD/CVD order in force are a concrete
+    # policy delta even when a media headline omits the word "order".
+    if re.search(r"\b(?:itc|usitc)\b.*\b(?:votes?|determines?)\b.*\b(?:dut(?:y|ies)|orders?)\b", text):
+        score += 35
+    if business_scope_noise(row.get("Headline"), row.get("Summary")) or opinion_article(row.get("Headline")):
+        score -= 50
+    return score
+
+
+def build_diverse_review_pool(fresh: pd.DataFrame) -> pd.DataFrame:
+    """Reserve AI capacity by policy family so global measures are not crowded out."""
+    work = fresh.copy()
+    work["PolicyCoverageScore"] = work.apply(policy_coverage_score, axis=1)
+    selected_indices: list[int] = []
+
+    family_quota = max(4, AI_POLICY_COVERAGE_QUOTA // 7)
+    family_order = [
+        "AD_CVD", "EXPORT_CONTROL", "ORIGIN_FTA", "CUSTOMS",
+        "HS_CLASSIFICATION", "CBAM_CARBON", "TARIFF",
+    ]
+    for family in family_order:
+        candidates = work[work["Issue"].astype(str).str.upper().eq(family)].sort_values(
+            ["PolicyCoverageScore", "PreScore", "Date"], ascending=[False, False, False], kind="stable"
+        )
+        for idx in candidates.head(family_quota).index:
+            if idx not in selected_indices:
+                selected_indices.append(idx)
+
+    coverage = work.sort_values(
+        ["PolicyCoverageScore", "PreScore", "Date"], ascending=[False, False, False], kind="stable"
+    )
+    for idx in coverage.index:
+        if len(selected_indices) >= min(AI_POLICY_COVERAGE_QUOTA, AI_REVIEW_MAX):
+            break
+        if idx not in selected_indices and work.at[idx, "PolicyCoverageScore"] >= 35:
+            selected_indices.append(idx)
+
+    remaining_capacity = max(0, AI_REVIEW_MAX - len(selected_indices))
+    remaining = work.loc[~work.index.isin(selected_indices)]
+    tariff = remaining[remaining["Issue"].astype(str).str.upper().eq("TARIFF")].head(
+        min(AI_TARIFF_QUOTA, remaining_capacity)
+    )
+    selected_indices.extend(idx for idx in tariff.index if idx not in selected_indices)
+    remaining_capacity = max(0, AI_REVIEW_MAX - len(selected_indices))
+    for idx in work.loc[~work.index.isin(selected_indices)].sort_values(
+        ["PreScore", "Date"], ascending=[False, False], kind="stable"
+    ).head(remaining_capacity).index:
+        selected_indices.append(idx)
+
+    return work.loc[selected_indices].sort_values(
+        ["PolicyCoverageScore", "PreScore", "Date"], ascending=[False, False, False], kind="stable"
+    )
 
 
 def gemini_json(prompt: str) -> dict:
@@ -1068,19 +1161,12 @@ def build() -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
     # AI 비용을 쓰기 전에 동일 사건을 대표기사 하나로 압축한다.
     fresh, pre_ai_duplicates = pre_ai_event_dedup(fresh)
 
-    # 한 개의 대형 관세사건이 AI 120건을 잠식하지 않도록 관세 일반기사에
-    # 상한을 두고 AD/CVD·FTA/원산지·통관·수출통제·CBAM·HS를 확보한다.
-    issue_series = fresh.get("Issue", pd.Series(index=fresh.index, dtype=str)).fillna("").astype(str).str.upper()
-    tariff_mask = issue_series.eq("TARIFF")
-    tariff_part = fresh.loc[tariff_mask].head(min(AI_TARIFF_QUOTA, AI_REVIEW_MAX))
-    other_part = fresh.loc[~tariff_mask].head(max(0, AI_REVIEW_MAX - len(tariff_part)))
-    review = pd.concat([tariff_part, other_part], axis=0).drop_duplicates().copy()
-    if len(review) < AI_REVIEW_MAX:
-        review = pd.concat([review, fresh.loc[~fresh.index.isin(review.index)]], axis=0).head(AI_REVIEW_MAX)
-    review = review.sort_values(["PreScore", "Date"], ascending=[False, False], kind="stable")
+    # 글로벌 공식정책과 7개 정책축을 먼저 확보하고 남은 용량을 점수순으로 채운다.
+    review = build_diverse_review_pool(fresh)
     tail = fresh.loc[~fresh.index.isin(review.index)].copy()
     review_issue = review.get("Issue", pd.Series(index=review.index, dtype=str)).fillna("").astype(str).str.upper()
-    log(f"AI REVIEW DIVERSITY: total={len(review)} / tariff={int(review_issue.eq('TARIFF').sum())} / other={int((~review_issue.eq('TARIFF')).sum())}")
+    coverage_n = int(pd.to_numeric(review.get("PolicyCoverageScore", 0), errors="coerce").fillna(0).ge(35).sum())
+    log(f"AI REVIEW POLICY COVERAGE: total={len(review)} / coverage={coverage_n} / tariff={int(review_issue.eq('TARIFF').sum())} / other={int((~review_issue.eq('TARIFF')).sum())}")
     if not tail.empty:
         tail["RejectReason"] = "OUTSIDE_AI_REVIEW_POOL"
 
@@ -1315,7 +1401,9 @@ def build() -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
             text = _post_text(row)
             title_noise = [
                 "으뜸이", "할랄시장 잡아라", "금리 압박", "수출액 늘었다고 경쟁력",
-                "인사 발령", "임원 인사", "수상자", "포상",
+                "인사 발령", "임원 인사", "수상자", "포상", "신용등급", "배당",
+                "영업익", "주택주", "동반 약세", "잔디밭", "청소로봇",
+                "tariffs can't fund", "job losses", "trade-offs facing",
             ]
             if any(term in title for term in title_noise):
                 return True
@@ -1336,6 +1424,12 @@ def build() -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
                 "official notice", "entered into force", "effective from",
             ])
             if enforcement_case and not policy_change:
+                return True
+            individual_case = any(term in title for term in [
+                "추가 납부 의무", "과거 수입 관세 오류", "벌금 부과", "소송 패소",
+                "세액 추징", "additional payment", "past import tariff error",
+            ])
+            if individual_case and not concrete_policy_delta(article_text):
                 return True
             if ("fta" in title or "자유무역협정" in title) and not any(term in text for term in [
                 "서명", "발효", "타결", "개정", "업그레이드", "upgrade", "협상 개시",
@@ -1477,7 +1571,7 @@ def safe_write(path: Path, df: pd.DataFrame) -> None:
 
 
 def main() -> int:
-    log("GTI STEP4-2 NEWS AI v45.0 EVENT-FAMILY POLICY-DELTA ENGINE START")
+    log("GTI STEP4-2 NEWS AI v46.0 GLOBAL-POLICY-COVERAGE ENGINE START")
     log(f"MODEL={GEMINI_MODEL} / Gemini={'Y' if USE_GEMINI else 'N'} / 24h / max={TARGET_MAX}")
     daily, audit, excluded = build()
     before_contract = len(daily)
