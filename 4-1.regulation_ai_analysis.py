@@ -22,6 +22,7 @@ from datetime import datetime
 from urllib.parse import quote, unquote, urlparse, urljoin
 
 import pandas as pd
+from gti_action_queue_contract import apply_action_queue_contract
 
 BASE_DIR = Path(os.getenv("GTI_BASE_DIR", r"C:\Temp"))
 INPUT_FILE = BASE_DIR / "3-1.regulation_article_summary.xlsx"
@@ -1855,7 +1856,7 @@ def main():
     log(f"keyword guardrail loaded: {len(KEYWORD_TERMS)} terms")
     df=read_input()
     selected, excluded_raw, audit_raw=build(df)
-    daily=to_output(selected)
+    daily=apply_action_queue_contract(to_output(selected))
     excluded=to_output(excluded_raw)
     cumulative=merge_cumulative(daily)
     write_excel(daily, OUT_SUMMARY); write_excel(cumulative, OUT_CUMULATIVE); write_excel(excluded, OUT_EXCLUDED)

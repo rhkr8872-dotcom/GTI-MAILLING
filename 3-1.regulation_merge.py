@@ -139,11 +139,41 @@ def national_assembly_bill_no(value) -> str:
     return match.group(1) if match else ""
 
 
+def dgft_document_identity(row: pd.Series) -> str:
+    """Stable DGFT identity independent of spaces, %20 and mirror URLs.
+
+    DGFT often publishes the same PDF with a literal-space URL on one run and
+    a percent-encoded URL on another.  Prefer the trade-notice/public-notice-
+    notice number; fall back to the notice number plus publication year.
+    """
+    text = " ".join([
+        clean(row.get("Headline", "")), clean(row.get("URL", "")),
+        clean(row.get("Agency", "")), clean(row.get("Source", "")),
+    ])
+    low = unquote(text).lower()
+    if "dgft" not in low and "directorate general of foreign trade" not in low:
+        return ""
+    full = re.search(r"\b(\d{1,4})\s*/\s*(20\d{2})\s*[-–]\s*(\d{1,4})\b", low)
+    if full:
+        return f"DGFT:NOTICE:{full.group(1)}/{full.group(2)}-{full.group(3)}"
+    notice = re.search(
+        r"\b(?:tn|trade\s*notice|pn|public\s*notice|notification)\s*(?:no\.?\s*)?(\d{1,4})\b",
+        low,
+    )
+    year = re.search(r"\b(20\d{2})\b", low)
+    if notice and year:
+        return f"DGFT:NOTICE:{notice.group(1)}:{year.group(1)}"
+    return ""
+
+
 def document_identity(row: pd.Series) -> str:
     """Return a document-level id; equal bill titles are not equal bills."""
     bill_no = national_assembly_bill_no(row.get("URL", ""))
     if bill_no:
         return f"BILL:{bill_no}"
+    dgft_id = dgft_document_identity(row)
+    if dgft_id:
+        return dgft_id
     number = regulation_number(row.get("Headline", ""))
     if number:
         return f"REGNO:{number}"
@@ -462,6 +492,9 @@ def legal_fingerprint(row: pd.Series) -> str:
     bill_no = national_assembly_bill_no(row.get('URL', ''))
     if bill_no:
         return f'bill:{bill_no}'
+    dgft_id = dgft_document_identity(row)
+    if dgft_id:
+        return dgft_id.lower()
     return (
         regulation_number(row.get('Headline', ''))
         or canonical_regulation_title(row.get('Headline', ''))
@@ -517,6 +550,9 @@ def regulation_event_key(row: pd.Series) -> str:
     bill_no = national_assembly_bill_no(row.get("URL", ""))
     if bill_no:
         return f"bill:{bill_no}"
+    dgft_id = dgft_document_identity(row)
+    if dgft_id:
+        return dgft_id.lower()
     number = regulation_number(row.get("Headline", ""))
     if number:
         return f"regno:{number}"
@@ -529,6 +565,9 @@ def regulation_event_key(row: pd.Series) -> str:
 
 def cross_source_policy_identity(row: pd.Series) -> str:
     """Stable identity for the same regulation reposted by different official sites."""
+    dgft_id = dgft_document_identity(row)
+    if dgft_id:
+        return dgft_id.lower()
     number = regulation_number(row.get('Headline', ''))
     if number:
         return f'regno:{number}'
@@ -767,7 +806,7 @@ def safe_write(path: Path, df: pd.DataFrame):
         print(f'[WARN] locked: {path.name} -> {alt.name}')
 
 def main():
-    print('GTI v6.0 STEP3-1 REGULATION-NUMBER IDENTITY START')
+    print('GTI v6.1 STEP3-1 DGFT-STABLE IDENTITY START')
     if not INPUT_FILE.exists():
         raise FileNotFoundError(INPUT_FILE)
 
@@ -938,7 +977,7 @@ def main():
         safe_write(cumulative_removed_path, cumulative_removed)
 
     print(f'[STEP3-1] raw={len(raw)} selected={len(sel)} new={len(today)} excluded={len(exc)} cumulative={len(combined)}')
-    print('GTI v6.0 STEP3-1 REGULATION-NUMBER IDENTITY DONE')
+    print('GTI v6.1 STEP3-1 DGFT-STABLE IDENTITY DONE')
 
 if __name__ == '__main__':
     main()

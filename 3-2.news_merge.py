@@ -2001,6 +2001,70 @@ def dedup_news(df: pd.DataFrame) -> pd.DataFrame:
     log(f"뉴스 중복 제거: {before - len(result)}")
     return result
 
+def canonical_event_signature(row: pd.Series) -> str:
+    """Cross-publisher event identity: actor/target + instrument + product.
+
+    This intentionally ignores publisher wording and percentage formatting.
+    It only returns a key when at least three anchors are present, preventing
+    broad items such as 'global tariffs' from collapsing unrelated events.
+    """
+    text = " ".join([
+        clean(row.get("Headline", "")), clean(row.get("Summary", "")),
+        clean(row.get("Description", "")), clean(row.get("Country", "")),
+    ]).lower()
+    country_groups = {
+        "US": ["미국", "美", "u.s.", "united states", "usa"],
+        "CN": ["중국", "中", "china", "chinese"],
+        "EU": ["유럽연합", "eu", "european union"],
+        "IN": ["인도", "india"], "VN": ["베트남", "vietnam"],
+        "KR": ["한국", "대한민국", "korea"],
+        "CA": ["캐나다", "canada"], "IE": ["아일랜드", "ireland", "irish"],
+        "MX": ["멕시코", "mexico"], "ID": ["인도네시아", "indonesia"],
+        "LA": ["라오스", "laos"],
+    }
+    instrument_groups = {
+        "AD": ["반덤핑", "anti-dumping", "antidumping"],
+        "CVD": ["상계관세", "countervailing"],
+        "SG": ["세이프가드", "safeguard"],
+        "S232": ["section 232", "232조", "무역확장법 232"],
+        "S301": ["section 301", "301조"],
+        "EXPORT_CONTROL": ["수출통제", "export control", "entity list"],
+        "ORIGIN": ["원산지", "rules of origin", "certificate of origin", "coo"],
+        "CUSTOMS": ["통관", "세관", "customs", "de minimis"],
+        "TARIFF": ["관세", "tariff", "duty"],
+    }
+    product_groups = {
+        "SEMICON": ["반도체", "semiconductor", "chip", "h200"],
+        "SOLAR": ["태양광", "solar cell", "solar cells", "photovoltaic"],
+        "STEEL": ["철강", "h형강", "특수강", "steel"],
+        "AUTO": ["자동차", "vehicle", "car"],
+        "DRONE": ["드론", "drone", "uas"],
+        "WHISKEY": ["위스키", "whiskey", "whisky"],
+        "CHEMICAL": ["화학", "chemical", "폴리실리콘", "polysilicon"],
+        "LOW_VALUE": ["저가소포", "저가 수입", "low-value", "de minimis"],
+    }
+    countries = sorted(k for k, terms in country_groups.items() if any(x in text for x in terms))
+    if re.search(r"\bus\b", text) and "US" not in countries:
+        countries.append("US")
+        countries.sort()
+    instrument = next((k for k, terms in instrument_groups.items() if any(x in text for x in terms)), "")
+    product = next((k for k, terms in product_groups.items() if any(x in text for x in terms)), "")
+    action = ""
+    action_groups = {
+        "INIT": ["조사 개시", "investigation initiated", "initiation"],
+        "PRELIM": ["예비판정", "preliminary determination"],
+        "FINAL": ["최종판정", "final determination"],
+        "IMPOSE": ["부과", "impose", "levy"],
+        "LIFT": ["철회", "폐지", "제거", "lift", "remove", "eliminate"],
+        "AMEND": ["개정", "변경", "amend", "change"],
+        "PROPOSE": ["제안", "검토", "계획", "propose", "consider", "plan"],
+    }
+    action = next((k for k, terms in action_groups.items() if any(x in text for x in terms)), "")
+    if countries and instrument and product:
+        return f"event|{'+'.join(countries)}|{instrument}|{product}|{action or 'SIGNAL'}".lower()
+    return ""
+
+
 def make_issue_cluster_key(row: pd.Series) -> str:
     """
     v5.3 event cluster:
@@ -2008,6 +2072,9 @@ def make_issue_cluster_key(row: pd.Series) -> str:
     Avoids collapsing unrelated tariff stories into one global cluster.
     """
     issue = clean(row.get("IssueKey", "")) or "TRADE_GENERAL"
+    canonical = canonical_event_signature(row)
+    if canonical:
+        return canonical
     text = f"{analysis_text(row)} {clean(row.get('Country', ''))}".lower()
     title_text = clean(row.get("Headline", "")).lower()
 
@@ -2913,7 +2980,7 @@ def main() -> None:
     global MIN_SCORE
     MIN_SCORE = args.min_score
 
-    log("GTI v5.11 STEP3-2 POLICY-EVENT KEY + ZERO-YIELD URL BYPASS START")
+    log("GTI v5.12 STEP3-2 CANONICAL EVENT IDENTITY START")
 
     keywords = load_keywords()
     validate_required_news_inputs(INPUT_FILES)
@@ -2988,7 +3055,7 @@ def main() -> None:
     write_excel(args.output, final_df, "news_summary")
     write_excel(args.cumulative, cumulative_df, "news_cumulative")
 
-    log(f"GTI v5.11 STEP3-2 COMPLETE: candidates={len(final_df)} / cumulative={len(cumulative_df)}")
+    log(f"GTI v5.12 STEP3-2 COMPLETE: candidates={len(final_df)} / cumulative={len(cumulative_df)}")
     log(f"SAVE: {args.output}")
     log(f"SAVE: {args.cumulative}")
 

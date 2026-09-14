@@ -20,6 +20,7 @@ from pathlib import Path
 import pandas as pd
 
 from gti_quality_contract import apply_quality_contract, VERSION as CONTRACT_VERSION
+from gti_action_queue_contract import apply_action_queue_contract, VERSION as ACTION_CONTRACT_VERSION
 
 
 BASE = Path(os.getenv("GTI_BASE_DIR", r"C:\Temp"))
@@ -32,7 +33,7 @@ SMTP_HOST = os.getenv("GTI_SMTP_HOST", "smtp.naver.com")
 SMTP_PORT = int(os.getenv("GTI_SMTP_PORT", "465"))
 SMTP_USER = os.getenv("GTI_SMTP_USER", "kch8872@naver.com").strip()
 SMTP_PASS = (os.getenv("GTI_SMTP_PASS") or os.getenv("GTI_MAIL_PW") or "").strip()
-ENGINE_VERSION = "v46.1"
+ENGINE_VERSION = "v48.0"
 
 
 def s(v) -> str:
@@ -177,7 +178,9 @@ def enrich_decision_status(rows: pd.DataFrame) -> pd.DataFrame:
     out.loc[reference, "ReportLayer"] = "REFERENCE"
     out.loc[reference, "DecisionStatus"] = "Monitoring"
     out.loc[reference, "PriorityEligible"] = "N"
-    return out
+    # Final fail-closed enforcement. STEP5 must never resurrect a row that did
+    # not pass the Samsung transaction gate in STEP4.
+    return apply_action_queue_contract(out)
 
 
 def evidence_grade(row: pd.Series) -> str:
@@ -193,8 +196,11 @@ def evidence_grade(row: pd.Series) -> str:
 def select_priority(rows: pd.DataFrame, limit: int = 3) -> pd.DataFrame:
     if rows.empty:
         return rows.copy()
-    eligible = rows[rows.get("PriorityEligible", pd.Series("N", index=rows.index)).astype(str).str.upper().eq("Y")].copy()
-    rank = {"Action Required": 0, "Urgent Verification": 1, "Scenario Analysis": 2, "Monitoring": 3}
+    eligible = rows[
+        rows.get("ActionQueueEligible", pd.Series("N", index=rows.index))
+        .astype(str).str.upper().eq("Y")
+    ].copy()
+    rank = {"Action Required": 0, "Operational Alert": 1, "Scenario Analysis": 2}
     eligible["_decision_rank"] = eligible.get("DecisionStatus", "Monitoring").map(rank).fillna(9)
     eligible = eligible.sort_values(["_decision_rank", "ExecutiveScore"], ascending=[True, False], kind="stable")
     return eligible.head(limit).drop(columns="_decision_rank")
@@ -269,9 +275,7 @@ def action_text(row: pd.Series) -> str:
     if s(row.get("ReportLayer")) == "REFERENCE":
         return "참고 동향으로 관리하고 구체적인 정부 조치가 발표될 때 정책 후보로 재평가"
     action = s(row.get("Action Plan"))
-    if not s(row.get("MappedHS")) and not s(row.get("TradeRoute")):
-        return "공식 정책원문, 대상 품목·HS, 시행일과 삼성 거래경로를 확인한 후 비용 영향을 산출"
-    return action or "원문·적용범위·시행일을 확인하고 관련 법인 영향도를 재판정"
+    return action or "공식 적용범위와 삼성 법인·품목·거래경로를 대조하고 담당자·기한이 포함된 실행조치를 확정"
 
 
 def esc(v) -> str:
@@ -279,6 +283,7 @@ def esc(v) -> str:
 
 
 def build_html(rows: pd.DataFrame, run_date: str) -> str:
+    rows = rows[rows.get("ReportLayer", pd.Series("POLICY_RADAR", index=rows.index)).ne("EXCLUDED")].copy()
     reference_mask = rows.get("ReportLayer", pd.Series("POLICY_RADAR", index=rows.index)).eq("REFERENCE")
     policy = rows[~reference_mask]
     reference = rows[reference_mask]
@@ -299,7 +304,7 @@ def build_html(rows: pd.DataFrame, run_date: str) -> str:
         <p><b>지시사항</b> {esc(action_text(r))}</p>
         <p class='meta'><b>원본 게시일자</b> {esc(row_publication_date(r))} · <b>최초 감지일</b> {esc(r.get('First Detected Date') or run_date)} · {esc(r.get('Detection Type'))} · {esc(r.get('Country'))} · {esc(r.get('Agency') or r.get('Source'))} · <a href='{esc(r.get('URL'))}'>원문</a></p></div>""")
     if not cards:
-        cards.append("<div class='empty'><b>신규 Action Queue 없음</b><br>Direct 확정 또는 원문 검증을 통과한 우선 검토대상이 없습니다.</div>")
+        cards.append("<div class='empty'><b>신규 Action Queue 없음</b><br>신규 정책·공식 문서·삼성 거래 연결·실행조치의 네 관문을 모두 통과한 건이 없습니다.</div>")
 
     def table_rows(frame: pd.DataFrame) -> str:
         rendered = []
@@ -326,10 +331,10 @@ def build_html(rows: pd.DataFrame, run_date: str) -> str:
     <section class='section verified'><h2>3. 본문 확인 정책 후보 ({len(verified)}건)</h2><table><tr><th>상태</th><th>원본 게시일자</th><th>최초 감지일</th><th>감지유형</th><th>정책 신호</th><th>국가</th><th>증거 등급</th><th>선정 근거</th></tr>{table_rows(verified)}</table></section>
     <section class='section pending'><h2>4. 원문 확인 필요 ({len(pending)}건)</h2><table><tr><th>상태</th><th>원본 게시일자</th><th>최초 감지일</th><th>감지유형</th><th>정책 신호</th><th>국가</th><th>증거 등급</th><th>확인 사유</th></tr>{table_rows(pending)}</table></section>
     <section class='section'><h2>5. Global Context Radar ({len(reference)}건)</h2><table><tr><th>구분</th><th>원본 게시일자</th><th>최초 감지일</th><th>감지유형</th><th>참고 동향</th><th>국가</th><th>증거 등급</th><th>분류 사유</th></tr>{table_rows(reference)}</table></section>
-    <section class='section'><small>정책 존재는 기사 원문·공식출처로만 판정하며 AI 분석문은 증거로 사용하지 않습니다. Engine {ENGINE_VERSION} · Contract {CONTRACT_VERSION}</small></section></body></html>"""
+    <section class='section'><small>정책 존재는 기사 원문·공식출처로만 판정하며 AI 분석문은 증거로 사용하지 않습니다. Action Queue는 신규 정책·공식 문서·삼성 거래 연결·실행조치를 모두 확인한 건만 표시합니다. Engine {ENGINE_VERSION} · Contract {CONTRACT_VERSION} · Action Contract {ACTION_CONTRACT_VERSION}</small></section></body></html>"""
 
 
-def write_xlsx(path: Path, rows: pd.DataFrame) -> None:
+def write_xlsx(path: Path, rows: pd.DataFrame, excluded_rows: pd.DataFrame | None = None) -> None:
     top3 = select_priority(rows, 3)
     reference_mask = rows.get("ReportLayer", pd.Series("POLICY_RADAR", index=rows.index)).eq("REFERENCE")
     policy_rows = rows[~reference_mask]
@@ -338,6 +343,8 @@ def write_xlsx(path: Path, rows: pd.DataFrame) -> None:
         policy_rows.to_excel(writer, sheet_name="Executive Radar", index=False)
         top3.to_excel(writer, sheet_name="Priority Watch Top3", index=False)
         reference_rows.to_excel(writer, sheet_name="Global Context", index=False)
+        if excluded_rows is not None and not excluded_rows.empty:
+            excluded_rows.to_excel(writer, sheet_name="Excluded", index=False)
         if rows.empty:
             pd.DataFrame({"Message": ["금일 신규 핵심정책 없음"]}).to_excel(writer, sheet_name="Run Summary", index=False)
         else:
@@ -395,7 +402,7 @@ def main() -> int:
     now_text = os.getenv("GTI_NOW", "").strip()
     now = datetime.fromisoformat(now_text) if now_text else datetime.now()
     run_date = args.date or now.strftime("%Y-%m-%d")
-    print("[INFO] GTI STEP5 v46.1 POLICY-LAYER EVIDENCE ENGINE START")
+    print(f"[INFO] GTI STEP5 {ENGINE_VERSION} SAMSUNG-ACTION-QUEUE CONTRACT START")
     news = read_excel_safe(news_input); reg = read_excel_safe(regulation_input)
     # STEP4-2 has already enforced and audited the report window. Reapplying a
     # moving 24-hour cutoff here made valid morning results disappear when
@@ -406,9 +413,15 @@ def main() -> int:
     reg = normalize_regulation(reg)
     frames = [x for x in (reg, news) if not x.empty]
     rows = pd.concat(frames, ignore_index=True, sort=False) if frames else pd.DataFrame()
+    excluded_admin = pd.DataFrame()
     if not rows.empty:
         rows = rows.sort_values("ExecutiveScore", ascending=False, kind="stable").drop_duplicates("EventKey", keep="first")
         rows = enrich_decision_status(rows)
+        excluded_mask = rows.get("ReportLayer", pd.Series("", index=rows.index)).eq("EXCLUDED")
+        if excluded_mask.any():
+            excluded_admin = rows[excluded_mask].copy()
+            print(f"[STEP5 ACTION CONTRACT] administrative_excluded={len(excluded_admin)}")
+            rows = rows[~excluded_mask].copy()
     old = pd.DataFrame() if args.preview else read_excel_safe(CUM_FILE)
     # STEP3-1 and STEP3-2 already own historical novelty. STEP5 must not apply
     # a second historical gate to their daily outputs, otherwise a polluted or
@@ -432,7 +445,7 @@ def main() -> int:
     print(f"[STEP5 LIVE NOVELTY] removed={historical_removed} / report={len(rows)} / forced_fill=0")
     output_dir.mkdir(parents=True, exist_ok=True)
     stem = f"[GTI Radar] Global Trade Intelligence({run_date})"; html_path = output_dir / f"{stem}.html"; xlsx_path = output_dir / f"{stem}.xlsx"
-    body = build_html(rows, run_date); html_path.write_text(body, encoding="utf-8"); write_xlsx(xlsx_path, rows)
+    body = build_html(rows, run_date); html_path.write_text(body, encoding="utf-8"); write_xlsx(xlsx_path, rows, excluded_admin)
     if not args.preview:
         cumulative = pd.concat([old, rows], ignore_index=True, sort=False)
         if not cumulative.empty: cumulative = cumulative.drop_duplicates(["EventKey"], keep="last")

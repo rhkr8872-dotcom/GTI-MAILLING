@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-GTI STEP4-2 NEWS AI v46.1 CUSTOMS-CENTRALITY ENGINE
+GTI STEP4-2 NEWS AI v47.0 THREE-GATE POLICY ENGINE
 - Input: 3-2.news_summary.xlsx
 - Strict published-date 24h guard
 - No legacy v18/v20/v23/v24 override chain
@@ -15,6 +15,7 @@ from pathlib import Path
 from datetime import datetime
 from urllib.parse import urlparse
 import pandas as pd
+from gti_action_queue_contract import apply_action_queue_contract
 import requests
 
 try:
@@ -84,6 +85,10 @@ OUTPUT_COLS = [
     "MappedEntity", "MappedProduct", "MappedHS", "TradeRoute", "MappingEvidence",
     "Article Extract Status", "Article Source Type", "Article Body Evidence",
     "Policy Stage", "Quality Contract",
+    "PolicyDeltaFlag", "PolicyDeltaType", "PolicyDeltaReason", "ReportLayer",
+    "OfficialSourceURL", "OfficialSourceStatus", "OfficialSourceCandidate",
+    "EvidenceGateFlag", "SamsungTradeGateFlag", "ThreeGateStatus",
+    "EventDuplicateCount", "AlternateHeadlines", "AlternateURLs",
 ]
 
 HARD_SCOPE_EXCLUDE_TITLE_TERMS = [
@@ -182,6 +187,110 @@ def concrete_policy_delta(text: object) -> bool:
     return has_instrument and (has_measure or has_authority)
 
 
+OFFICIAL_HOSTS = (
+    ".gov", ".gov.uk", ".gov.cn", ".gov.in", ".gov.vn", ".go.kr", ".gc.ca",
+    "europa.eu", "wto.org", "ustr.gov", "cbp.gov", "bis.gov", "trade.gov",
+    "federalregister.gov", "usitc.gov", "customs.go.kr", "motie.go.kr",
+    "mofcom.gov.cn", "dgft.gov.in", "taxation-customs.ec.europa.eu",
+)
+OFFICIAL_AGENCY_HOME = {
+    "ustr": "https://ustr.gov/", "cbp": "https://www.cbp.gov/",
+    "usitc": "https://www.usitc.gov/", "federal register": "https://www.federalregister.gov/",
+    "미 상무부": "https://www.trade.gov/", "department of commerce": "https://www.trade.gov/",
+    "bis": "https://www.bis.gov/", "관세청": "https://www.customs.go.kr/",
+    "무역위원회": "https://www.ktc.go.kr/", "산업통상": "https://www.motie.go.kr/",
+    "dgft": "https://www.dgft.gov.in/", "mofcom": "https://english.mofcom.gov.cn/",
+    "eu commission": "https://policy.trade.ec.europa.eu/",
+    "european commission": "https://policy.trade.ec.europa.eu/",
+}
+
+
+def _is_official_url(value: object) -> bool:
+    url = clean(value)
+    if not url.startswith(("http://", "https://")):
+        return False
+    try:
+        host = (urlparse(url).hostname or "").lower()
+    except Exception:
+        return False
+    return any(host == x.lstrip(".") or host.endswith(x) for x in OFFICIAL_HOSTS)
+
+
+def official_source_fields(row: pd.Series) -> tuple[str, str, str]:
+    """Exact official URL is evidence; an agency homepage is only a candidate."""
+    for field in [
+        "OfficialSourceURL", "URL", "OriginalURLCandidate", "BestLinkURL",
+        "Source", "Official Evidence", "Direct Evidence",
+    ]:
+        value = clean(row.get(field))
+        urls = re.findall(r"https?://[^\s|<>'\"]+", value) if value else []
+        if value.startswith(("http://", "https://")):
+            urls.insert(0, value)
+        for url in dict.fromkeys(urls):
+            if _is_official_url(url):
+                return url.rstrip(".,);]"), "VERIFIED_EXACT", ""
+    agency_text = " ".join([
+        clean(row.get("Agency")), clean(row.get("Publisher")),
+        clean(row.get("Official Evidence")), clean(row.get("Country")),
+    ]).lower()
+    candidate = next((home for key, home in OFFICIAL_AGENCY_HOME.items() if key in agency_text), "")
+    return "", ("PENDING_DISCOVERY" if candidate else "NOT_IDENTIFIED"), candidate
+
+
+def policy_delta_gate(row: pd.Series) -> tuple[str, str, str]:
+    """Identify a new policy change; non-delta rows remain as Global Context."""
+    title = clean(row.get("Headline")).lower()
+    lead = " ".join([
+        clean(row.get("SummaryAI")), clean(row.get("Direct Evidence")),
+        clean(row.get("Official Evidence")), clean(row.get("Article Body Evidence"))[:1400],
+    ]).lower()
+    anchor = f"{title} {lead}"
+    issue = clean(row.get("Issue")).upper()
+    official_url, official_status, _ = official_source_fields(row)
+    commentary = any(x in title for x in [
+        "전망", "분석", "연구", "효과", "영향", "증가", "감소", "기고", "칼럼",
+        "왜 ", "시사점", "outlook", "analysis", "study", "impact", "opinion",
+    ])
+    event_only = any(x in title for x in [
+        "대화 개최", "회의 개최", "포럼", "세미나", "협력 강화", "의견 교환",
+        "mou 체결", "양해각서", "dialogue", "forum", "seminar", "meeting",
+    ])
+    operative_terms = [
+        "시행", "발효", "부과", "철회", "폐지", "면제", "인상", "인하", "개정",
+        "조사 개시", "예비판정", "최종판정", " 판정", "지정", "삭제", "수입금지",
+        "entered into force", "effective from", "imposed", "lifted", "removed",
+        "amended", "investigation initiated", "preliminary determination",
+        "final determination", "designated", "added to", "import ban", "will remove",
+    ]
+    proposal_terms = [
+        "법률안", "개정안", "입법예고", "행정예고", "공식 제안", "제안했다",
+        "하겠다", "예정", "계획", "proposed rule", "proposal", "notice and comment",
+        "plans to impose", "plans to lift", "will impose",
+    ]
+    title_operative = any(x in title for x in operative_terms)
+    title_proposal = any(x in title for x in proposal_terms)
+    # Body-only historical references must not manufacture a current event.
+    # An exact official page may supply the operative phrase when a terse
+    # government title omits it; media articles must carry the change in title.
+    operative = title_operative or (official_status == "VERIFIED_EXACT" and any(x in anchor for x in operative_terms))
+    proposal = title_proposal
+    instrument = concrete_policy_delta(anchor) or issue_specific_policy_signal(issue, anchor)
+    if event_only and not (title_operative or title_proposal):
+        return "N", "EVENT_CONTEXT", "회의·대화·협력행사이며 변경된 규정·세율·허가요건이 확인되지 않음"
+    if commentary and not (title_operative or title_proposal):
+        return "N", "BACKGROUND_ANALYSIS", "정책 영향·통계·전망 분석이며 당일 신규 정부조치가 확인되지 않음"
+    if operative and instrument:
+        reason = "구체 정책수단과 시행·부과·판정 등 현재 조치 확인"
+        if official_status != "VERIFIED_EXACT":
+            reason += "; 공식 원문 링크 추가 확인 필요"
+        return "Y", "CONFIRMED_DELTA", reason
+    if proposal and instrument:
+        return "Y", "PROPOSED_DELTA", "정부의 공식 입법·행정 제안 단계로 확인"
+    if official_url and instrument:
+        return "Y", "OFFICIAL_DELTA", "공식기관 원문과 구체 정책수단 확인"
+    return "N", "NO_CURRENT_DELTA", "관세·통상 관련성은 있으나 현재 발생한 신규 정책변화가 확인되지 않음"
+
+
 def event_only_noise(title: object, body: object = "") -> bool:
     title_text = clean(title).lower()
     full_text = f"{title_text} {clean(body).lower()}"
@@ -278,7 +387,7 @@ def official_primary_evidence(value: object) -> bool:
         return False
     return any(x in t for x in [
         "관보", "연방관보", "federal register", "ustr", "cbp", "bis", "ofac", "미 재무부",
-        "미 상무부", "eu 집행위원회", "commission regulation", "관세청", "세관", "법원",
+        "미 상무부", "미국 상무부", "무역위원회", "국제무역위원회", "eu 집행위원회", "commission regulation", "관세청", "세관", "법원",
         "행정명령", "고시", "공식문서", "official gazette", "regulation (eu)", "decision",
     ])
 
@@ -1264,6 +1373,50 @@ def build() -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
         ascending=[False, False, False, False], kind="stable"
     )
     selected["_supplemental_watch"] = False
+    if not selected.empty:
+        delta_values = selected.apply(policy_delta_gate, axis=1)
+        selected["PolicyDeltaFlag"] = [x[0] for x in delta_values]
+        selected["PolicyDeltaType"] = [x[1] for x in delta_values]
+        selected["PolicyDeltaReason"] = [x[2] for x in delta_values]
+        official_values = selected.apply(official_source_fields, axis=1)
+        selected["OfficialSourceURL"] = [x[0] for x in official_values]
+        selected["OfficialSourceStatus"] = [x[1] for x in official_values]
+        selected["OfficialSourceCandidate"] = [x[2] for x in official_values]
+        selected["EvidenceGateFlag"] = selected.apply(
+            lambda r: "Y" if (
+                clean(r.get("OfficialSourceStatus")) == "VERIFIED_EXACT"
+                or official_primary_evidence(r.get("Official Evidence"))
+            ) else "N", axis=1,
+        )
+        selected["SamsungTradeGateFlag"] = selected.apply(
+            lambda r: "Y" if (
+                clean(r.get("EntityDirectFlag")).upper() == "Y"
+                and bool(clean(r.get("MappedEntity")))
+                and bool(clean(r.get("MappedHS")) or clean(r.get("TradeRoute")))
+            ) else "N", axis=1,
+        )
+        selected["ThreeGateStatus"] = selected.apply(
+            lambda r: (
+                "G1_POLICY_DELTA_FAIL" if clean(r.get("PolicyDeltaFlag")) != "Y"
+                else "G2_OFFICIAL_EVIDENCE_PENDING" if clean(r.get("EvidenceGateFlag")) != "Y"
+                else "PASS_ALL_GATES" if clean(r.get("SamsungTradeGateFlag")) == "Y"
+                else "G3_SAMSUNG_MAPPING_PENDING"
+            ), axis=1,
+        )
+        selected["ReportLayer"] = "POLICY_RADAR"
+        # Policy Radar requires a current policy delta and named/linked official
+        # evidence. Samsung mapping controls actionability, not global sensing.
+        context_mask = selected["PolicyDeltaFlag"].ne("Y") | selected["EvidenceGateFlag"].ne("Y")
+        selected.loc[context_mask, "ReportLayer"] = "REFERENCE"
+        selected.loc[context_mask, "ExecutiveTier"] = "REFERENCE"
+        selected.loc[context_mask, "Top3 Eligible"] = "N"
+        selected.loc[context_mask, "Samsung Impact"] = "Watch"
+        log(
+            "POLICY DELTA GATE: "
+            f"policy={int((~context_mask).sum())} / context={int(context_mask.sum())} / "
+            f"official_exact={int(selected['OfficialSourceStatus'].eq('VERIFIED_EXACT').sum())} / "
+            f"samsung_mapped={int(selected['SamsungTradeGateFlag'].eq('Y').sum())}"
+        )
     # REPORT_TARGET은 최대 표시 건수다. 품질 미달 행으로 30건을 강제 충원하지 않는다.
     log(
         f"GOLD QUALITY CONTRACT {CONTRACT_VERSION}: strict_pass={len(selected)} / target_cap={REPORT_TARGET} / "
@@ -1272,6 +1425,9 @@ def build() -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
 
     def semantic_event_key(row: pd.Series) -> str:
         title_text = clean(row.get("Headline")).lower()
+        upstream_cluster = clean(row.get("Cluster")).lower()
+        if upstream_cluster.startswith("event|"):
+            return upstream_cluster
         text = " ".join([
             clean(row.get("Headline")), clean(row.get("SummaryAI")),
             clean(row.get("Country")), clean(row.get("Issue")),
@@ -1377,6 +1533,19 @@ def build() -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
             "Article Body Evidence": clean(r.get("Article Body Evidence")),
             "Policy Stage": clean(r.get("Policy Stage")),
             "Quality Contract": clean(r.get("Quality Contract")) or "STRICT_PASS",
+            "PolicyDeltaFlag": clean(r.get("PolicyDeltaFlag")) or "N",
+            "PolicyDeltaType": clean(r.get("PolicyDeltaType")) or "NO_CURRENT_DELTA",
+            "PolicyDeltaReason": clean(r.get("PolicyDeltaReason")),
+            "ReportLayer": clean(r.get("ReportLayer")) or "REFERENCE",
+            "OfficialSourceURL": clean(r.get("OfficialSourceURL")),
+            "OfficialSourceStatus": clean(r.get("OfficialSourceStatus")) or "NOT_IDENTIFIED",
+            "OfficialSourceCandidate": clean(r.get("OfficialSourceCandidate")),
+            "EvidenceGateFlag": clean(r.get("EvidenceGateFlag")) or "N",
+            "SamsungTradeGateFlag": clean(r.get("SamsungTradeGateFlag")) or "N",
+            "ThreeGateStatus": clean(r.get("ThreeGateStatus")) or "G1_POLICY_DELTA_FAIL",
+            "EventDuplicateCount": int(float(r.get("DuplicateCount", 0) or 0)),
+            "AlternateHeadlines": clean(r.get("ClusterHeadlines")),
+            "AlternateURLs": clean(r.get("AlternateURLs")),
         })
     daily = pd.DataFrame(selected_rows, columns=OUTPUT_COLS)
 
@@ -1440,10 +1609,15 @@ def build() -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
 
         hard_mask = daily.apply(_hard_nonpolicy, axis=1)
         if hard_mask.any():
-            removed = daily.loc[hard_mask].copy()
-            removed["RejectReason"] = "V36_NON_POLICY_OR_INDIVIDUAL_CASE"
-            post_guard_removed.append(removed)
-            daily = daily.loc[~hard_mask].copy()
+            # Keep customs-relevant background in Global Context instead of
+            # silently deleting it from the morning report.
+            daily.loc[hard_mask, "ReportLayer"] = "REFERENCE"
+            daily.loc[hard_mask, "PolicyDeltaFlag"] = "N"
+            daily.loc[hard_mask, "PolicyDeltaType"] = "NON_POLICY_CONTEXT"
+            daily.loc[hard_mask, "PolicyDeltaReason"] = "신규 정책조치가 아닌 기업·시장·개별사건 참고정보"
+            daily.loc[hard_mask, "Samsung Impact"] = "Watch"
+            daily.loc[hard_mask, "Top3 Eligible"] = "N"
+            log(f"V47 GLOBAL CONTEXT DOWNGRADE: {int(hard_mask.sum())}")
 
         # Clear master-derived entity/product/HS/route when the original body
         # does not explicitly connect Samsung, the product and customs policy.
@@ -1469,6 +1643,9 @@ def build() -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
                 daily.at[idx, "MappingStatus"] = "MAPPING_REQUIRED"
                 daily.at[idx, "RegulationMappingType"] = "POLICY_GENERAL"
                 daily.at[idx, "Top3 Eligible"] = "N"
+                daily.at[idx, "SamsungTradeGateFlag"] = "N"
+                if clean(daily.at[idx, "PolicyDeltaFlag"]) == "Y" and clean(daily.at[idx, "EvidenceGateFlag"]) == "Y":
+                    daily.at[idx, "ThreeGateStatus"] = "G3_SAMSUNG_MAPPING_PENDING"
                 mapping_downgraded += 1
         if mapping_downgraded:
             log(f"V36 ARTICLE-NATIVE MAPPING GUARD: downgraded={mapping_downgraded}")
@@ -1512,7 +1689,22 @@ def build() -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
 
         daily["_v36_event_key"] = daily.apply(_final_event_key, axis=1)
         before_v36_dedup = len(daily)
-        daily = daily.drop_duplicates("_v36_event_key", keep="first").drop(columns="_v36_event_key")
+        daily["_official_rank"] = daily.get("OfficialSourceStatus", pd.Series("", index=daily.index)).eq("VERIFIED_EXACT").astype(int)
+        daily = daily.sort_values(
+            ["_v36_event_key", "_official_rank", "Importance Score"],
+            ascending=[True, False, False], kind="stable",
+        )
+        collapsed = []
+        for _, group in daily.groupby("_v36_event_key", sort=False, dropna=False):
+            rep = group.iloc[0].copy()
+            rep["EventDuplicateCount"] = int(pd.to_numeric(group.get("EventDuplicateCount", 0), errors="coerce").fillna(0).sum()) + len(group) - 1
+            headlines = [clean(x) for x in group.get("Headline", pd.Series(dtype=str)) if clean(x)]
+            urls = [clean(x) for x in group.get("URL", pd.Series(dtype=str)) if clean(x)]
+            rep["AlternateHeadlines"] = " | ".join(dict.fromkeys(headlines))
+            rep["AlternateURLs"] = " | ".join(dict.fromkeys(urls))
+            collapsed.append(rep)
+        daily = pd.DataFrame(collapsed).drop(columns=["_v36_event_key", "_official_rank"], errors="ignore")
+        daily = daily.sort_values("Importance Score", ascending=False, kind="stable")
         if len(daily) != before_v36_dedup:
             log(f"V36 FINAL EVENT DEDUP: {before_v36_dedup} -> {len(daily)}")
         daily = daily.reset_index(drop=True)
@@ -1571,7 +1763,7 @@ def safe_write(path: Path, df: pd.DataFrame) -> None:
 
 
 def main() -> int:
-    log("GTI STEP4-2 NEWS AI v46.1 CUSTOMS-CENTRALITY ENGINE START")
+    log("GTI STEP4-2 NEWS AI v47.0 THREE-GATE POLICY ENGINE START")
     log(f"MODEL={GEMINI_MODEL} / Gemini={'Y' if USE_GEMINI else 'N'} / 24h / max={TARGET_MAX}")
     daily, audit, excluded = build()
     before_contract = len(daily)
@@ -1580,6 +1772,7 @@ def main() -> int:
         contract_rejected = contract_rejected.copy()
         contract_rejected["RejectReason"] = "GOLD_CONTRACT:" + contract_rejected["ContractReason"].astype(str)
         excluded = pd.concat([excluded, contract_rejected], ignore_index=True, sort=False)
+    daily = apply_action_queue_contract(daily)
     daily["No"] = range(1, len(daily) + 1)
     log(
         f"GOLD QUALITY CONTRACT {CONTRACT_VERSION}: before={before_contract} / "
