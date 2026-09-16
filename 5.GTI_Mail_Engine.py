@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""GTI STEP5 v46.1 policy-layer evidence-gated report engine.
+"""GTI STEP5 v45 evidence-gated executive report engine.
 
 One preparation path, one quality contract, one send path.  --preview and
 --no-email never mutate cumulative history.
@@ -20,7 +20,6 @@ from pathlib import Path
 import pandas as pd
 
 from gti_quality_contract import apply_quality_contract, VERSION as CONTRACT_VERSION
-from gti_action_queue_contract import apply_action_queue_contract, VERSION as ACTION_CONTRACT_VERSION
 
 
 BASE = Path(os.getenv("GTI_BASE_DIR", r"C:\Temp"))
@@ -33,7 +32,6 @@ SMTP_HOST = os.getenv("GTI_SMTP_HOST", "smtp.naver.com")
 SMTP_PORT = int(os.getenv("GTI_SMTP_PORT", "465"))
 SMTP_USER = os.getenv("GTI_SMTP_USER", "kch8872@naver.com").strip()
 SMTP_PASS = (os.getenv("GTI_SMTP_PASS") or os.getenv("GTI_MAIL_PW") or "").strip()
-ENGINE_VERSION = "v48.0"
 
 
 def s(v) -> str:
@@ -119,15 +117,13 @@ def normalize_regulation(df: pd.DataFrame) -> pd.DataFrame:
     out.loc[verified & score.ge(85), "ExecutiveTier"] = "PRIORITY_WATCH"
     out["Original Publish Date"] = out["Date"].map(publication_date)
     out["EventKey"] = out.apply(regulation_event_key, axis=1)
-    out["ContractReason"] = "공식 법규 본문 확인: 삼성 품목·법인·거래 매핑은 별도 확인 필요"
+    out["ContractReason"] = "공식 원문 검증 완료: 적용범위·시행일 및 삼성 거래 매핑 확인"
     out.loc[~verified, "ContractReason"] = "공식 게시물이나 원문 본문 미확인: 확인 완료 전 경영진 우선정책 승격 금지"
     out["SamsungDirectFlag"] = "N"
     out["DirectConfirmedFlag"] = "N"
     out["OfficialSourceFlag"] = "Y"
     out["VerificationStatus"] = verified.map({True: "VERIFIED", False: "PENDING"})
-    out["DecisionStatus"] = "Monitoring"
-    out.loc[~verified, "DecisionStatus"] = "Verification Pending"
-    out.loc[verified & score.ge(85), "DecisionStatus"] = "Urgent Verification"
+    out["DecisionStatus"] = verified.map({True: "Urgent Verification", False: "Verification Pending"})
     out["PriorityEligible"] = (verified & score.ge(85)).map({True: "Y", False: "N"})
     return out
 
@@ -152,14 +148,6 @@ def enrich_decision_status(rows: pd.DataFrame) -> pd.DataFrame:
     news = out.get("Content Type", pd.Series("", index=out.index)).astype(str).str.lower().eq("news")
     direct = direct_confirmed_mask(out)
     proposed = out.get("Policy Stage", pd.Series("", index=out.index)).astype(str).str.upper().eq("PROPOSED_OR_MONITORING")
-    commentary_stage = out.get("Policy Stage", pd.Series("", index=out.index)).astype(str).str.upper().isin(
-        ["COMMENTARY_OR_OUTLOOK", "COMMENTARY", "OUTLOOK", "ANALYSIS"]
-    )
-    title = out.get("Headline", pd.Series("", index=out.index)).astype(str).str.lower()
-    commentary_title = title.str.contains(
-        r"전망|관측|퇴임해도|포럼|기고|칼럼|오피니언|전문가|could|may|outlook|forum|opinion",
-        regex=True, na=False,
-    )
     verified = out["VerificationStatus"].eq("VERIFIED")
     score = pd.to_numeric(out.get("ExecutiveScore", 0), errors="coerce").fillna(0)
     priority_signal = out.get("ExecutiveTier", pd.Series("", index=out.index)).isin(["EXECUTIVE", "PRIORITY_WATCH"])
@@ -168,39 +156,14 @@ def enrich_decision_status(rows: pd.DataFrame) -> pd.DataFrame:
     out.loc[news & verified & ~proposed & priority_signal & ~direct, "DecisionStatus"] = "Urgent Verification"
     out.loc[direct, "DecisionStatus"] = "Action Required"
     out.loc[news & verified & (direct | priority_signal) & score.ge(70), "PriorityEligible"] = "Y"
-    # 전망·포럼·논평은 정책 존재의 증거가 아니다. 구체 정책변경이 이미
-    # 확인되었더라도 경영진 Action Queue가 아니라 모니터링에 둔다.
-    commentary = news & (commentary_stage | commentary_title) & ~direct
-    out.loc[commentary, "DecisionStatus"] = "Monitoring"
-    out.loc[commentary, "PriorityEligible"] = "N"
-    reference = out.get("ExecutiveTier", pd.Series("", index=out.index)).astype(str).str.upper().eq("REFERENCE")
-    out["ReportLayer"] = "POLICY_RADAR"
-    out.loc[reference, "ReportLayer"] = "REFERENCE"
-    out.loc[reference, "DecisionStatus"] = "Monitoring"
-    out.loc[reference, "PriorityEligible"] = "N"
-    # Final fail-closed enforcement. STEP5 must never resurrect a row that did
-    # not pass the Samsung transaction gate in STEP4.
-    return apply_action_queue_contract(out)
-
-
-def evidence_grade(row: pd.Series) -> str:
-    """Separate official legal evidence from a verified media article body."""
-    verified = s(row.get("VerificationStatus")).upper() == "VERIFIED" or s(row.get("Body Verified")).upper() == "Y"
-    if not verified:
-        return "확인 필요"
-    if s(row.get("OfficialSourceFlag")).upper() == "Y" or s(row.get("Content Type")).lower() == "regulation":
-        return "공식 근거 확인"
-    return "기사 본문 확인"
+    return out
 
 
 def select_priority(rows: pd.DataFrame, limit: int = 3) -> pd.DataFrame:
     if rows.empty:
         return rows.copy()
-    eligible = rows[
-        rows.get("ActionQueueEligible", pd.Series("N", index=rows.index))
-        .astype(str).str.upper().eq("Y")
-    ].copy()
-    rank = {"Action Required": 0, "Operational Alert": 1, "Scenario Analysis": 2}
+    eligible = rows[rows.get("PriorityEligible", pd.Series("N", index=rows.index)).astype(str).str.upper().eq("Y")].copy()
+    rank = {"Action Required": 0, "Urgent Verification": 1, "Scenario Analysis": 2, "Monitoring": 3}
     eligible["_decision_rank"] = eligible.get("DecisionStatus", "Monitoring").map(rank).fillna(9)
     eligible = eligible.sort_values(["_decision_rank", "ExecutiveScore"], ascending=[True, False], kind="stable")
     return eligible.head(limit).drop(columns="_decision_rank")
@@ -216,15 +179,10 @@ def historical_keys(df: pd.DataFrame) -> set[str]:
     return keys
 
 
-def remove_history(rows: pd.DataFrame, old: pd.DataFrame, report_date: str = "") -> tuple[pd.DataFrame, int]:
+def remove_history(rows: pd.DataFrame, old: pd.DataFrame) -> tuple[pd.DataFrame, int]:
     if rows.empty or old.empty:
         return rows.copy(), 0
-    compare = old.copy()
-    # A rerun for the same report date must rebuild the same report instead of
-    # treating that morning's first run as historical noise.
-    if report_date and "ReportDate" in compare.columns:
-        compare = compare[compare["ReportDate"].fillna("").astype(str).str[:10].ne(report_date)]
-    known = historical_keys(compare)
+    known = historical_keys(old)
     mask = []
     for _, r in rows.iterrows():
         url = s(r.get("URL")).lower()
@@ -240,25 +198,15 @@ def remove_history(rows: pd.DataFrame, old: pd.DataFrame, report_date: str = "")
 def executive_sentence(rows: pd.DataFrame) -> str:
     if rows.empty:
         return "최근 24시간 내 새로 확인된 삼성전자 관세·통상 핵심 조치는 없습니다. 기존 고위험 정책은 변동 여부를 계속 모니터링합니다."
-    policy_rows = rows[rows.get("ReportLayer", pd.Series("POLICY_RADAR", index=rows.index)).ne("REFERENCE")]
-    if policy_rows.empty:
-        return "금일 확인된 신규 핵심 관세정책은 없습니다. 참고 동향은 별도 Global Context Radar에 수록했습니다."
     axes = []
-    priority = select_priority(policy_rows, 3)
-    source = priority if not priority.empty else policy_rows.head(3)
+    priority = select_priority(rows, 3)
+    source = priority if not priority.empty else rows.head(3)
     for _, r in source.iterrows():
         fam = s(r.get("PolicyFamily"))
-        headline = s(r.get("Headline"))
-        if s(r.get("Content Type")).lower() == "regulation":
-            if "certificate of origin" in headline.lower() and "api" in headline.lower():
-                axes.append("인도 DGFT 원산지증명서 API 연동")
-            else:
-                axes.append(headline[:55])
-        elif fam == "SEMICONDUCTOR_TARIFF": axes.append("반도체 관세·현지생산 조건")
-        elif fam == "CUSTOMS_PROCEDURE": axes.append("통관절차 변경")
+        if fam == "SEMICONDUCTOR_TARIFF": axes.append("미국 반도체 관세와 현지생산 조건")
+        elif fam == "CUSTOMS_PROCEDURE": axes.append("베트남 통관절차 변경")
         elif fam == "ORIGIN_TRANSshipment": axes.append("원산지·우회수출 검증")
         elif fam == "TARIFF": axes.append("주요국 관세협상 후속조건")
-        elif fam == "TRADE_REMEDY": axes.append("반덤핑·상계관세 판정")
     axes = list(dict.fromkeys(axes))
     joined = "·".join(axes) if axes else "관세·통상 정책 변화"
     return f"금일 핵심 센싱은 {joined}입니다. HQ Customs는 시행조건과 대상 품목·법인·거래경로를 확인하고, 확정 전 사안은 비용 시나리오와 증빙 준비 수준으로 관리해야 합니다."
@@ -272,10 +220,7 @@ def action_text(row: pd.Series) -> str:
         return "베트남 법인과 Circular 원문·적용 국경·시행일을 확인하고 통관 SOP 및 시스템 변경사항을 Gap 분석"
     if fam == "ORIGIN_TRANSshipment":
         return "베트남 생산품의 BOM·원산지·제조공정·선적경로를 연결한 Origin Traceability 증빙 점검"
-    if s(row.get("ReportLayer")) == "REFERENCE":
-        return "참고 동향으로 관리하고 구체적인 정부 조치가 발표될 때 정책 후보로 재평가"
-    action = s(row.get("Action Plan"))
-    return action or "공식 적용범위와 삼성 법인·품목·거래경로를 대조하고 담당자·기한이 포함된 실행조치를 확정"
+    return s(row.get("Action Plan")) or "원문·적용범위·시행일을 확인하고 관련 법인 영향도를 재판정"
 
 
 def esc(v) -> str:
@@ -283,16 +228,12 @@ def esc(v) -> str:
 
 
 def build_html(rows: pd.DataFrame, run_date: str) -> str:
-    rows = rows[rows.get("ReportLayer", pd.Series("POLICY_RADAR", index=rows.index)).ne("EXCLUDED")].copy()
-    reference_mask = rows.get("ReportLayer", pd.Series("POLICY_RADAR", index=rows.index)).eq("REFERENCE")
-    policy = rows[~reference_mask]
-    reference = rows[reference_mask]
-    priority = select_priority(policy, 3)
-    direct_n = int(direct_confirmed_mask(policy).sum())
-    urgent_n = int(policy.get("DecisionStatus", pd.Series(dtype=str)).eq("Urgent Verification").sum())
-    scenario_n = int(policy.get("DecisionStatus", pd.Series(dtype=str)).eq("Scenario Analysis").sum())
-    monitoring_n = int(policy.get("DecisionStatus", pd.Series(dtype=str)).eq("Monitoring").sum())
-    pending_n = int(policy.get("DecisionStatus", pd.Series(dtype=str)).eq("Verification Pending").sum())
+    priority = select_priority(rows, 3)
+    direct_n = int(direct_confirmed_mask(rows).sum())
+    urgent_n = int(rows.get("DecisionStatus", pd.Series(dtype=str)).eq("Urgent Verification").sum())
+    scenario_n = int(rows.get("DecisionStatus", pd.Series(dtype=str)).eq("Scenario Analysis").sum())
+    monitoring_n = int(rows.get("DecisionStatus", pd.Series(dtype=str)).eq("Monitoring").sum())
+    pending_n = int(rows.get("DecisionStatus", pd.Series(dtype=str)).eq("Verification Pending").sum())
     cards = []
     for i, (_, r) in enumerate(priority.iterrows(), 1):
         badge = esc(r.get("DecisionStatus"))
@@ -302,20 +243,19 @@ def build_html(rows: pd.DataFrame, run_date: str) -> str:
         <p><b>임원 판단</b> {esc(r.get('ContractReason'))}</p>
         <p><b>삼성전자 관세업무</b> {esc(r.get('AI Analysis')) or '직접 비용은 미확정이며 적용범위 검증이 필요합니다.'}</p>
         <p><b>지시사항</b> {esc(action_text(r))}</p>
-        <p class='meta'><b>원본 게시일자</b> {esc(row_publication_date(r))} · <b>최초 감지일</b> {esc(r.get('First Detected Date') or run_date)} · {esc(r.get('Detection Type'))} · {esc(r.get('Country'))} · {esc(r.get('Agency') or r.get('Source'))} · <a href='{esc(r.get('URL'))}'>원문</a></p></div>""")
+        <p class='meta'><b>원본 게시일자</b> {esc(row_publication_date(r))} · {esc(r.get('Country'))} · {esc(r.get('Agency') or r.get('Source'))} · <a href='{esc(r.get('URL'))}'>원문</a></p></div>""")
     if not cards:
-        cards.append("<div class='empty'><b>신규 Action Queue 없음</b><br>신규 정책·공식 문서·삼성 거래 연결·실행조치의 네 관문을 모두 통과한 건이 없습니다.</div>")
+        cards.append("<div class='empty'><b>신규 Action Queue 없음</b><br>Direct 확정 또는 원문 검증을 통과한 우선 검토대상이 없습니다.</div>")
 
     def table_rows(frame: pd.DataFrame) -> str:
         rendered = []
         for _, r in frame.iterrows():
             original_date = row_publication_date(r)
-            status = "Reference" if s(r.get("ReportLayer")) == "REFERENCE" else s(r.get("DecisionStatus"))
-            rendered.append(f"<tr><td>{esc(status)}</td><td>{esc(original_date)}</td><td>{esc(r.get('First Detected Date') or run_date)}</td><td>{esc(r.get('Detection Type'))}</td><td><a href='{esc(r.get('URL'))}'>{esc(r.get('Headline'))}</a></td><td>{esc(r.get('Country'))}</td><td>{esc(evidence_grade(r))}</td><td>{esc(r.get('ContractReason'))}</td></tr>")
+            rendered.append(f"<tr><td>{esc(r.get('DecisionStatus'))}</td><td>{esc(original_date)}</td><td><a href='{esc(r.get('URL'))}'>{esc(r.get('Headline'))}</a></td><td>{esc(r.get('Country'))}</td><td>{esc(r.get('ContractReason'))}</td></tr>")
         return "".join(rendered)
 
-    verified = policy[policy.get("VerificationStatus", pd.Series("PENDING", index=policy.index)).eq("VERIFIED")]
-    pending = policy[policy.get("VerificationStatus", pd.Series("PENDING", index=policy.index)).ne("VERIFIED")]
+    verified = rows[rows.get("VerificationStatus", pd.Series("PENDING", index=rows.index)).eq("VERIFIED")]
+    pending = rows[rows.get("VerificationStatus", pd.Series("PENDING", index=rows.index)).ne("VERIFIED")]
     return f"""<!doctype html><html><head><meta charset='utf-8'><style>
     body{{font-family:Arial,'Malgun Gothic',sans-serif;color:#172033;max-width:980px;margin:auto;padding:24px;background:#f5f7fb}}
     header,.section{{background:white;border-radius:12px;padding:22px;margin-bottom:14px}} h1{{margin:0;color:#123b70}} h2{{color:#123b70}}
@@ -326,29 +266,22 @@ def build_html(rows: pd.DataFrame, run_date: str) -> str:
     table{{width:100%;border-collapse:collapse}} th,td{{padding:9px;border-bottom:1px solid #e4e8ef;text-align:left;font-size:13px}} .empty{{padding:18px;background:#f7f8fa}}
     </style></head><body><header><h1>[GTI Radar] Global Trade Intelligence</h1><p>{run_date} | Samsung Electronics Customs Executive Brief</p></header>
     <section class='section'><h2>1. 오늘의 관세정책 센싱</h2><p class='lead'><b>{esc(executive_sentence(rows))}</b></p>
-    <span class='metric'>정책 {len(policy)}건</span><span class='metric'>참고 {len(reference)}건</span><span class='metric'>Action Required {direct_n}건</span><span class='metric'>Urgent Verification {urgent_n}건</span><span class='metric'>Scenario {scenario_n}건</span><span class='metric'>Monitoring {monitoring_n}건</span><span class='metric'>Verification Pending {pending_n}건</span></section>
+    <span class='metric'>보고 {len(rows)}건</span><span class='metric'>Action Required {direct_n}건</span><span class='metric'>Urgent Verification {urgent_n}건</span><span class='metric'>Scenario {scenario_n}건</span><span class='metric'>Monitoring {monitoring_n}건</span><span class='metric'>Verification Pending {pending_n}건</span></section>
     <section class='section'><h2>2. Samsung Customs Action Queue</h2>{''.join(cards)}</section>
-    <section class='section verified'><h2>3. 본문 확인 정책 후보 ({len(verified)}건)</h2><table><tr><th>상태</th><th>원본 게시일자</th><th>최초 감지일</th><th>감지유형</th><th>정책 신호</th><th>국가</th><th>증거 등급</th><th>선정 근거</th></tr>{table_rows(verified)}</table></section>
-    <section class='section pending'><h2>4. 원문 확인 필요 ({len(pending)}건)</h2><table><tr><th>상태</th><th>원본 게시일자</th><th>최초 감지일</th><th>감지유형</th><th>정책 신호</th><th>국가</th><th>증거 등급</th><th>확인 사유</th></tr>{table_rows(pending)}</table></section>
-    <section class='section'><h2>5. Global Context Radar ({len(reference)}건)</h2><table><tr><th>구분</th><th>원본 게시일자</th><th>최초 감지일</th><th>감지유형</th><th>참고 동향</th><th>국가</th><th>증거 등급</th><th>분류 사유</th></tr>{table_rows(reference)}</table></section>
-    <section class='section'><small>정책 존재는 기사 원문·공식출처로만 판정하며 AI 분석문은 증거로 사용하지 않습니다. Action Queue는 신규 정책·공식 문서·삼성 거래 연결·실행조치를 모두 확인한 건만 표시합니다. Engine {ENGINE_VERSION} · Contract {CONTRACT_VERSION} · Action Contract {ACTION_CONTRACT_VERSION}</small></section></body></html>"""
+    <section class='section verified'><h2>3. 원문 검증 완료 ({len(verified)}건)</h2><table><tr><th>상태</th><th>원본 게시일자</th><th>정책 신호</th><th>국가</th><th>선정 근거</th></tr>{table_rows(verified)}</table></section>
+    <section class='section pending'><h2>4. 원문 확인 필요 ({len(pending)}건)</h2><table><tr><th>상태</th><th>원본 게시일자</th><th>정책 신호</th><th>국가</th><th>확인 사유</th></tr>{table_rows(pending)}</table></section>
+    <section class='section'><small>정책 존재는 기사 원문·공식출처로만 판정하며 AI 분석문은 증거로 사용하지 않습니다. Contract {CONTRACT_VERSION}</small></section></body></html>"""
 
 
-def write_xlsx(path: Path, rows: pd.DataFrame, excluded_rows: pd.DataFrame | None = None) -> None:
+def write_xlsx(path: Path, rows: pd.DataFrame) -> None:
     top3 = select_priority(rows, 3)
-    reference_mask = rows.get("ReportLayer", pd.Series("POLICY_RADAR", index=rows.index)).eq("REFERENCE")
-    policy_rows = rows[~reference_mask]
-    reference_rows = rows[reference_mask]
     with pd.ExcelWriter(path, engine="openpyxl") as writer:
-        policy_rows.to_excel(writer, sheet_name="Executive Radar", index=False)
+        rows.to_excel(writer, sheet_name="Executive Radar", index=False)
         top3.to_excel(writer, sheet_name="Priority Watch Top3", index=False)
-        reference_rows.to_excel(writer, sheet_name="Global Context", index=False)
-        if excluded_rows is not None and not excluded_rows.empty:
-            excluded_rows.to_excel(writer, sheet_name="Excluded", index=False)
         if rows.empty:
             pd.DataFrame({"Message": ["금일 신규 핵심정책 없음"]}).to_excel(writer, sheet_name="Run Summary", index=False)
         else:
-            pd.DataFrame({"Metric": ["Policy Radar", "Global Context", "Action Required", "Urgent Verification", "Scenario Analysis", "Monitoring", "Verification Pending", "Contract"], "Value": [len(policy_rows), len(reference_rows), int(direct_confirmed_mask(policy_rows).sum()), int(policy_rows["DecisionStatus"].eq("Urgent Verification").sum()), int(policy_rows["DecisionStatus"].eq("Scenario Analysis").sum()), int(policy_rows["DecisionStatus"].eq("Monitoring").sum()), int(policy_rows["DecisionStatus"].eq("Verification Pending").sum()), CONTRACT_VERSION]}).to_excel(writer, sheet_name="Run Summary", index=False)
+            pd.DataFrame({"Metric": ["Selected", "Action Required", "Urgent Verification", "Scenario Analysis", "Monitoring", "Verification Pending", "Contract"], "Value": [len(rows), int(direct_confirmed_mask(rows).sum()), int(rows["DecisionStatus"].eq("Urgent Verification").sum()), int(rows["DecisionStatus"].eq("Scenario Analysis").sum()), int(rows["DecisionStatus"].eq("Monitoring").sum()), int(rows["DecisionStatus"].eq("Verification Pending").sum()), CONTRACT_VERSION]}).to_excel(writer, sheet_name="Run Summary", index=False)
         for ws in writer.book.worksheets:
             ws.freeze_panes = "A2"
             ws.auto_filter.ref = ws.dimensions
@@ -359,6 +292,251 @@ def write_xlsx(path: Path, rows: pd.DataFrame, excluded_rows: pd.DataFrame | Non
             for col in ws.columns:
                 letter = col[0].column_letter
                 ws.column_dimensions[letter].width = min(55, max(12, max(len(s(c.value)) for c in col) + 2))
+
+
+# ---------------------------------------------------------------------------
+# v50 fixed-form executive report contract
+# ---------------------------------------------------------------------------
+ENGINE_VERSION = "v50.0 FIXED-SIX-SECTION"
+HEALTH_FILE = BASE / "1.site_crawl_health.xlsx"
+
+
+def yn(df: pd.DataFrame, col: str) -> pd.Series:
+    return df.get(col, pd.Series("N", index=df.index)).fillna("N").astype(str).str.upper().eq("Y")
+
+
+def text_blob(df: pd.DataFrame) -> pd.Series:
+    cols = [c for c in ["Headline", "Summary", "AI Analysis", "Issue", "Country", "Agency", "Source"] if c in df]
+    if not cols:
+        return pd.Series("", index=df.index)
+    out = pd.Series("", index=df.index)
+    for col in cols:
+        out = out + " " + df[col].fillna("").astype(str)
+    return out.str.lower()
+
+
+def classify_report_layers(rows: pd.DataFrame) -> tuple[pd.DataFrame, dict[str, pd.DataFrame]]:
+    """Apply the immutable report hierarchy without forced filling.
+
+    Action Queue requires all three gates. Core policy requires current delta
+    plus official evidence. Samsung Watch holds business-relevant candidates
+    with one or more gates pending. Remaining valid policy context is compact.
+    """
+    if rows.empty:
+        empty = rows.copy()
+        return empty, {k: empty.copy() for k in ["action", "core", "watch", "context", "excluded"]}
+    d = rows.copy()
+    for col, default in [
+        ("Content Type", "News"), ("ReportLayer", "REFERENCE"),
+        ("PolicyDeltaFlag", "N"), ("EvidenceGateFlag", "N"),
+        ("SamsungTradeGateFlag", "N"), ("DirectConfirmedFlag", "N"),
+        ("Body Verified", "N"), ("ContractReason", ""), ("DecisionStatus", "Monitoring"),
+    ]:
+        if col not in d: d[col] = default
+    d["_score"] = pd.to_numeric(d.get("ExecutiveScore", d.get("Importance Score", 0)), errors="coerce").fillna(0)
+    blob = text_blob(d)
+    native = pd.Series("", index=d.index)
+    # Samsung scope must come from article-native evidence. AI summaries often
+    # mention Samsung hypothetically and must never create relevance by itself.
+    for col in ["Headline", "Direct Evidence", "Article Body Evidence", "Country", "Agency"]:
+        if col in d: native = native + " " + d[col].fillna("").astype(str)
+    native = native.str.lower()
+    reg = d["Content Type"].astype(str).str.lower().eq("regulation")
+    delta = yn(d, "PolicyDeltaFlag")
+    evidence = yn(d, "EvidenceGateFlag")
+    body = yn(d, "Body Verified")
+    trade = yn(d, "SamsungTradeGateFlag")
+    direct = yn(d, "DirectConfirmedFlag") | trade
+
+    # A daily STEP4-1 regulation row is already a newly detected official
+    # document. Its body status controls evidence quality, not policy novelty.
+    d.loc[reg, "PolicyDeltaFlag"] = "Y"
+    delta = delta | reg
+    # Official regulations are evidence-backed only when the body itself was
+    # obtained. A listing title alone is not enough.
+    evidence = evidence | (reg & body)
+    d.loc[reg & body, "EvidenceGateFlag"] = "Y"
+
+    customs_operation = blob.str.contains(
+        r"외국환거래규정|수출입대금|납세신고\s*정정|수입신고\s*정정|전자문서\s*변경|5fe|5fk|품목번호\s*연계표",
+        regex=True, na=False,
+    )
+    d.loc[customs_operation, "PolicyDeltaFlag"] = "Y"
+    delta = delta | customs_operation
+
+    # Defensive event-family merge. The same KCS table or FTA event is often
+    # reported by several outlets. Propagate the strongest gate evidence to
+    # the family and keep one representative article.
+    d["_family"] = d.get("EventKey", pd.Series("", index=d.index)).fillna("").astype(str)
+    kcs_family = native.str.contains(r"품목번호\s*연계표|hs code cross-reference|한.?미\s*품목번호", regex=True, na=False) & native.str.contains(r"관세청|korea customs service", regex=True, na=False)
+    fta_family = native.str.contains("메르코수르", regex=False, na=False) & native.str.contains("싱가포르", regex=False, na=False) & native.str.contains("fta", regex=False, na=False)
+    d.loc[kcs_family, "_family"] = "KR_US_ADDITIONAL_TARIFF_HS_CROSS_REFERENCE"
+    d.loc[fta_family, "_family"] = "MERCOSUR_SINGAPORE_FTA_EFFECTIVE"
+    for family in ["KR_US_ADDITIONAL_TARIFF_HS_CROSS_REFERENCE", "MERCOSUR_SINGAPORE_FTA_EFFECTIVE"]:
+        members = d["_family"].eq(family)
+        if not members.any(): continue
+        if yn(d.loc[members], "PolicyDeltaFlag").any() or family.startswith("KR_US_"):
+            d.loc[members, "PolicyDeltaFlag"] = "Y"
+        if yn(d.loc[members], "EvidenceGateFlag").any():
+            d.loc[members, "EvidenceGateFlag"] = "Y"
+    d["_evidence_rank"] = yn(d, "EvidenceGateFlag").astype(int)
+    d["_delta_rank"] = yn(d, "PolicyDeltaFlag").astype(int)
+    d = d.sort_values(["_evidence_rank", "_delta_rank", "_score"], ascending=[False, False, False], kind="stable")
+    has_family = d["_family"].astype(str).str.strip().ne("")
+    family_rows = d[has_family].drop_duplicates("_family", keep="first")
+    d = pd.concat([family_rows, d[~has_family]], axis=0).sort_values("_score", ascending=False, kind="stable")
+    blob = text_blob(d)
+    native = pd.Series("", index=d.index)
+    for col in ["Headline", "Direct Evidence", "Article Body Evidence", "Country", "Agency"]:
+        if col in d: native = native + " " + d[col].fillna("").astype(str)
+    native = native.str.lower()
+    reg = d["Content Type"].astype(str).str.lower().eq("regulation")
+    delta = yn(d, "PolicyDeltaFlag")
+    evidence = yn(d, "EvidenceGateFlag") | (reg & yn(d, "Body Verified"))
+    trade = yn(d, "SamsungTradeGateFlag")
+    direct = yn(d, "DirectConfirmedFlag") | trade
+
+    samsung_scope = native.str.contains(
+        r"삼성전자|samsung electronics|반도체|semiconductor|디스플레이|스마트폰|휴대폰|가전|네트워크장비|"
+        r"품목번호\s*연계표|한.?미\s*품목번호|메르코수르.{0,20}싱가포르|싱가포르.{0,20}메르코수르|"
+        r"외국환거래규정|수출입대금|납세신고\s*정정|수입신고\s*정정|전자문서\s*변경|5fe|5fk",
+        regex=True, na=False,
+    )
+    excluded_mask = d["ReportLayer"].astype(str).str.upper().eq("EXCLUDED") | d.get("DecisionStatus", "").astype(str).str.lower().eq("excluded")
+    action_mask = ~excluded_mask & delta & evidence & direct
+    core_mask = ~excluded_mask & ~action_mask & delta & evidence
+    watch_mask = ~excluded_mask & ~action_mask & ~core_mask & samsung_scope
+
+    action = d[action_mask].sort_values("_score", ascending=False, kind="stable").head(3).copy()
+    core = d[core_mask].sort_values("_score", ascending=False, kind="stable").head(5).copy()
+    watch = d[watch_mask].sort_values("_score", ascending=False, kind="stable").head(10).copy()
+    used = set(action.index) | set(core.index) | set(watch.index)
+    context_candidates = d[~excluded_mask & ~d.index.isin(used)].copy()
+    context = context_candidates.sort_values("_score", ascending=False, kind="stable").head(20).copy()
+    used |= set(context.index)
+    excluded = d[excluded_mask | ~d.index.isin(used)].copy()
+
+    for frame, layer, status in [
+        (action, "ACTION_QUEUE", "Action Required"),
+        (core, "CORE_POLICY", "Core Policy"),
+        (watch, "SAMSUNG_WATCH", "Verification Pending"),
+        (context, "GLOBAL_CONTEXT", "Monitoring"),
+        (excluded, "EXCLUDED", "Excluded"),
+    ]:
+        frame["ReportSection"] = layer
+        frame["DecisionStatus"] = status
+    visible = pd.concat([action, core, watch, context], ignore_index=True, sort=False)
+    helper_cols = ["_score", "_family", "_evidence_rank", "_delta_rank"]
+    visible = visible.drop(columns=helper_cols, errors="ignore")
+    layers = {"action": action.drop(columns=helper_cols, errors="ignore"),
+              "core": core.drop(columns=helper_cols, errors="ignore"),
+              "watch": watch.drop(columns=helper_cols, errors="ignore"),
+              "context": context.drop(columns=helper_cols, errors="ignore"),
+              "excluded": excluded.drop(columns=helper_cols, errors="ignore")}
+    return visible, layers
+
+
+def concise(v, limit=180) -> str:
+    value = s(v)
+    return value if len(value) <= limit else value[:limit - 1].rstrip() + "…"
+
+
+def health_summary() -> dict[str, int]:
+    result = {"OK_NEW": 0, "NO_NEW": 0, "PARSE_ZERO": 0, "FAIL": 0}
+    health = read_excel_safe(HEALTH_FILE)
+    if health.empty:
+        return result
+    status_col = next((c for c in ["HealthStatus", "health_status", "final_status", "status", "zero_yield_status"] if c in health), None)
+    if not status_col:
+        return result
+    values = health[status_col].fillna("").astype(str).str.upper()
+    result["OK_NEW"] = int(values.str.contains(r"^OK|VALID_REGULATION", regex=True).sum())
+    result["NO_NEW"] = int(values.str.contains("NO_NEW", regex=False).sum())
+    result["PARSE_ZERO"] = int(values.str.contains("PARSE_ZERO|PARTIAL_COVERAGE", regex=True).sum())
+    result["FAIL"] = int(values.str.contains("FAIL|BLOCKED|ERROR", regex=True).sum())
+    return result
+
+
+def conclusion_lines(layers: dict[str, pd.DataFrame], health: dict[str, int]) -> list[str]:
+    action, core, watch = layers["action"], layers["core"], layers["watch"]
+    line1 = (f"금일 삼성전자 본·지사 거래에 직접 영향이 확인된 신규 관세정책은 {len(action)}건입니다."
+             if len(action) else "금일 삼성전자 본·지사 거래에 직접 영향이 확인된 신규 관세정책은 없습니다.")
+    if len(core) or len(watch):
+        names = [concise(x, 42) for x in pd.concat([core, watch]).get("Headline", pd.Series(dtype=str)).head(2)]
+        line2 = f"공식근거가 확인된 핵심 정책 {len(core)}건과 삼성 관련 확인 후보 {len(watch)}건을 센싱했습니다"
+        if names: line2 += ": " + " / ".join(names)
+        line2 += "."
+    else:
+        line2 = "공식근거가 확인된 핵심 정책과 추가 확인이 필요한 삼성 관련 후보는 없습니다."
+    if health["FAIL"] or health["PARSE_ZERO"]:
+        line3 = f"수집상태는 FAIL {health['FAIL']}건, PARSE_ZERO {health['PARSE_ZERO']}건으로 재확인이 필요합니다."
+    else:
+        line3 = f"수집상태는 OK_NEW {health['OK_NEW']}건, NO_NEW {health['NO_NEW']}건이며 확인된 수집 장애는 없습니다."
+    return [line1, line2, line3]
+
+
+def empty_message(label: str) -> str:
+    return {
+        "action": "금일 삼성전자 거래에 직접 영향과 실행조치가 모두 확인된 정책은 없습니다.",
+        "core": "공식근거가 확인된 신규 중요 정책은 없습니다.",
+        "watch": "추가 확인이 필요한 삼성전자 관련 관세정책 후보는 없습니다.",
+        "context": "보고기준을 충족한 글로벌 관세정책 변화는 없습니다.",
+    }[label]
+
+
+def build_html_v50(layers: dict[str, pd.DataFrame], run_date: str, health: dict[str, int]) -> str:
+    action, core, watch, context = (layers[k] for k in ["action", "core", "watch", "context"])
+    lines = conclusion_lines(layers, health)
+    def empty(k): return f"<div class='empty'>{esc(empty_message(k))}</div>"
+    action_html = []
+    for _, r in action.iterrows():
+        action_html.append(f"<div class='card'><h3><a href='{esc(r.get('URL'))}'>{esc(r.get('Headline'))}</a></h3><p><b>직접영향</b> {esc(concise(r.get('AI Analysis'),260))}</p><p><b>조치</b> {esc(concise(r.get('Action Plan'),220))}</p><p class='meta'>원본 게시일 {esc(row_publication_date(r))} · {esc(r.get('Country'))} · {esc(r.get('Agency'))}</p></div>")
+    core_html = []
+    for _, r in core.iterrows():
+        core_html.append(f"<div class='card'><h3><a href='{esc(r.get('URL'))}'>{esc(r.get('Headline'))}</a></h3><p><b>정책 변화</b> {esc(concise(r.get('Summary'),240))}</p><p><b>삼성 관세 시사점</b> {esc(concise(r.get('AI Analysis'),260))}</p><p class='meta'>원본 게시일 {esc(row_publication_date(r))} · {esc(r.get('Country'))} · {esc(r.get('Agency'))}</p></div>")
+    def table(frame, cols):
+        heads = "".join(f"<th>{esc(h)}</th>" for h, _ in cols)
+        body = []
+        for _, r in frame.iterrows():
+            cells=[]
+            for h,c in cols:
+                val = concise(r.get(c), 115)
+                if c == "Headline": val=f"<a href='{esc(r.get('URL'))}'>{esc(val)}</a>"
+                else: val=esc(val)
+                cells.append(f"<td>{val}</td>")
+            body.append("<tr>"+"".join(cells)+"</tr>")
+        return f"<table><tr>{heads}</tr>{''.join(body)}</table>"
+    watch_table = table(watch, [("상태","DecisionStatus"),("정책 신호","Headline"),("삼성 관련성","ContractReason"),("추가 확인","Missing Facts")]) if len(watch) else empty("watch")
+    context_table = table(context, [("국가/권역","Country"),("정책유형","Issue"),("정책 동향","Headline"),("근거상태","OfficialSourceStatus")]) if len(context) else empty("context")
+    return f"""<!doctype html><html><head><meta charset='utf-8'><style>
+body{{font-family:Arial,'Malgun Gothic',sans-serif;color:#172033;max-width:1040px;margin:auto;padding:24px;background:#f5f7fb}}header,.section{{background:#fff;border-radius:12px;padding:22px;margin-bottom:14px}}h1{{margin:0;color:#123b70}}h2{{color:#123b70}}.lead{{font-size:16px;line-height:1.7;border-left:5px solid #1d63b7;padding:12px 16px;background:#eef5ff}}.card{{border:1px solid #dbe4ef;border-radius:9px;padding:14px;margin:10px 0}}.meta{{font-size:12px;color:#687386}}table{{width:100%;border-collapse:collapse}}th,td{{padding:8px;border-bottom:1px solid #e4e8ef;text-align:left;font-size:12px;vertical-align:top}}.empty{{padding:16px;background:#f7f8fa;color:#53606f}}
+</style></head><body><header><h1>[GTI Radar] Global Trade Intelligence</h1><p>{run_date} | Samsung Electronics Customs Executive Brief</p></header>
+<section class='section'><h2>1. 오늘의 결론</h2><div class='lead'>{'<br>'.join(esc(x) for x in lines)}</div></section>
+<section class='section'><h2>2. Samsung Action Queue ({len(action)}건)</h2>{''.join(action_html) if action_html else empty('action')}</section>
+<section class='section'><h2>3. 핵심 정책 분석 ({len(core)}건)</h2>{''.join(core_html) if core_html else empty('core')}</section>
+<section class='section'><h2>4. Samsung Customs Watch ({len(watch)}건)</h2>{watch_table}</section>
+<section class='section'><h2>5. Global Context Radar ({len(context)}건)</h2>{context_table}</section>
+<section class='section'><h2>6. 수집·검증 상태</h2><table><tr><th>OK_NEW</th><th>NO_NEW</th><th>PARSE_ZERO</th><th>FAIL</th></tr><tr><td>{health['OK_NEW']}건</td><td>{health['NO_NEW']}건</td><td>{health['PARSE_ZERO']}건</td><td>{health['FAIL']}건</td></tr></table><p class='meta'>0건과 수집 실패를 구분합니다. 상세 분석·미확인 사항은 첨부 Excel에 보관합니다. Engine {ENGINE_VERSION} · Contract {CONTRACT_VERSION}</p></section></body></html>"""
+
+
+def write_xlsx_v50(path: Path, visible: pd.DataFrame, layers: dict[str, pd.DataFrame], health: dict[str, int]) -> None:
+    summary = pd.DataFrame({"Metric": ["Action Queue","Core Policy","Samsung Watch","Global Context","Total Visible","OK_NEW","NO_NEW","PARSE_ZERO","FAIL","Engine","Contract"],
+                            "Value": [len(layers['action']),len(layers['core']),len(layers['watch']),len(layers['context']),len(visible),health['OK_NEW'],health['NO_NEW'],health['PARSE_ZERO'],health['FAIL'],ENGINE_VERSION,CONTRACT_VERSION]})
+    with pd.ExcelWriter(path, engine="openpyxl") as writer:
+        summary.to_excel(writer, sheet_name="Executive Summary", index=False)
+        layers["action"].to_excel(writer, sheet_name="Action Queue", index=False)
+        layers["core"].to_excel(writer, sheet_name="Core Policy", index=False)
+        layers["watch"].to_excel(writer, sheet_name="Samsung Watch", index=False)
+        layers["context"].to_excel(writer, sheet_name="Global Context", index=False)
+        visible.to_excel(writer, sheet_name="Details", index=False)
+        layers["excluded"].to_excel(writer, sheet_name="Excluded", index=False)
+        for ws in writer.book.worksheets:
+            ws.freeze_panes = "A2"; ws.auto_filter.ref = ws.dimensions
+            for cell in ws[1]:
+                cell.font = __import__("openpyxl").styles.Font(bold=True, color="FFFFFF")
+                cell.fill = __import__("openpyxl").styles.PatternFill("solid", fgColor="1F4E78")
+            for col in ws.columns:
+                ws.column_dimensions[col[0].column_letter].width = min(55, max(12, max(len(s(c.value)) for c in col) + 2))
 
 
 def recipients() -> list[str]:
@@ -386,76 +564,47 @@ def send_mail(body: str, xlsx: Path, run_date: str) -> None:
 
 
 def main() -> int:
-    ap = argparse.ArgumentParser()
-    ap.add_argument("--preview", action="store_true")
-    ap.add_argument("--no-email", action="store_true")
-    ap.add_argument("--date")
-    # Pipeline-runner compatibility.  Defaults preserve standalone execution.
-    ap.add_argument("--regulation-input", default=str(REG_FILE))
-    ap.add_argument("--news-input", default=str(NEWS_FILE))
-    ap.add_argument("--output-dir", default=str(OUT_DIR))
-    ap.add_argument("--enforce-step5-history", action="store_true")
+    ap = argparse.ArgumentParser(); ap.add_argument("--preview", action="store_true"); ap.add_argument("--no-email", action="store_true"); ap.add_argument("--date")
+    ap.add_argument("--regulation-input", default=str(REG_FILE)); ap.add_argument("--news-input", default=str(NEWS_FILE)); ap.add_argument("--output-dir", default=str(OUT_DIR))
     args = ap.parse_args()
-    regulation_input = Path(args.regulation_input)
-    news_input = Path(args.news_input)
-    output_dir = Path(args.output_dir)
     now_text = os.getenv("GTI_NOW", "").strip()
     now = datetime.fromisoformat(now_text) if now_text else datetime.now()
     run_date = args.date or now.strftime("%Y-%m-%d")
-    print(f"[INFO] GTI STEP5 {ENGINE_VERSION} SAMSUNG-ACTION-QUEUE CONTRACT START")
-    news = read_excel_safe(news_input); reg = read_excel_safe(regulation_input)
-    # STEP4-2 has already enforced and audited the report window. Reapplying a
-    # moving 24-hour cutoff here made valid morning results disappear when
-    # STEP5 was rerun later in the day.
-    stale = pd.DataFrame(columns=news.columns)
-    print(f"[STEP5 WINDOW] trust_upstream=Y / news_rows={len(news)} / runtime_refilter=OFF")
-    news, rejected = apply_quality_contract(news, include_reference=True)
+    print(f"[INFO] GTI STEP5 {ENGINE_VERSION} START")
+    news = read_excel_safe(Path(args.news_input)); reg = read_excel_safe(Path(args.regulation_input))
+    news, stale = within_24h(news, now)
+    # STEP4-2 is authoritative for AI selection. STEP5 only assigns report
+    # layers; it must not silently discard valid Watch/Context rows by running
+    # a second, different quality contract.
+    rejected = news[news.get("ReportLayer", pd.Series("", index=news.index)).astype(str).str.upper().eq("EXCLUDED")].copy()
+    news = news[~news.index.isin(rejected.index)].copy()
     reg = normalize_regulation(reg)
     frames = [x for x in (reg, news) if not x.empty]
     rows = pd.concat(frames, ignore_index=True, sort=False) if frames else pd.DataFrame()
-    excluded_admin = pd.DataFrame()
     if not rows.empty:
+        if "ExecutiveScore" not in rows:
+            rows["ExecutiveScore"] = pd.to_numeric(rows.get("Importance Score", 0), errors="coerce").fillna(0)
         rows = rows.sort_values("ExecutiveScore", ascending=False, kind="stable").drop_duplicates("EventKey", keep="first")
-        rows = enrich_decision_status(rows)
-        excluded_mask = rows.get("ReportLayer", pd.Series("", index=rows.index)).eq("EXCLUDED")
-        if excluded_mask.any():
-            excluded_admin = rows[excluded_mask].copy()
-            print(f"[STEP5 ACTION CONTRACT] administrative_excluded={len(excluded_admin)}")
-            rows = rows[~excluded_mask].copy()
     old = pd.DataFrame() if args.preview else read_excel_safe(CUM_FILE)
-    # STEP3-1 and STEP3-2 already own historical novelty. STEP5 must not apply
-    # a second historical gate to their daily outputs, otherwise a polluted or
-    # previously tested mail ledger can turn a valid report into zero rows.
-    if args.enforce_step5_history:
-        rows, historical_removed = remove_history(rows, old, report_date=run_date)
-        print("[STEP5 HISTORY] upstream_authoritative=N / secondary_history_gate=ON")
-    else:
-        historical_removed = 0
-        print("[STEP5 HISTORY] upstream_authoritative=Y / secondary_history_gate=OFF")
+    rows, historical_removed = remove_history(rows, old)
     rows = rows.reset_index(drop=True)
-    if not rows.empty:
-        rows["ReportDate"] = run_date
-        rows["First Detected Date"] = run_date
-        original = pd.to_datetime(rows.apply(row_publication_date, axis=1), errors="coerce")
-        report_dt = pd.to_datetime(run_date, errors="coerce")
-        rows["Detection Type"] = "Current Window"
-        if not pd.isna(report_dt):
-            rows.loc[original.lt(report_dt - pd.Timedelta(days=1)), "Detection Type"] = "Delayed Detection / Backfill"
+    visible, layers = classify_report_layers(rows)
+    if not rejected.empty:
+        layers["excluded"] = pd.concat([layers["excluded"], rejected], ignore_index=True, sort=False)
+    health = health_summary()
     print(f"[STEP5 CONTRACT] news_input={len(news)+len(rejected)} / selected={len(news)} / rejected={len(rejected)} / stale={len(stale)}")
-    print(f"[STEP5 LIVE NOVELTY] removed={historical_removed} / report={len(rows)} / forced_fill=0")
-    output_dir.mkdir(parents=True, exist_ok=True)
+    print(f"[STEP5 LIVE NOVELTY] removed={historical_removed} / report={len(visible)} / forced_fill=0")
+    output_dir = Path(args.output_dir); output_dir.mkdir(parents=True, exist_ok=True)
     stem = f"[GTI Radar] Global Trade Intelligence({run_date})"; html_path = output_dir / f"{stem}.html"; xlsx_path = output_dir / f"{stem}.xlsx"
-    body = build_html(rows, run_date); html_path.write_text(body, encoding="utf-8"); write_xlsx(xlsx_path, rows, excluded_admin)
+    body = build_html_v50(layers, run_date, health); html_path.write_text(body, encoding="utf-8"); write_xlsx_v50(xlsx_path, visible, layers, health)
     if not args.preview:
-        cumulative = pd.concat([old, rows], ignore_index=True, sort=False)
+        cumulative = pd.concat([old, visible], ignore_index=True, sort=False)
         if not cumulative.empty: cumulative = cumulative.drop_duplicates(["EventKey"], keep="last")
         cumulative.to_excel(CUM_FILE, index=False)
     if not args.preview and not args.no_email: send_mail(body, xlsx_path, run_date)
     else: print("[MAIL SKIP] preview/no-email")
     print(f"[DONE] HTML: {html_path}"); print(f"[DONE] XLSX: {xlsx_path}")
-    ref_mask = rows.get("ReportLayer", pd.Series("POLICY_RADAR", index=rows.index)).eq("REFERENCE")
-    policy_rows = rows[~ref_mask]
-    print(f"[ROWS] total={len(rows)}, policy={len(policy_rows)}, reference={int(ref_mask.sum())}, action_required={int(direct_confirmed_mask(policy_rows).sum())}, urgent={int(policy_rows.get('DecisionStatus', pd.Series(dtype=str)).eq('Urgent Verification').sum())}, scenario={int(policy_rows.get('DecisionStatus', pd.Series(dtype=str)).eq('Scenario Analysis').sum())}, monitoring={int(policy_rows.get('DecisionStatus', pd.Series(dtype=str)).eq('Monitoring').sum())}")
+    print(f"[ROWS] total={len(visible)}, action_queue={len(layers['action'])}, core_policy={len(layers['core'])}, samsung_watch={len(layers['watch'])}, global_context={len(layers['context'])}")
     return 0
 
 

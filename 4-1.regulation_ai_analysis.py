@@ -19,10 +19,9 @@ import urllib.request
 import urllib.error
 from pathlib import Path
 from datetime import datetime
-from urllib.parse import quote, unquote, urlparse, urljoin
+from urllib.parse import quote, unquote, urlparse
 
 import pandas as pd
-from gti_action_queue_contract import apply_action_queue_contract
 
 BASE_DIR = Path(os.getenv("GTI_BASE_DIR", r"C:\Temp"))
 INPUT_FILE = BASE_DIR / "3-1.regulation_article_summary.xlsx"
@@ -54,10 +53,12 @@ TOPIC_RULES = [
     ("CBAM_CARBON", ["cbam", "carbon border", "carbon border adjustment", "탄소국경"]),
     ("ORIGIN_FTA", ["fta", "cepa", "usmca", "rules of origin", "origin", "원산지", "자유무역협정", "tepa"]),
     ("HS_CLASSIFICATION", ["hs code", "classification", "tariff classification", "품목분류", "hs코드"]),
+    ("CUSTOMS_EDI", ["납세신고 정정", "수입신고 정정", "신고 정정", "전자문서 변경", "전자신고 변경", "5fe", "5fk"]),
+    ("FX_TRADE_PAYMENT", ["외국환거래규정", "외국환 신고", "수출입대금", "지급 및 영수", "상계 신고"]),
     ("TARIFF", ["section 301", "301조", "section 232", "232조", "reciprocal tariff", "tariff", "tariffs", "customs duty", "import duty", "관세", "관세율", "추가관세", "상호관세"]),
     ("CUSTOMS", ["customs", "clearance", "declaration", "통관", "세관", "관세청"]),
 ]
-TOPIC_KR = {"EXPORT_CONTROL":"수출통제", "AD_CVD":"반덤핑/상계관세", "CBAM_CARBON":"CBAM", "ORIGIN_FTA":"FTA/원산지", "HS_CLASSIFICATION":"HS/품목분류", "TARIFF":"관세정책", "CUSTOMS":"통관/세관", "TRADE_GENERAL":"무역일반"}
+TOPIC_KR = {"EXPORT_CONTROL":"수출통제", "AD_CVD":"반덤핑/상계관세", "CBAM_CARBON":"CBAM", "ORIGIN_FTA":"FTA/원산지", "HS_CLASSIFICATION":"HS/품목분류", "TARIFF":"관세정책", "CUSTOMS":"통관/세관", "CUSTOMS_EDI":"수입신고/전자문서", "FX_TRADE_PAYMENT":"수출입 외국환", "TRADE_GENERAL":"무역일반"}
 
 STRICT_TRADE_REG_TERMS = [
     "관세", "관세율", "관세청", "통관", "세관", "보세", "수입신고", "수출신고",
@@ -66,6 +67,8 @@ STRICT_TRADE_REG_TERMS = [
     "덤핑사실", "국내산업피해", "산업피해구제", "불공정무역행위", "조사개시결정",
     "상계관세", "무역구제", "수출통제", "전략물자", "entity list", "cbam", "carbon border",
     "customs", "tariff", "tariffs", "customs duty", "import duty", "section 301", "section 232",
+    "외국환거래규정", "외국환 신고", "수출입대금", "지급 및 영수",
+    "납세신고 정정", "수입신고 정정", "전자문서 변경", "전자신고 변경", "5fe", "5fk",
 ]
 
 SOFT_TRADE_REG_TERMS = [
@@ -81,6 +84,7 @@ CONCRETE_TRADE_REG_TERMS = [
     "anti-dumping", "antidumping", "countervailing", "ad/cvd", "tariff", "customs duty",
     "import duty", "rules of origin", "hs code", "classification",
     "수입", "수출", "원산지", "관세", "반덤핑", "상계관세", "무역구제", "세이프가드",
+    "외국환거래규정", "수출입대금", "납세신고 정정", "수입신고 정정", "전자문서 변경", "5fe", "5fk",
 ]
 
 GENERIC_NOTICE_ONLY_TERMS = {"notice", "public notice", "regulation", "law", "act", "decree", "공고", "고시"}
@@ -103,6 +107,7 @@ PURE_REGULATION_TERMS = [
     "법", "법률", "법령", "시행령", "시행규칙", "규칙", "고시", "공고", "훈령", "예규",
     "행정규칙", "입법예고", "행정예고", "덤핑방지관세", "덤핑사실", "국내산업피해", "조사개시결정", "상계관세", "무역구제",
     "관세율", "관세법", "보세", "통관", "수출입고시", "수입규제", "수출규제",
+    "외국환거래규정", "납세신고 정정", "수입신고 정정", "전자문서 변경", "5fe", "5fk",
 ]
 
 LEGAL_FORM_TITLE_TERMS = [
@@ -110,6 +115,7 @@ LEGAL_FORM_TITLE_TERMS = [
     "trade notice", "federal register", "determination under", "investigation",
     "법", "법률", "법령", "시행령", "시행규칙", "규칙", "고시", "공고", "훈령", "예규",
     "행정규칙", "입법예고", "행정예고", "덤핑방지관세", "상계관세", "무역구제", "지급요령",
+    "외국환거래규정", "전자문서 변경", "납세신고 정정", "수입신고 정정",
 ]
 
 POLICY_NOTICE_NOISE_TERMS = [
@@ -740,6 +746,8 @@ def action_for(topic):
     if topic == "CBAM_CARBON": return "ESG/구매/통관", "CBAM 대상 품목, 공급사 탄소자료, EU 신고 증빙 체계를 점검하십시오."
     if topic == "ORIGIN_FTA": return "FTA팀", "원산지 기준·CO 발급·수입 FTA 적용 및 증빙자료 영향을 확인하십시오."
     if topic == "HS_CLASSIFICATION": return "HS/통관팀", "품목분류 기준 변경 및 HS Master 영향 여부를 확인하십시오."
+    if topic == "CUSTOMS_EDI": return "통관운영/관세시스템", "수입(납세)신고 정정 전자문서와 관세사·EDI 인터페이스 변경일을 확인하고 신고 테스트 및 SOP를 갱신하십시오."
+    if topic == "FX_TRADE_PAYMENT": return "HQ관세/재무/외환", "수출입대금 지급·영수·상계·제3자 지급 신고요건과 증빙 및 ERP 지급 프로세스 영향을 확인하십시오."
     if topic == "TARIFF": return "통관운영/FTA팀", "관세율·시행일·대상국·대상품목을 확인하고 원가 영향을 점검하십시오."
     return "통관운영", "업무 관련성 확인 후 모니터링하십시오."
 
@@ -872,7 +880,7 @@ def score_row(row):
     if topic == "TRADE_GENERAL" and not keyword_hits and not metadata_trade_signal:
         rejects.append("weak_trade_policy_signal")
 
-    base_map = {"EXPORT_CONTROL":100,"AD_CVD":96,"CBAM_CARBON":90,"ORIGIN_FTA":88,"HS_CLASSIFICATION":86,"TARIFF":84,"CUSTOMS":74,"TRADE_GENERAL":72 if keyword_hits else 30}
+    base_map = {"EXPORT_CONTROL":100,"AD_CVD":96,"CBAM_CARBON":90,"ORIGIN_FTA":88,"HS_CLASSIFICATION":86,"CUSTOMS_EDI":90,"FX_TRADE_PAYMENT":86,"TARIFF":84,"CUSTOMS":74,"TRADE_GENERAL":72 if keyword_hits else 30}
     base = base_map.get(topic, 30)
     if age_days is None and metadata_trade_signal:
         recency = 85
@@ -1261,11 +1269,6 @@ def _is_bad_cached_analysis(item: dict, headline: str) -> bool:
     if status and not status.startswith("GEMINI_OK"):
         # v5 fallback cache. Re-analyze when possible.
         return True
-    if clean(item.get("Body Verified", "N")).upper() != "Y" and any(
-        x in status for x in ["FETCH_FAILED", "BODY_TOO_SHORT", "INVALID_GAZETTE_SHELL", "NO_INPUT_BODY"]
-    ):
-        # A newly available official alternate URL must get another chance.
-        return True
     return False
 
 def _extract_terms_for_analysis(text: str) -> dict:
@@ -1305,80 +1308,6 @@ def _is_navigation_or_gazette_shell(text: str) -> bool:
         sum(m in t for m in markers) >= 3
         and not any(m in t for m in legal_markers)
     )
-
-
-def _official_url_candidates(row: pd.Series, primary_url: str) -> list[str]:
-    """Return primary + cross-source official URLs without duplicating them."""
-    values = [primary_url, clean(row.get("original_url", "")), clean(row.get("AlternateURLs", ""))]
-    candidates: list[str] = []
-    for value in values:
-        if not value:
-            continue
-        found = re.findall(r"https?://[^\s|;,]+", value)
-        if not found and value.startswith("http"):
-            found = [value]
-        for candidate in found:
-            candidate = candidate.strip().rstrip(").]")
-            if candidate and candidate not in candidates:
-                candidates.append(candidate)
-    return candidates
-
-
-def _discover_official_document_links(page_url: str) -> list[str]:
-    """Discover linked legal documents (PDF/HWP/statute/detail) on an official page."""
-    try:
-        raw, content_type, fetch_status = _fetch_url_bytes(page_url)
-        if not raw or not str(fetch_status).startswith("FETCH_OK"):
-            return []
-        html_text = _decode_bytes(raw, content_type)
-    except Exception:
-        return []
-    try:
-        from bs4 import BeautifulSoup
-        hrefs = [a.get("href", "") for a in BeautifulSoup(html_text, "html.parser").find_all("a")]
-    except Exception:
-        hrefs = re.findall(r'''href=["']([^"']+)["']''', html_text, flags=re.I)
-    discovered: list[str] = []
-    for href in hrefs:
-        absolute = urljoin(page_url, clean(href))
-        low = absolute.lower()
-        if not absolute.startswith(("http://", "https://")):
-            continue
-        if not any(token in low for token in (
-            ".pdf", ".hwp", ".hwpx", "download", "attach", "lsinfop.do",
-            "detailrp", "gwanbo", "law.go.kr/lsw", "filedown", "filedownload",
-        )):
-            continue
-        if absolute not in discovered:
-            discovered.append(absolute)
-    return discovered[:20]
-
-
-def _fetch_official_body_with_fallback(row: pd.Series, primary_url: str) -> tuple[str, str, str]:
-    """Try every official source and retain the best non-navigation legal body."""
-    best_body, best_status, best_url, best_score = "", "NO_OFFICIAL_BODY", primary_url, -1
-    legal_markers = [
-        "부칙", "시행", "적용", "별표", "세율", "관세", "원산지", "품목번호",
-        "반덤핑", "상계관세", "effective", "tariff", "customs", "article",
-    ]
-    base_candidates = _official_url_candidates(row, primary_url)
-    candidates = list(base_candidates)
-    for page_url in base_candidates:
-        for linked in _discover_official_document_links(page_url):
-            if linked not in candidates:
-                candidates.append(linked)
-    for candidate in candidates:
-        body, status = fetch_article_body_for_ai(candidate)
-        if not body or _is_navigation_or_gazette_shell(body):
-            continue
-        marker_score = sum(m in body.lower() for m in legal_markers)
-        score = min(len(body), ARTICLE_MAX_CHARS) + marker_score * 500
-        if len(body) >= 80 and score > best_score:
-            best_body, best_status, best_url, best_score = body, status, candidate, score
-    if best_body:
-        source_kind = "PRIMARY" if safe_url(best_url) == safe_url(primary_url) else "ALTERNATE"
-        return best_body, f"{source_kind}_OFFICIAL:{best_status}", best_url
-    return "", best_status, best_url
 
 def _fallback_gti_analysis_from_body(*, body: str, headline: str, issue: str, impact: str, products_text: str, default_action: str, content_type: str) -> dict:
     summary = _simple_body_summary(body, headline)
@@ -1484,9 +1413,7 @@ def build_gti_ai_analysis(row: pd.Series, *, headline: str, url: str, issue: str
     """v6 override: Gemini first; ignore stale fallback cache; useful fallback if Gemini unavailable."""
     body, status = _fallback_source_body(row, headline)
     if not body:
-        body, status, evidence_url = _fetch_official_body_with_fallback(row, url)
-    else:
-        evidence_url = url
+        body, status = fetch_article_body_for_ai(url)
 
     if _is_navigation_or_gazette_shell(body):
         body = ""
@@ -1538,7 +1465,6 @@ Direct 판정 조건:
 - Samsung Impact: {impact}
 - Affected Products: {products_text}
 - URL: {url}
-- Evidence URL: {evidence_url}
 - Headline: {headline}
 - Default Action Hint: {default_action}
 
@@ -1847,7 +1773,7 @@ def _gti_step4_extractor_log_once():
 # ======================================================================
 
 def main():
-    print("GTI STEP4-1 REGULATION AI v8.8 OFFICIAL-LINKED-DOCUMENT FALLBACK START")
+    print("GTI STEP4-1 REGULATION AI v8.6 BILL-IDENTITY PRIORITY START")
     print(f"[MODEL] {GEMINI_MODEL}")
     _gti_step4_gemini_log_once()
     _gti_step4_extractor_log_once()
@@ -1856,7 +1782,7 @@ def main():
     log(f"keyword guardrail loaded: {len(KEYWORD_TERMS)} terms")
     df=read_input()
     selected, excluded_raw, audit_raw=build(df)
-    daily=apply_action_queue_contract(to_output(selected))
+    daily=to_output(selected)
     excluded=to_output(excluded_raw)
     cumulative=merge_cumulative(daily)
     write_excel(daily, OUT_SUMMARY); write_excel(cumulative, OUT_CUMULATIVE); write_excel(excluded, OUT_EXCLUDED)

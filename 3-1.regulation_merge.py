@@ -38,7 +38,12 @@ CORE_TERMS = [
     '원산지','fta','cepa','epa','rcep','협정세율','특혜관세','반덤핑','덤핑방지관세','상계관세','세이프가드',
     '수출통제','전략물자','제재','cbam','탄소국경','section 301','section 232',
     'customs','tariff','duty','import duty','anti-dumping','antidumping','countervailing','rules of origin',
-    'export control','sanctions','customs valuation','de minimis','trade remedy'
+    'export control','sanctions','customs valuation','de minimis','trade remedy',
+    # Customs-adjacent rules that directly change import/export payment or
+    # declaration operations.  Keep these as exact concepts, not broad
+    # "외환"/"전자" matches, to avoid unrelated finance/IT notices.
+    '외국환거래규정','외국환 신고','수출입대금','지급 및 영수',
+    '납세신고 정정','수입신고 정정','전자문서 변경','전자신고 변경','5fe','5fk'
 ]
 
 # HQ + overseas subsidiary regulation scope. General customs procedures in
@@ -58,6 +63,8 @@ GENERAL_CUSTOMS_PROCEDURE_TERMS = [
     'customs procedure','customs declaration','import declaration','export declaration',
     'customs valuation','customs audit','administrative appeal','appeal procedure','advance ruling',
     'binding ruling','duty drawback','customs refund','bonded warehouse','record keeping',
+    '납세신고 정정','수입신고 정정','신고 정정','전자문서 변경','전자신고 변경',
+    '5fe','5fk','외국환거래규정','외국환 신고','수출입대금','지급 및 영수',
 ]
 ITEM_SPECIFIC_TERMS = [
     'hs code','hs코드','품목분류','tariff classification','반덤핑','anti-dumping','antidumping',
@@ -338,6 +345,9 @@ STRONG_CUSTOMS_TERMS = [
     '수출통제','전략물자','제재','entity list','export control','export controls','sanctions','uflpa',
     'cbam','탄소국경','carbon border adjustment',
     'section 232','section 301','232조','301조',
+    # HQ customs operations: trade-payment compliance and declaration EDI.
+    '외국환거래규정','외국환 신고','수출입대금','지급 및 영수',
+    '납세신고 정정','수입신고 정정','전자문서 변경','전자신고 변경','5fe','5fk',
 ]
 
 def strong_customs_rule(title: str) -> tuple[bool, list[str]]:

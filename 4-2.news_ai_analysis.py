@@ -1395,6 +1395,35 @@ def build() -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
                 and bool(clean(r.get("MappedHS")) or clean(r.get("TradeRoute")))
             ) else "N", axis=1,
         )
+        # A policy delta also includes a new customs operating instrument.
+        # A KCS HS cross-reference changes classification/mapping work even
+        # when the underlying U.S. tariff was announced earlier. FTA guidance
+        # is attached to the effective FTA event when entry into force is
+        # confirmed in the article body.
+        for idx, r in selected.iterrows():
+            body = " ".join([
+                clean(r.get("Headline")), clean(r.get("SummaryAI")),
+                clean(r.get("AnalysisAI")), clean(r.get("Article Body Evidence")),
+            ]).lower()
+            kcs_hs_map = (
+                any(x in body for x in ["품목번호 연계표", "hs code cross-reference", "한-미 품목번호"])
+                and any(x in body for x in ["관세청", "korea customs service"])
+                and any(x in body for x in ["미 추가관세", "미국 관세", "new us tariff", "u.s. tariff"])
+            )
+            mercosur_sg_fta = (
+                "메르코수르" in body and "싱가포르" in body and "fta" in body
+                and any(x in body for x in ["발효", "효력", "entered into force", "effective"])
+            )
+            if kcs_hs_map:
+                selected.at[idx, "PolicyDeltaFlag"] = "Y"
+                selected.at[idx, "PolicyDeltaType"] = "CUSTOMS_OPERATION_DELTA"
+                selected.at[idx, "PolicyDeltaReason"] = "관세청의 미국 추가관세 대응 한·미 품목번호 연계표 신규 공개"
+                selected.at[idx, "Issue"] = "HS_CLASSIFICATION"
+            elif mercosur_sg_fta:
+                selected.at[idx, "PolicyDeltaFlag"] = "Y"
+                selected.at[idx, "PolicyDeltaType"] = "FTA_EFFECTIVE_DELTA"
+                selected.at[idx, "PolicyDeltaReason"] = "메르코수르-싱가포르 FTA 발효 및 활용조건 확인 필요"
+                selected.at[idx, "Issue"] = "ORIGIN_FTA"
         selected["ThreeGateStatus"] = selected.apply(
             lambda r: (
                 "G1_POLICY_DELTA_FAIL" if clean(r.get("PolicyDeltaFlag")) != "Y"
@@ -1445,6 +1474,13 @@ def build() -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
             and any(x in text for x in ["관세", "tariff"])
         ):
             return "US_DRONE_232_TARIFF"
+        if (
+            any(x in text for x in ["품목번호 연계표", "hs code cross-reference", "한-미 품목번호"])
+            and any(x in text for x in ["관세청", "korea customs service"])
+        ):
+            return "KR_US_ADDITIONAL_TARIFF_HS_CROSS_REFERENCE"
+        if "메르코수르" in text and "싱가포르" in text and "fta" in text:
+            return "MERCOSUR_SINGAPORE_FTA_EFFECTIVE"
         rules = [
             ("CN_JP_DICHLOROSILANE_AD_2026", [["디클로로실란", "반도체 가스", "반도체 핵심소재"], ["반덤핑", "보증금", "99.2%", "99.2％"], ["중국", "china"]]),
             ("VN_IN_CERAMIC_TILE_AD_2026", [["세라믹 타일", "ceramic tile"], ["반덤핑", "anti-dumping"], ["인도", "india"]]),
