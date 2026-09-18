@@ -44,7 +44,7 @@ def publication_date(v) -> str:
     """Return the source publication date used for sensing, never the run date."""
     dt = pd.to_datetime(v, errors="coerce")
     if pd.isna(dt):
-        return s(v)[:10] or "원문 확인 필요"
+        return "원문 게시일 확인 필요"
     return dt.strftime("%Y-%m-%d")
 
 
@@ -53,7 +53,7 @@ def row_publication_date(row: pd.Series) -> str:
         value = row.get(col, "")
         if value is not None and not pd.isna(value) and s(value):
             return publication_date(value)
-    return "원문 확인 필요"
+    return "원문 게시일 확인 필요"
 
 
 def regulation_event_key(row: pd.Series) -> str:
@@ -297,7 +297,7 @@ def write_xlsx(path: Path, rows: pd.DataFrame) -> None:
 # ---------------------------------------------------------------------------
 # v50 fixed-form executive report contract
 # ---------------------------------------------------------------------------
-ENGINE_VERSION = "v50.0 FIXED-SIX-SECTION"
+ENGINE_VERSION = "v50.3 WATCH-REASON-REPAIR"
 HEALTH_FILE = BASE / "1.site_crawl_health.xlsx"
 
 
@@ -399,10 +399,31 @@ def classify_report_layers(rows: pd.DataFrame) -> tuple[pd.DataFrame, dict[str, 
     samsung_scope = native.str.contains(
         r"삼성전자|samsung electronics|반도체|semiconductor|디스플레이|스마트폰|휴대폰|가전|네트워크장비|"
         r"품목번호\s*연계표|한.?미\s*품목번호|메르코수르.{0,20}싱가포르|싱가포르.{0,20}메르코수르|"
-        r"외국환거래규정|수출입대금|납세신고\s*정정|수입신고\s*정정|전자문서\s*변경|5fe|5fk",
+        r"외국환거래규정|수출입대금|납세신고\s*정정|수입신고\s*정정|전자문서\s*변경|5fe|5fk|"
+        r"통관지원|세관상호지원|관세협력|합동단속|위조상품|국경단계|지식재산권\s*보호",
         regex=True, na=False,
     )
-    excluded_mask = d["ReportLayer"].astype(str).str.upper().eq("EXCLUDED") | d.get("DecisionStatus", "").astype(str).str.lower().eq("excluded")
+    declared_excluded = d["ReportLayer"].astype(str).str.upper().eq("EXCLUDED") | d.get("DecisionStatus", "").astype(str).str.lower().eq("excluded")
+    substantive_customs = native.str.contains(
+        r"통관지원|통관\s*지원|세관상호지원|세관\s*상호지원|관세협력|관세\s*협력|"
+        r"합동단속|합동\s*단속|위조상품|위조\s*상품|국경단계|지식재산권\s*보호|"
+        r"customs\s*(?:assistance|cooperation|enforcement)|counterfeit",
+        regex=True, na=False,
+    )
+    administrative_only = native.str.contains(
+        r"채용|입찰|교육생\s*모집|설명회\s*개최|행사\s*안내|공고\s*마감|"
+        r"recruitment|tender\s+notice|training\s+registration",
+        regex=True, na=False,
+    ) & ~substantive_customs
+    rescued_customs = declared_excluded & substantive_customs
+    d.loc[rescued_customs, "ReportLayer"] = "SAMSUNG_WATCH"
+    d.loc[rescued_customs, "ContractReason"] = (
+        "관세당국 간 통관지원·단속 협력 내용 확인: 삼성전자 관련 품목·법인·적용범위 추가 검증 필요"
+    )
+    d.loc[rescued_customs, "Missing Facts"] = (
+        "공식 MOU·협정 원문 | 대상 품목·법인 | 적용 시점 | 통관지원 연락창구·단속 절차"
+    )
+    excluded_mask = (declared_excluded & ~substantive_customs) | administrative_only
     action_mask = ~excluded_mask & delta & evidence & direct
     core_mask = ~excluded_mask & ~action_mask & delta & evidence
     watch_mask = ~excluded_mask & ~action_mask & ~core_mask & samsung_scope
@@ -410,6 +431,7 @@ def classify_report_layers(rows: pd.DataFrame) -> tuple[pd.DataFrame, dict[str, 
     action = d[action_mask].sort_values("_score", ascending=False, kind="stable").head(3).copy()
     core = d[core_mask].sort_values("_score", ascending=False, kind="stable").head(5).copy()
     watch = d[watch_mask].sort_values("_score", ascending=False, kind="stable").head(10).copy()
+    watch = sort_by_country_and_publish_date(watch)
     used = set(action.index) | set(core.index) | set(watch.index)
     context_candidates = d[~excluded_mask & ~d.index.isin(used)].copy()
     context = context_candidates.sort_values("_score", ascending=False, kind="stable").head(20).copy()
@@ -449,7 +471,29 @@ def health_summary() -> dict[str, int]:
     status_col = next((c for c in ["HealthStatus", "health_status", "final_status", "status", "zero_yield_status"] if c in health), None)
     if not status_col:
         return result
-    values = health[status_col].fillna("").astype(str).str.upper()
+    site_col = next((c for c in [
+        "SiteKey", "site_key", "Site ID", "site_id", "Site", "site",
+        "SiteName", "site_name", "Agency", "Source", "URL", "url",
+    ] if c in health), None)
+    time_col = next((c for c in [
+        "DiagnosedAt", "diagnosed_at", "CheckedAt", "checked_at",
+        "RunDateTime", "run_datetime", "Timestamp", "timestamp",
+        "CrawlTime", "crawl_time", "DateTime", "datetime", "Date", "date",
+    ] if c in health), None)
+    latest = health.copy()
+    if site_col:
+        latest["_site_key"] = latest[site_col].fillna("").astype(str).str.strip()
+        blank = latest["_site_key"].eq("")
+        latest.loc[blank, "_site_key"] = [f"__ROW_{i}" for i in latest.index[blank]]
+        latest["_row_order"] = range(len(latest))
+        if time_col:
+            latest["_diagnosed_at"] = pd.to_datetime(latest[time_col], errors="coerce")
+            latest = latest.sort_values(
+                ["_site_key", "_diagnosed_at", "_row_order"],
+                ascending=[True, True, True], na_position="first", kind="stable",
+            )
+        latest = latest.drop_duplicates("_site_key", keep="last")
+    values = latest[status_col].fillna("").astype(str).str.upper().str.strip()
     result["OK_NEW"] = int(values.str.contains(r"^OK|VALID_REGULATION", regex=True).sum())
     result["NO_NEW"] = int(values.str.contains("NO_NEW", regex=False).sum())
     result["PARSE_ZERO"] = int(values.str.contains("PARSE_ZERO|PARTIAL_COVERAGE", regex=True).sum())
@@ -459,6 +503,7 @@ def health_summary() -> dict[str, int]:
 
 def conclusion_lines(layers: dict[str, pd.DataFrame], health: dict[str, int]) -> list[str]:
     action, core, watch = layers["action"], layers["core"], layers["watch"]
+    context = layers["context"]
     line1 = (f"금일 삼성전자 본·지사 거래에 직접 영향이 확인된 신규 관세정책은 {len(action)}건입니다."
              if len(action) else "금일 삼성전자 본·지사 거래에 직접 영향이 확인된 신규 관세정책은 없습니다.")
     if len(core) or len(watch):
@@ -466,13 +511,46 @@ def conclusion_lines(layers: dict[str, pd.DataFrame], health: dict[str, int]) ->
         line2 = f"공식근거가 확인된 핵심 정책 {len(core)}건과 삼성 관련 확인 후보 {len(watch)}건을 센싱했습니다"
         if names: line2 += ": " + " / ".join(names)
         line2 += "."
+    elif len(context):
+        names = [concise(x, 42) for x in context.get("Headline", pd.Series(dtype=str)).head(2)]
+        line2 = f"확정 정책은 아니지만 글로벌 관세·통상 동향 {len(context)}건을 모니터링 대상으로 확인했습니다"
+        if names: line2 += ": " + " / ".join(names)
+        line2 += "."
     else:
-        line2 = "공식근거가 확인된 핵심 정책과 추가 확인이 필요한 삼성 관련 후보는 없습니다."
-    if health["FAIL"] or health["PARSE_ZERO"]:
-        line3 = f"수집상태는 FAIL {health['FAIL']}건, PARSE_ZERO {health['PARSE_ZERO']}건으로 재확인이 필요합니다."
+        line2 = "금일 보고기준을 충족한 신규 관세·통상 동향은 없습니다."
+    if len(action):
+        line3 = "HQ Customs는 직접 영향 항목의 대상법인·품목·거래경로와 실행기한을 즉시 확정해야 합니다."
+    elif len(core) or len(watch):
+        line3 = "HQ Customs는 공식 원문과 적용 시점, 대상 품목·법인 및 통관지원·단속 절차를 확인해야 합니다."
+    elif len(context):
+        line3 = "HQ Customs는 전망성 보도를 확정 정책과 구분하고 공식 발표 여부만 후속 확인해야 합니다."
     else:
-        line3 = f"수집상태는 OK_NEW {health['OK_NEW']}건, NO_NEW {health['NO_NEW']}건이며 확인된 수집 장애는 없습니다."
+        line3 = "기존 고위험 정책의 변동 여부와 수집 실패 사이트를 계속 확인해야 합니다."
     return [line1, line2, line3]
+
+
+def summary_counter(layers: dict[str, pd.DataFrame], health: dict[str, int]) -> str:
+    return (f"※ 삼성전자 본·지사 직접 영향 {len(layers['action'])}건, 핵심 정책 {len(layers['core'])}건, "
+            f"삼성 관련 확인 후보 {len(layers['watch'])}건, 수집상태 FAIL {health['FAIL']}건, "
+            f"PARSE_ZERO {health['PARSE_ZERO']}건 재확인 필요.")
+
+
+def sort_by_country_and_publish_date(frame: pd.DataFrame) -> pd.DataFrame:
+    if frame.empty:
+        return frame.copy()
+    out = frame.copy()
+    out["_country_sort"] = out.get("Country", pd.Series("", index=out.index)).fillna("").astype(str).str.casefold()
+    date_values = pd.Series(pd.NaT, index=out.index, dtype="datetime64[ns]")
+    # Prefer timestamp-bearing source fields for newest-first ordering. The
+    # normalized Original Publish Date may intentionally contain date only.
+    for col in ("Publish Date", "Date", "Original Publish Date"):
+        if col in out:
+            date_values = date_values.fillna(pd.to_datetime(out[col], errors="coerce"))
+    out["_date_sort"] = date_values
+    return out.sort_values(
+        ["_country_sort", "_date_sort"], ascending=[True, False],
+        na_position="last", kind="stable",
+    ).drop(columns=["_country_sort", "_date_sort"])
 
 
 def empty_message(label: str) -> str:
@@ -486,7 +564,9 @@ def empty_message(label: str) -> str:
 
 def build_html_v50(layers: dict[str, pd.DataFrame], run_date: str, health: dict[str, int]) -> str:
     action, core, watch, context = (layers[k] for k in ["action", "core", "watch", "context"])
+    watch = sort_by_country_and_publish_date(watch)
     lines = conclusion_lines(layers, health)
+    counter = summary_counter(layers, health)
     def empty(k): return f"<div class='empty'>{esc(empty_message(k))}</div>"
     action_html = []
     for _, r in action.iterrows():
@@ -506,12 +586,15 @@ def build_html_v50(layers: dict[str, pd.DataFrame], run_date: str, health: dict[
                 cells.append(f"<td>{val}</td>")
             body.append("<tr>"+"".join(cells)+"</tr>")
         return f"<table><tr>{heads}</tr>{''.join(body)}</table>"
-    watch_table = table(watch, [("상태","DecisionStatus"),("정책 신호","Headline"),("삼성 관련성","ContractReason"),("추가 확인","Missing Facts")]) if len(watch) else empty("watch")
-    context_table = table(context, [("국가/권역","Country"),("정책유형","Issue"),("정책 동향","Headline"),("근거상태","OfficialSourceStatus")]) if len(context) else empty("context")
+    for frame in (watch, context):
+        if not frame.empty:
+            frame["_Display Publish Date"] = frame.apply(row_publication_date, axis=1)
+    watch_table = table(watch, [("국가/권역","Country"),("원문 게시일","_Display Publish Date"),("상태","DecisionStatus"),("정책 신호","Headline"),("삼성 관련성","ContractReason"),("추가 확인","Missing Facts")]) if len(watch) else empty("watch")
+    context_table = table(context, [("국가/권역","Country"),("원문 게시일","_Display Publish Date"),("정책유형","Issue"),("정책 동향","Headline"),("근거상태","OfficialSourceStatus")]) if len(context) else empty("context")
     return f"""<!doctype html><html><head><meta charset='utf-8'><style>
-body{{font-family:Arial,'Malgun Gothic',sans-serif;color:#172033;max-width:1040px;margin:auto;padding:24px;background:#f5f7fb}}header,.section{{background:#fff;border-radius:12px;padding:22px;margin-bottom:14px}}h1{{margin:0;color:#123b70}}h2{{color:#123b70}}.lead{{font-size:16px;line-height:1.7;border-left:5px solid #1d63b7;padding:12px 16px;background:#eef5ff}}.card{{border:1px solid #dbe4ef;border-radius:9px;padding:14px;margin:10px 0}}.meta{{font-size:12px;color:#687386}}table{{width:100%;border-collapse:collapse}}th,td{{padding:8px;border-bottom:1px solid #e4e8ef;text-align:left;font-size:12px;vertical-align:top}}.empty{{padding:16px;background:#f7f8fa;color:#53606f}}
+body{{font-family:Arial,'Malgun Gothic',sans-serif;color:#172033;max-width:1040px;margin:auto;padding:24px;background:#f5f7fb}}header,.section{{background:#fff;border-radius:12px;padding:22px;margin-bottom:14px}}h1{{margin:0;color:#123b70}}h2{{color:#123b70}}.lead{{font-size:16px;line-height:1.7;border-left:5px solid #1d63b7;padding:12px 16px;background:#eef5ff}}.summary-counter{{font-size:11px;color:#7a828c;line-height:1.55;margin:9px 0 0 16px}}.card{{border:1px solid #dbe4ef;border-radius:9px;padding:14px;margin:10px 0}}.meta{{font-size:12px;color:#687386}}table{{width:100%;border-collapse:collapse}}th,td{{padding:8px;border-bottom:1px solid #e4e8ef;text-align:left;font-size:12px;vertical-align:top}}.empty{{padding:16px;background:#f7f8fa;color:#53606f}}
 </style></head><body><header><h1>[GTI Radar] Global Trade Intelligence</h1><p>{run_date} | Samsung Electronics Customs Executive Brief</p></header>
-<section class='section'><h2>1. 오늘의 결론</h2><div class='lead'>{'<br>'.join(esc(x) for x in lines)}</div></section>
+<section class='section'><h2>1. 요약</h2><div class='lead'>{'<br>'.join(esc(x) for x in lines)}</div><p class='summary-counter'>{esc(counter)}</p></section>
 <section class='section'><h2>2. Samsung Action Queue ({len(action)}건)</h2>{''.join(action_html) if action_html else empty('action')}</section>
 <section class='section'><h2>3. 핵심 정책 분석 ({len(core)}건)</h2>{''.join(core_html) if core_html else empty('core')}</section>
 <section class='section'><h2>4. Samsung Customs Watch ({len(watch)}건)</h2>{watch_table}</section>
@@ -573,15 +656,15 @@ def main() -> int:
     print(f"[INFO] GTI STEP5 {ENGINE_VERSION} START")
     news = read_excel_safe(Path(args.news_input)); reg = read_excel_safe(Path(args.regulation_input))
     news, stale = within_24h(news, now)
-    # STEP4-2 is authoritative for AI selection. STEP5 only assigns report
-    # layers; it must not silently discard valid Watch/Context rows by running
-    # a second, different quality contract.
-    rejected = news[news.get("ReportLayer", pd.Series("", index=news.index)).astype(str).str.upper().eq("EXCLUDED")].copy()
-    news = news[~news.index.isin(rejected.index)].copy()
+    # Keep STEP4 exclusions until STEP5 classification. This permits the
+    # narrow substantive-customs rescue rule while preserving genuine
+    # administrative exclusions in the Excluded audit sheet.
+    input_news_count = len(news)
     reg = normalize_regulation(reg)
     frames = [x for x in (reg, news) if not x.empty]
     rows = pd.concat(frames, ignore_index=True, sort=False) if frames else pd.DataFrame()
     if not rows.empty:
+        rows["Original Publish Date"] = rows.apply(row_publication_date, axis=1)
         if "ExecutiveScore" not in rows:
             rows["ExecutiveScore"] = pd.to_numeric(rows.get("Importance Score", 0), errors="coerce").fillna(0)
         rows = rows.sort_values("ExecutiveScore", ascending=False, kind="stable").drop_duplicates("EventKey", keep="first")
@@ -589,10 +672,8 @@ def main() -> int:
     rows, historical_removed = remove_history(rows, old)
     rows = rows.reset_index(drop=True)
     visible, layers = classify_report_layers(rows)
-    if not rejected.empty:
-        layers["excluded"] = pd.concat([layers["excluded"], rejected], ignore_index=True, sort=False)
     health = health_summary()
-    print(f"[STEP5 CONTRACT] news_input={len(news)+len(rejected)} / selected={len(news)} / rejected={len(rejected)} / stale={len(stale)}")
+    print(f"[STEP5 CONTRACT] news_input={input_news_count} / classified={len(news)} / excluded={len(layers['excluded'])} / stale={len(stale)}")
     print(f"[STEP5 LIVE NOVELTY] removed={historical_removed} / report={len(visible)} / forced_fill=0")
     output_dir = Path(args.output_dir); output_dir.mkdir(parents=True, exist_ok=True)
     stem = f"[GTI Radar] Global Trade Intelligence({run_date})"; html_path = output_dir / f"{stem}.html"; xlsx_path = output_dir / f"{stem}.xlsx"
