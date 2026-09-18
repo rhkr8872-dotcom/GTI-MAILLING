@@ -86,6 +86,7 @@ PIPELINE_ENV_DEFAULTS = {
     "GTI_LOOKBACK_HOURS": "72",
     "GTI_STEP3_RECENT_HOURS": "24",
     "GTI_STEP4_NEWS_MAX_AGE_HOURS": "24",
+    "GTI_STEP4_REG_MAX_AGE_HOURS": "24",
 
     # Step5 final hard guard.
     "GTI_MAIL_NEWS_HOURS": "24",

@@ -28,6 +28,7 @@ INPUT_FILE = BASE_DIR / "3-1.regulation_article_summary.xlsx"
 FALLBACK_INPUT_FILE = BASE_DIR / "3-1.regulation_summary.xlsx"
 KEYWORD_FILE = BASE_DIR / "keyword.xlsx"
 OUT_SUMMARY = BASE_DIR / "4-1.regulation_ai_summary.xlsx"
+MAX_AGE_HOURS = int(os.getenv("GTI_STEP4_REG_MAX_AGE_HOURS", "24"))
 OUT_CUMULATIVE = BASE_DIR / "4-1.regulation_ai_cumulative.xlsx"
 OUT_CUMULATIVE_REMOVED = BASE_DIR / "4-1.regulation_ai_cumulative_removed.xlsx"
 OUT_EXCLUDED = BASE_DIR / "4-1.regulation_ai_excluded.xlsx"
@@ -1016,6 +1017,20 @@ def read_input():
     if "Source" not in df.columns and "source" in df.columns: df["Source"] = df["source"]
     return df
 
+def strict_24h(df):
+    if df.empty:
+        return df.copy(), df.copy()
+    out = df.copy()
+    published = pd.to_datetime(out.get("Date"), errors="coerce", format="mixed")
+    now_text = os.getenv("GTI_NOW", "").strip()
+    now = pd.Timestamp(datetime.fromisoformat(now_text) if now_text else datetime.now())
+    cutoff = now - pd.Timedelta(hours=MAX_AGE_HOURS)
+    keep = published.notna() & published.between(cutoff, now + pd.Timedelta(hours=2), inclusive="both")
+    fresh = out.loc[keep].copy()
+    stale = out.loc[~keep].copy()
+    log(f"24H REGULATION GUARD: {len(out)} -> {len(fresh)} / removed={len(stale)} / cutoff={cutoff}")
+    return fresh, stale
+
 def build(df):
     rows=[]
     for _, row in df.iterrows():
@@ -1781,9 +1796,31 @@ def main():
     KEYWORD_TERMS = load_keyword_terms()
     log(f"keyword guardrail loaded: {len(KEYWORD_TERMS)} terms")
     df=read_input()
+    df, stale_input = strict_24h(df)
     selected, excluded_raw, audit_raw=build(df)
     daily=to_output(selected)
     excluded=to_output(excluded_raw)
+    if not stale_input.empty:
+        stale_rows = stale_input.copy()
+        stale_rows["selected"] = False
+        stale_rows["score"] = 0
+        stale_rows["Risk"] = "하"
+        stale_rows["Issue"] = ""
+        stale_rows["topic"] = ""
+        stale_rows["RejectReason"] = "STRICT_24H_PUBLISHED_DATE"
+        stale_rows["Summary"] = stale_rows.get("Summary", "")
+        stale_rows["AI Analysis"] = stale_rows.get("AI Analysis", "")
+        stale_rows["Action Plan"] = stale_rows.get("Action Plan", "")
+        stale_rows["Samsung Impact"] = "Reference"
+        stale_rows["Top3 Eligible"] = "N"
+        stale_rows["PriorityEligible"] = "N"
+        stale_rows["DecisionStatus"] = "Excluded - older than 24 hours"
+        stale_rows["Policy Stage"] = ""
+        stale_rows["Body Verified"] = "N"
+        stale_rows["Change Type"] = ""
+        stale_rows["Evidence"] = ""
+        stale_rows["Missing Facts"] = ""
+        excluded = pd.concat([excluded, to_output(stale_rows)], ignore_index=True, sort=False)
     cumulative=merge_cumulative(daily)
     write_excel(daily, OUT_SUMMARY); write_excel(cumulative, OUT_CUMULATIVE); write_excel(excluded, OUT_EXCLUDED)
     if not CUMULATIVE_REMOVED_DF.empty:

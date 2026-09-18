@@ -45,11 +45,13 @@ def publication_date(v) -> str:
     dt = pd.to_datetime(v, errors="coerce")
     if pd.isna(dt):
         return "원문 게시일 확인 필요"
+    if dt.hour or dt.minute or dt.second:
+        return dt.strftime("%Y-%m-%d %H:%M")
     return dt.strftime("%Y-%m-%d")
 
 
 def row_publication_date(row: pd.Series) -> str:
-    for col in ("Original Publish Date", "Publish Date", "Date"):
+    for col in ("Publish Date", "Date", "Original Publish Date"):
         value = row.get(col, "")
         if value is not None and not pd.isna(value) and s(value):
             return publication_date(value)
@@ -96,6 +98,16 @@ def within_24h(df: pd.DataFrame, now: datetime) -> tuple[pd.DataFrame, pd.DataFr
     future_limit = pd.Timestamp(now + timedelta(hours=2))
     keep = out["_published"].between(cutoff, future_limit, inclusive="both")
     return out[keep].drop(columns="_published"), out[~keep].drop(columns="_published")
+
+
+def has_substantive_text(value, headline="", min_chars: int = 45) -> bool:
+    text = re.sub(r"\s+", " ", s(value)).strip()
+    title = re.sub(r"\s+", " ", s(headline)).strip()
+    if not text or len(text) < min_chars:
+        return False
+    if title and re.sub(r"\W+", "", text).lower() == re.sub(r"\W+", "", title).lower():
+        return False
+    return True
 
 
 def normalize_regulation(df: pd.DataFrame) -> pd.DataFrame:
@@ -504,13 +516,14 @@ def health_summary() -> dict[str, int]:
 def conclusion_lines(layers: dict[str, pd.DataFrame], health: dict[str, int]) -> list[str]:
     action, core, watch = layers["action"], layers["core"], layers["watch"]
     context = layers["context"]
-    line1 = (f"금일 삼성전자 본·지사 거래에 직접 영향이 확인된 신규 관세정책은 {len(action)}건입니다."
-             if len(action) else "금일 삼성전자 본·지사 거래에 직접 영향이 확인된 신규 관세정책은 없습니다.")
+    line1 = (f"금일 GTI Radar는 삼성전자 본·지사 거래에 직접적인 영향을 미치는 신규 관세정책 {len(action)}건을 확인했습니다."
+             if len(action) else "금일 GTI Radar는 삼성전자 본·지사 거래에 직접적인 영향을 미치는 신규 관세정책은 확인되지 않았습니다.")
     if len(core) or len(watch):
-        names = [concise(x, 42) for x in pd.concat([core, watch]).get("Headline", pd.Series(dtype=str)).head(2)]
-        line2 = f"공식근거가 확인된 핵심 정책 {len(core)}건과 삼성 관련 확인 후보 {len(watch)}건을 센싱했습니다"
-        if names: line2 += ": " + " / ".join(names)
-        line2 += "."
+        names = [concise(x, 42) for x in core.get("Headline", pd.Series(dtype=str)).head(2)]
+        total_review = len(core) + len(watch)
+        line2 = f"공식 근거가 확인된 주요 정책 {len(core)}건"
+        if names: line2 += "(" + " / ".join(names) + ")"
+        line2 += f"을 포함해 삼성 관련 검토 대상 총 {total_review}건을 센싱했습니다."
     elif len(context):
         names = [concise(x, 42) for x in context.get("Headline", pd.Series(dtype=str)).head(2)]
         line2 = f"확정 정책은 아니지만 글로벌 관세·통상 동향 {len(context)}건을 모니터링 대상으로 확인했습니다"
@@ -521,7 +534,7 @@ def conclusion_lines(layers: dict[str, pd.DataFrame], health: dict[str, int]) ->
     if len(action):
         line3 = "HQ Customs는 직접 영향 항목의 대상법인·품목·거래경로와 실행기한을 즉시 확정해야 합니다."
     elif len(core) or len(watch):
-        line3 = "HQ Customs는 공식 원문과 적용 시점, 대상 품목·법인 및 통관지원·단속 절차를 확인해야 합니다."
+        line3 = "HQ Customs는 해당 정책의 공식 원문, 적용 시점, 대상 품목·법인 및 통관 지원·단속 절차를 면밀히 확인해야 합니다."
     elif len(context):
         line3 = "HQ Customs는 전망성 보도를 확정 정책과 구분하고 공식 발표 여부만 후속 확인해야 합니다."
     else:
@@ -589,8 +602,8 @@ def build_html_v50(layers: dict[str, pd.DataFrame], run_date: str, health: dict[
     for frame in (watch, context):
         if not frame.empty:
             frame["_Display Publish Date"] = frame.apply(row_publication_date, axis=1)
-    watch_table = table(watch, [("국가/권역","Country"),("원문 게시일","_Display Publish Date"),("상태","DecisionStatus"),("정책 신호","Headline"),("삼성 관련성","ContractReason"),("추가 확인","Missing Facts")]) if len(watch) else empty("watch")
-    context_table = table(context, [("국가/권역","Country"),("원문 게시일","_Display Publish Date"),("정책유형","Issue"),("정책 동향","Headline"),("근거상태","OfficialSourceStatus")]) if len(context) else empty("context")
+    watch_table = table(watch, [("국가/권역","Country"),("원문 게시일","_Display Publish Date"),("정책 신호","Headline"),("정책 동향 요약","Summary"),("삼성 관련성 분석","AI Analysis"),("추가 확인","Missing Facts")]) if len(watch) else empty("watch")
+    context_table = table(context, [("국가/권역","Country"),("원문 게시일","_Display Publish Date"),("정책유형","Issue"),("정책 동향","Headline"),("요약","Summary")]) if len(context) else empty("context")
     return f"""<!doctype html><html><head><meta charset='utf-8'><style>
 body{{font-family:Arial,'Malgun Gothic',sans-serif;color:#172033;max-width:1040px;margin:auto;padding:24px;background:#f5f7fb}}header,.section{{background:#fff;border-radius:12px;padding:22px;margin-bottom:14px}}h1{{margin:0;color:#123b70}}h2{{color:#123b70}}.lead{{font-size:16px;line-height:1.7;border-left:5px solid #1d63b7;padding:12px 16px;background:#eef5ff}}.summary-counter{{font-size:11px;color:#7a828c;line-height:1.55;margin:9px 0 0 16px}}.card{{border:1px solid #dbe4ef;border-radius:9px;padding:14px;margin:10px 0}}.meta{{font-size:12px;color:#687386}}table{{width:100%;border-collapse:collapse}}th,td{{padding:8px;border-bottom:1px solid #e4e8ef;text-align:left;font-size:12px;vertical-align:top}}.empty{{padding:16px;background:#f7f8fa;color:#53606f}}
 </style></head><body><header><h1>[GTI Radar] Global Trade Intelligence</h1><p>{run_date} | Samsung Electronics Customs Executive Brief</p></header>
@@ -655,12 +668,14 @@ def main() -> int:
     run_date = args.date or now.strftime("%Y-%m-%d")
     print(f"[INFO] GTI STEP5 {ENGINE_VERSION} START")
     news = read_excel_safe(Path(args.news_input)); reg = read_excel_safe(Path(args.regulation_input))
-    news, stale = within_24h(news, now)
+    news, stale_news = within_24h(news, now)
     # Keep STEP4 exclusions until STEP5 classification. This permits the
     # narrow substantive-customs rescue rule while preserving genuine
     # administrative exclusions in the Excluded audit sheet.
     input_news_count = len(news)
     reg = normalize_regulation(reg)
+    reg, stale_reg = within_24h(reg, now)
+    stale = pd.concat([stale_news, stale_reg], ignore_index=True, sort=False)
     frames = [x for x in (reg, news) if not x.empty]
     rows = pd.concat(frames, ignore_index=True, sort=False) if frames else pd.DataFrame()
     if not rows.empty:
@@ -671,6 +686,14 @@ def main() -> int:
     old = pd.DataFrame() if args.preview else read_excel_safe(CUM_FILE)
     rows, historical_removed = remove_history(rows, old)
     rows = rows.reset_index(drop=True)
+    if not rows.empty:
+        summary_ok = rows.apply(lambda r: has_substantive_text(r.get("Summary"), r.get("Headline")), axis=1)
+        analysis_ok = rows.apply(lambda r: has_substantive_text(r.get("AI Analysis"), r.get("Headline")), axis=1)
+        quality_ok = summary_ok & analysis_ok
+        low_quality = rows.loc[~quality_ok].copy()
+        if not low_quality.empty:
+            print(f"[STEP5 CONTENT GUARD] excluded_title_only={len(low_quality)}")
+        rows = rows.loc[quality_ok].reset_index(drop=True)
     visible, layers = classify_report_layers(rows)
     health = health_summary()
     print(f"[STEP5 CONTRACT] news_input={input_news_count} / classified={len(news)} / excluded={len(layers['excluded'])} / stale={len(stale)}")
