@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-GTI STEP4-2 NEWS AI v47.0 THREE-GATE POLICY ENGINE
+GTI STEP4-2 NEWS AI v47.1 POLICY-EVENT QUALITY ENGINE
 - Input: 3-2.news_summary.xlsx
 - Strict published-date 24h guard
 - No legacy v18/v20/v23/v24 override chain
@@ -301,7 +301,10 @@ def event_only_noise(title: object, body: object = "") -> bool:
 
 
 def opinion_article(title: object) -> bool:
-    return any(term in clean(title).lower() for term in OPINION_TITLE_TERMS)
+    t = clean(title).lower()
+    return any(term in t for term in OPINION_TITLE_TERMS) or any(term in t for term in [
+        "why does everyone hate", "paul krugman", "역사적 배경", "1980년대", "1990년대",
+    ])
 
 
 def hard_scope_excluded(title: object) -> bool:
@@ -336,7 +339,16 @@ def business_scope_noise(title: object, text: object = "") -> bool:
         "협정문 개정", "원산지 규정 개정", "관세양허 변경", "서명", "비준", "발효",
         "rules of origin amended", "tariff schedule", "entered into force",
     ])
-    return tax_only or food_only or patent_only or labor_only or market_only or promotion_only
+    consumer_or_agri_only = any(x in t for x in [
+        "합성니코틴", "유사니코틴", "마운자로", "위고비", "농축산물", "농가경제",
+        "일본 농업", "유전자 변형 감자", "고용보험", "워크셰어링",
+        "benefit-processing", "service canada", "jewelers", "다이아몬드", "보석류",
+    ]) and not any(x in t for x in ["삼성전자", "samsung electronics"])
+    unrelated_vehicle_commentary = any(x in title_l for x in [
+        "현대차", "car problem is not a customs problem", "영국의 경고장",
+    ]) and not any(x in t for x in ["삼성전자", "samsung electronics", "반도체", "semiconductor"])
+    return (tax_only or food_only or patent_only or labor_only or market_only
+            or promotion_only or consumer_or_agri_only or unrelated_vehicle_commentary)
 
 
 def issue_specific_policy_signal(issue: object, text: object) -> bool:
@@ -424,6 +436,36 @@ def _event_anchor(row: pd.Series) -> str:
     issue = clean(row.get("Issue")).upper() or "OTHER"
     # High-frequency cross-publisher events: use policy-event identity rather
     # than the occasionally inconsistent upstream Issue label.
+    if all([
+        any(x in context for x in ["러시아", "russia"]),
+        any(x in context for x in ["이란", "iran", "원유", "oil", "natural gas"]),
+        any(x in context for x in ["100%", "100％", "secondary tariff", "제재법", "sanctions act"]),
+    ]):
+        return "EVENT|US_RUSSIA_IRAN_SECONDARY_TARIFF_100"
+    if all([
+        any(x in context for x in ["대미투자", "미국 투자", "u.s. investment", "us investment"]),
+        any(x in context for x in ["301조", "section 301", "232조", "section 232", "관세"]),
+        any(x in context for x in ["중간재", "자본재", "설비", "equipment", "capital goods"]),
+    ]):
+        return "EVENT|KR_US_INVESTMENT_301_232_COST"
+    if all([
+        any(x in context for x in ["트럼프", "미국", "u.s."]),
+        any(x in context for x in ["시진핑", "중국", "china"]),
+        any(x in context for x in ["정상회담", "회담", "summit", "관세 담판", "tariff negotiation"]),
+    ]):
+        return "EVENT|US_CHINA_SUMMIT_TARIFF_NEGOTIATION"
+    if all([
+        any(x in context for x in ["반도체", "semiconductor", "chip"]),
+        any(x in context for x in ["100%", "100％", "관세", "tariff"]),
+        any(x in context for x in ["미국 투자", "현지 생산", "local production", "invest"]),
+    ]):
+        return "EVENT|US_SEMICON_TARIFF_INVESTMENT_PRESSURE"
+    if all([
+        any(x in context for x in ["베트남", "vietnam"]),
+        any(x in context for x in ["수출통제", "전략물자", "export control"]),
+        any(x in context for x in ["hs코드", "hs code", "기술사양", "재수출", "환적", "re-export", "transshipment"]),
+    ]):
+        return "EVENT|VN_STRATEGIC_EXPORT_CONTROL"
     if any(x in context for x in ["멕시코", "mexico"]) and any(x in context for x in ["중국", "중국산", "china", "chinese"]) and any(x in context for x in ["관세", "tariff"]):
         return "EVENT|MEXICO_CHINA_ADDITIONAL_TARIFF"
     if any(x in context for x in ["h200", "엔비디아칩", "엔비디아 칩", "nvidia chip"]) and any(x in context for x in ["중국", "china", "中"]) and any(x in context for x in ["허용", "완화", "반입", "수입", "빗장 일부", "allow", "import"]):
@@ -1704,6 +1746,11 @@ def build() -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
         def _final_event_key(row: pd.Series) -> str:
             text = _post_text(row)
             rules = [
+                ("US_RUSSIA_IRAN_SECONDARY_TARIFF_100", [["러시아", "russia"], ["이란", "iran", "원유", "oil", "natural gas"], ["100%", "100％", "secondary tariff", "제재법", "sanctions act"]]),
+                ("KR_US_INVESTMENT_301_232_COST", [["대미투자", "미국 투자", "u.s. investment", "us investment"], ["301조", "section 301", "232조", "section 232", "관세"], ["중간재", "자본재", "설비", "equipment", "capital goods"]]),
+                ("US_CHINA_SUMMIT_TARIFF_NEGOTIATION", [["트럼프", "미국", "u.s."], ["시진핑", "중국", "china"], ["정상회담", "회담", "summit", "관세 담판", "tariff negotiation"]]),
+                ("US_SEMICON_TARIFF_INVESTMENT_PRESSURE", [["반도체", "semiconductor", "chip"], ["100%", "100％", "관세", "tariff"], ["미국 투자", "현지 생산", "local production", "invest"]]),
+                ("VN_STRATEGIC_EXPORT_CONTROL", [["베트남", "vietnam"], ["수출통제", "전략물자", "export control"], ["hs코드", "hs code", "기술사양", "재수출", "환적", "re-export", "transshipment"]]),
                 ("US_CHINA_30B_TARIFF_NEGOTIATION", [["300억달러", "30 billion", "$30 billion"], ["미중", "미·중", "미국", "중국", "u.s.", "china"], ["상호 관세", "관세인하", "관세 인하", "tariff reduction"]]),
                 ("KR_TBFC_TASK_FORCE", [["tbfc", "무역기반 재정", "무역기반 금융", "특별수사단", "특수단"], ["관세청", "관세 범죄", "시장교란", "부정수급"]]),
                 ("KR_CUSTOMS_PUBLIC_NOTICE_BILL", [["공시송달", "온라인 게시", "유니패스", "국가관세종합정보시스템"], ["관세법", "국세기본법", "조승래"]]),

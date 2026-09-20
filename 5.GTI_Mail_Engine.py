@@ -309,7 +309,7 @@ def write_xlsx(path: Path, rows: pd.DataFrame) -> None:
 # ---------------------------------------------------------------------------
 # v50 fixed-form executive report contract
 # ---------------------------------------------------------------------------
-ENGINE_VERSION = "v50.3 WATCH-REASON-REPAIR"
+ENGINE_VERSION = "v50.4 POLICY-EVENT-QUALITY"
 HEALTH_FILE = BASE / "1.site_crawl_health.xlsx"
 
 
@@ -325,6 +325,130 @@ def text_blob(df: pd.DataFrame) -> pd.Series:
     for col in cols:
         out = out + " " + df[col].fillna("").astype(str)
     return out.str.lower()
+
+
+def _row_native_text(row: pd.Series) -> str:
+    """Article-native text only; AI Summary/Analysis must not create relevance."""
+    return " ".join(s(row.get(c)) for c in [
+        "Headline", "Article Body Evidence", "Country", "Agency", "Source",
+    ]).lower()
+
+
+def _canonical_policy_family(row: pd.Series) -> str:
+    """Stable event identity across publishers and Korean/English headlines."""
+    t = _row_native_text(row)
+    rules = [
+        ("US_RUSSIA_IRAN_SECONDARY_TARIFF_100", [
+            ["러시아", "russia"], ["이란", "iran", "원유", "oil", "natural gas"],
+            ["100%", "100％", "secondary tariff", "제재법", "sanctions act"],
+        ]),
+        ("KR_US_INVESTMENT_301_232_COST", [
+            ["대미투자", "미국 투자", "u.s. investment", "us investment"],
+            ["301조", "section 301", "232조", "section 232", "관세"],
+            ["중간재", "자본재", "설비", "equipment", "capital goods"],
+        ]),
+        ("US_CHINA_SUMMIT_TARIFF_NEGOTIATION", [
+            ["트럼프", "미국", "u.s."], ["시진핑", "중국", "china"],
+            ["정상회담", "회담", "summit", "관세 담판", "tariff negotiation"],
+        ]),
+        ("US_SEMICON_TARIFF_INVESTMENT_PRESSURE", [
+            ["반도체", "semiconductor", "chip"], ["100%", "100％", "관세", "tariff"],
+            ["미국 투자", "현지 생산", "local production", "invest"],
+        ]),
+        ("VN_STRATEGIC_EXPORT_CONTROL", [
+            ["베트남", "vietnam"], ["수출통제", "전략물자", "export control"],
+            ["hs코드", "hs code", "기술사양", "재수출", "환적", "re-export", "transshipment"],
+        ]),
+    ]
+    for key, groups in rules:
+        if all(any(term in t for term in group) for group in groups):
+            return key
+    existing = s(row.get("EventKey")) or s(row.get("Cluster"))
+    if existing and not existing.upper().startswith("AUTO_"):
+        return existing.casefold()
+    title = re.sub(r"[^0-9a-z가-힣%]+", " ", s(row.get("Headline")).lower())
+    return "title:" + " ".join(title.split()[:14])
+
+
+def _context_noise(row: pd.Series) -> bool:
+    """Remove non-policy/background noise from the visible report, not Excel audit."""
+    t = _row_native_text(row)
+    title = s(row.get("Headline")).lower()
+    samsung_named = bool(re.search(r"삼성전자|samsung electronics|samsung semiconductor", t, re.I))
+    current_measure = bool(re.search(
+        r"시행|발효|부과|인상|인하|철회|폐지|개정|조사\s*개시|예비판정|최종판정|"
+        r"입법예고|행정예고|고시|공고|명령|지정|금지|강화|완화|"
+        r"effective|entered into force|imposed|amended|investigation initiated|"
+        r"preliminary determination|final determination|official notice|executive order",
+        t, re.I,
+    ))
+    hard_noise = bool(re.search(
+        r"합성니코틴|유사니코틴|마운자로|위고비|농축산물|농가경제|일본\s*농업|"
+        r"쌀|사과|유전자\s*변형\s*감자|고용보험|워크셰어링|benefit-processing|"
+        r"service canada|현대차|자동차\s*문제|car\s+problem|jewelers|보석|다이아몬드",
+        t, re.I,
+    ))
+    opinion_or_history = bool(re.search(
+        r"paul krugman|why does everyone hate|\[칼럼|\[기고|\[사설|오피니언|"
+        r"1980년대|1990년대|역사적\s*배경|historical background",
+        t, re.I,
+    ))
+    employment_support = "tariff support" in t and not current_measure
+    return (hard_noise or opinion_or_history or employment_support) and not samsung_named
+
+
+def _samsung_watch_scope(row: pd.Series) -> bool:
+    """Require a plausible Samsung customs route, not a product buzzword alone."""
+    t = _row_native_text(row)
+    samsung_named = bool(re.search(r"삼성전자|samsung electronics|samsung semiconductor", t, re.I))
+    customs = bool(re.search(
+        r"관세|통관|품목분류|원산지|수출통제|전략물자|반덤핑|상계관세|cbam|"
+        r"tariff|customs|hs\s*code|rules of origin|export control|anti-dumping|countervailing",
+        t, re.I,
+    ))
+    electronics = bool(re.search(
+        r"반도체|semiconductor|메모리|chip|스마트폰|smartphone|휴대폰|display|oled|"
+        r"가전|전자제품|electronics|네트워크장비|배터리|battery",
+        t, re.I,
+    ))
+    route = bool(re.search(
+        r"미국\s*투자|현지\s*생산|한국.{0,20}미국|베트남|vietnam|재수출|환적|"
+        r"수입|수출|import|export|re-export|transshipment|local production",
+        t, re.I,
+    ))
+    strategic_country_control = bool(re.search(r"베트남|vietnam", t, re.I)) and bool(
+        re.search(r"수출통제|전략물자|export control", t, re.I)
+    )
+    return customs and (samsung_named or (electronics and route) or strategic_country_control)
+
+
+def _collapse_policy_events(d: pd.DataFrame) -> pd.DataFrame:
+    if d.empty:
+        return d
+    out = d.copy()
+    out["_quality_family"] = out.apply(_canonical_policy_family, axis=1)
+    out["_official_rank2"] = (
+        out.get("OfficialSourceStatus", pd.Series("", index=out.index))
+        .fillna("").astype(str).str.upper().eq("VERIFIED_EXACT").astype(int)
+    )
+    out["_body_rank2"] = yn(out, "Body Verified").astype(int)
+    out = out.sort_values(
+        ["_quality_family", "_official_rank2", "_body_rank2", "_score"],
+        ascending=[True, False, False, False], kind="stable",
+    )
+    kept = []
+    for _, group in out.groupby("_quality_family", sort=False, dropna=False):
+        rep = group.iloc[0].copy()
+        headlines = [s(x) for x in group.get("Headline", pd.Series(dtype=str)) if s(x)]
+        urls = [s(x) for x in group.get("URL", pd.Series(dtype=str)) if s(x)]
+        rep["EventDuplicateCount"] = max(
+            int(pd.to_numeric(group.get("EventDuplicateCount", 0), errors="coerce").fillna(0).sum()),
+            len(group) - 1,
+        )
+        rep["AlternateHeadlines"] = " | ".join(dict.fromkeys(headlines))
+        rep["AlternateURLs"] = " | ".join(dict.fromkeys(urls))
+        kept.append(rep)
+    return pd.DataFrame(kept).drop(columns=["_official_rank2", "_body_rank2"], errors="ignore")
 
 
 def classify_report_layers(rows: pd.DataFrame) -> tuple[pd.DataFrame, dict[str, pd.DataFrame]]:
@@ -397,6 +521,13 @@ def classify_report_layers(rows: pd.DataFrame) -> tuple[pd.DataFrame, dict[str, 
     has_family = d["_family"].astype(str).str.strip().ne("")
     family_rows = d[has_family].drop_duplicates("_family", keep="first")
     d = pd.concat([family_rows, d[~has_family]], axis=0).sort_values("_score", ascending=False, kind="stable")
+    # Cross-publisher event identity is re-evaluated after STEP4 enrichment.
+    # This prevents the same policy from occupying several report rows merely
+    # because publishers used different titles or country strings.
+    before_event_collapse = len(d)
+    d = _collapse_policy_events(d).reset_index(drop=True)
+    if len(d) != before_event_collapse:
+        print(f"[STEP5 EVENT DEDUP] {before_event_collapse} -> {len(d)} / removed={before_event_collapse-len(d)}")
     blob = text_blob(d)
     native = pd.Series("", index=d.index)
     for col in ["Headline", "Direct Evidence", "Article Body Evidence", "Country", "Agency"]:
@@ -408,13 +539,7 @@ def classify_report_layers(rows: pd.DataFrame) -> tuple[pd.DataFrame, dict[str, 
     trade = yn(d, "SamsungTradeGateFlag")
     direct = yn(d, "DirectConfirmedFlag") | trade
 
-    samsung_scope = native.str.contains(
-        r"삼성전자|samsung electronics|반도체|semiconductor|디스플레이|스마트폰|휴대폰|가전|네트워크장비|"
-        r"품목번호\s*연계표|한.?미\s*품목번호|메르코수르.{0,20}싱가포르|싱가포르.{0,20}메르코수르|"
-        r"외국환거래규정|수출입대금|납세신고\s*정정|수입신고\s*정정|전자문서\s*변경|5fe|5fk|"
-        r"통관지원|세관상호지원|관세협력|합동단속|위조상품|국경단계|지식재산권\s*보호",
-        regex=True, na=False,
-    )
+    samsung_scope = d.apply(_samsung_watch_scope, axis=1)
     declared_excluded = d["ReportLayer"].astype(str).str.upper().eq("EXCLUDED") | d.get("DecisionStatus", "").astype(str).str.lower().eq("excluded")
     substantive_customs = native.str.contains(
         r"통관지원|통관\s*지원|세관상호지원|세관\s*상호지원|관세협력|관세\s*협력|"
@@ -435,7 +560,8 @@ def classify_report_layers(rows: pd.DataFrame) -> tuple[pd.DataFrame, dict[str, 
     d.loc[rescued_customs, "Missing Facts"] = (
         "공식 MOU·협정 원문 | 대상 품목·법인 | 적용 시점 | 통관지원 연락창구·단속 절차"
     )
-    excluded_mask = (declared_excluded & ~substantive_customs) | administrative_only
+    context_noise = d.apply(_context_noise, axis=1)
+    excluded_mask = (declared_excluded & ~substantive_customs) | administrative_only | context_noise
     action_mask = ~excluded_mask & delta & evidence & direct
     core_mask = ~excluded_mask & ~action_mask & delta & evidence
     watch_mask = ~excluded_mask & ~action_mask & ~core_mask & samsung_scope
@@ -460,7 +586,7 @@ def classify_report_layers(rows: pd.DataFrame) -> tuple[pd.DataFrame, dict[str, 
         frame["ReportSection"] = layer
         frame["DecisionStatus"] = status
     visible = pd.concat([action, core, watch, context], ignore_index=True, sort=False)
-    helper_cols = ["_score", "_family", "_evidence_rank", "_delta_rank"]
+    helper_cols = ["_score", "_family", "_evidence_rank", "_delta_rank", "_quality_family"]
     visible = visible.drop(columns=helper_cols, errors="ignore")
     layers = {"action": action.drop(columns=helper_cols, errors="ignore"),
               "core": core.drop(columns=helper_cols, errors="ignore"),
@@ -531,6 +657,19 @@ def conclusion_lines(layers: dict[str, pd.DataFrame], health: dict[str, int]) ->
         line2 += "."
     else:
         line2 = "금일 보고기준을 충족한 신규 관세·통상 동향은 없습니다."
+    if len(context):
+        context_names = [
+            concise(x, 46)
+            for x in context.get("Headline", pd.Series(dtype=str)).dropna().astype(str).head(2)
+            if s(x)
+        ]
+        line_context = f"글로벌 관세·통상 동향은 총 {len(context)}건이며"
+        if context_names:
+            line_context += ", 주요 이슈는 " + " / ".join(context_names) + "입니다."
+        else:
+            line_context += " 후속 정책 발표 여부를 모니터링하고 있습니다."
+    else:
+        line_context = "금일 추가로 확인된 글로벌 관세·통상 동향은 없습니다."
     if len(action):
         line3 = "HQ Customs는 직접 영향 항목의 대상법인·품목·거래경로와 실행기한을 즉시 확정해야 합니다."
     elif len(core) or len(watch):
@@ -539,7 +678,7 @@ def conclusion_lines(layers: dict[str, pd.DataFrame], health: dict[str, int]) ->
         line3 = "HQ Customs는 전망성 보도를 확정 정책과 구분하고 공식 발표 여부만 후속 확인해야 합니다."
     else:
         line3 = "기존 고위험 정책의 변동 여부와 수집 실패 사이트를 계속 확인해야 합니다."
-    return [line1, line2, line3]
+    return [line1, line2, line_context, line3]
 
 
 def summary_counter(layers: dict[str, pd.DataFrame], health: dict[str, int]) -> str:
@@ -666,6 +805,12 @@ def main() -> int:
     now_text = os.getenv("GTI_NOW", "").strip()
     now = datetime.fromisoformat(now_text) if now_text else datetime.now()
     run_date = args.date or now.strftime("%Y-%m-%d")
+    output_dir = Path(args.output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+    stem = f"[GTI Radar] Global Trade Intelligence({run_date})"
+    html_path = output_dir / f"{stem}.html"
+    xlsx_path = output_dir / f"{stem}.xlsx"
+    same_day_rerun = not args.preview and (html_path.exists() or xlsx_path.exists())
     print(f"[INFO] GTI STEP5 {ENGINE_VERSION} START")
     news = read_excel_safe(Path(args.news_input)); reg = read_excel_safe(Path(args.regulation_input))
     news, stale_news = within_24h(news, now)
@@ -684,7 +829,11 @@ def main() -> int:
             rows["ExecutiveScore"] = pd.to_numeric(rows.get("Importance Score", 0), errors="coerce").fillna(0)
         rows = rows.sort_values("ExecutiveScore", ascending=False, kind="stable").drop_duplicates("EventKey", keep="first")
     old = pd.DataFrame() if args.preview else read_excel_safe(CUM_FILE)
-    rows, historical_removed = remove_history(rows, old)
+    if same_day_rerun:
+        historical_removed = 0
+        print(f"[STEP5 RERUN] existing {run_date} output detected; same-day history suppression bypassed")
+    else:
+        rows, historical_removed = remove_history(rows, old)
     rows = rows.reset_index(drop=True)
     if not rows.empty:
         summary_ok = rows.apply(lambda r: has_substantive_text(r.get("Summary"), r.get("Headline")), axis=1)
@@ -698,8 +847,6 @@ def main() -> int:
     health = health_summary()
     print(f"[STEP5 CONTRACT] news_input={input_news_count} / classified={len(news)} / excluded={len(layers['excluded'])} / stale={len(stale)}")
     print(f"[STEP5 LIVE NOVELTY] removed={historical_removed} / report={len(visible)} / forced_fill=0")
-    output_dir = Path(args.output_dir); output_dir.mkdir(parents=True, exist_ok=True)
-    stem = f"[GTI Radar] Global Trade Intelligence({run_date})"; html_path = output_dir / f"{stem}.html"; xlsx_path = output_dir / f"{stem}.xlsx"
     body = build_html_v50(layers, run_date, health); html_path.write_text(body, encoding="utf-8"); write_xlsx_v50(xlsx_path, visible, layers, health)
     if not args.preview:
         cumulative = pd.concat([old, visible], ignore_index=True, sort=False)
