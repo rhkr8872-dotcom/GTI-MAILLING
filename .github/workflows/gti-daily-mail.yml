@@ -2,8 +2,8 @@ name: GTI Daily Mail
 
 on:
   schedule:
-    # UTC 20:00 = KST 05:00 (next day)
-    - cron: "0 20 * * *"
+    # UTC 19:17 = KST 04:17 (next day)
+    - cron: "17 19 * * *"
   workflow_dispatch:
     inputs:
       send_email:
