@@ -7,3 +7,5 @@ lxml
 feedparser
 python-dateutil
 scikit-learn
+google-genai
+pydantic
