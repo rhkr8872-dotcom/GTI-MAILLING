@@ -2,8 +2,8 @@ name: GTI Daily Mail
 
 on:
   schedule:
-    # UTC 16:41 = KST 01:41 (next day)
-    - cron: "41 16 * * *"
+    # UTC 20:00 = KST 05:00 (next day)
+    - cron: "0 20 * * *"
   workflow_dispatch:
     inputs:
       send_email:
@@ -117,11 +117,23 @@ jobs:
       - name: Validate required settings
         shell: pwsh
         run: |
-          $requiredFiles = @("C:\temp\7.run_gti_pipeline.py")
+          $requiredFiles = @(
+            "C:\temp\1.site_crawler.py",
+            "C:\temp\3-1.regulation_merge.py",
+            "C:\temp\3-2.news_merge.py",
+            "C:\temp\4-1.regulation_ai_analysis.py",
+            "C:\temp\4-2.news_ai_analysis.py",
+            "C:\temp\5.GTI_Mail_Engine.py",
+            "C:\temp\7.run_gti_pipeline.py",
+            "C:\temp\gti_report_window.py",
+            "C:\temp\gti_quality_contract.py"
+          )
           $missingFiles = $requiredFiles | Where-Object { -not (Test-Path $_) }
           if ($missingFiles) {
             throw "Missing required file(s): $($missingFiles -join ', ')"
           }
+
+          python -c "import sys; sys.path.insert(0, r'C:\temp'); import gti_report_window, gti_quality_contract; print('GTI shared modules OK:', gti_quality_contract.VERSION)"
 
           $requiredSecrets = @(
             "NAVER_CLIENT_ID",
