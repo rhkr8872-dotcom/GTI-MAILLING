@@ -11,6 +11,8 @@ from urllib.parse import parse_qsl, quote, unquote, urlencode, urlparse, urlunpa
 
 import pandas as pd
 
+from gti_report_window import kst_now
+
 BASE_DIR = Path(os.getenv('GTI_BASE_DIR', r'C:\Temp'))
 INPUT_FILE = BASE_DIR / '1-1.regulation_raw.xlsx'
 KEYWORD_FILE = BASE_DIR / 'keyword.xlsx'
@@ -816,7 +818,7 @@ def safe_write(path: Path, df: pd.DataFrame):
         print(f'[WARN] locked: {path.name} -> {alt.name}')
 
 def main():
-    print('GTI v6.1 STEP3-1 DGFT-STABLE IDENTITY START')
+    print('GTI v6.2 STEP3-1 KST-ZERO-ROW-SAFE IDENTITY START')
     if not INPUT_FILE.exists():
         raise FileNotFoundError(INPUT_FILE)
 
@@ -887,7 +889,7 @@ def main():
                   else ('STRONG_CUSTOMS_RULE' if strong_rel
                         else ('TITLE_KEYWORD' if hits else ('AI_CUSTOMS_YES' if ai_rel else 'REJECT'))))
         )
-        r['CheckedAt'] = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+        r['CheckedAt'] = kst_now().strftime('%Y-%m-%d %H:%M:%S')
         mapping_type, mapping_status, entity_direct = regulation_mapping_type(r, title)
         r['RegulationMappingType'] = mapping_type
         r['MappingStatus'] = mapping_status
@@ -933,7 +935,7 @@ def main():
 
     if not sel.empty:
         sel = same_day_dedup(sel)
-        report_day = datetime.now().date()
+        report_day = kst_now().date()
         old_urls, old_event_keys, old_fingerprints = historical_keys(report_day, clean_old)
         sel['EventType'] = sel['Headline'].apply(regulation_event_type)
         sel['EventKey'] = sel.apply(regulation_event_key, axis=1)
@@ -977,9 +979,31 @@ def main():
         combined = combined.drop_duplicates('_event_key', keep='first')
         combined = combined.drop(columns=['_url_key','_event_key','_date_sort'], errors='ignore')
 
-    safe_write(OUT_SUMMARY, today.drop(columns=['_url','_title'], errors='ignore'))
-    safe_write(OUT_ARTICLE, today.drop(columns=['_url','_title'], errors='ignore'))
-    safe_write(OUT_CUMULATIVE, combined.drop(columns=['_url','_title'], errors='ignore'))
+    # A day with zero new regulations is a valid business result.  Preserve
+    # the workbook schema so the pipeline can distinguish ZERO_NEW from a
+    # corrupt/blank Excel file and STEP4 can safely read it.
+    internal_cols = {'_url', '_title'}
+    base_schema = [c for c in aud.columns if c not in internal_cols]
+    for c in [
+        'EventType', 'EventKey', 'HistoricalDuplicateReason',
+        'HistoricalDuplicate', 'original_url', 'article_body',
+        'article_extract_status',
+    ]:
+        if c not in base_schema:
+            base_schema.append(c)
+
+    def schema_safe(frame: pd.DataFrame) -> pd.DataFrame:
+        out = frame.drop(columns=list(internal_cols), errors='ignore').copy()
+        if out.empty:
+            return out.reindex(columns=base_schema)
+        for col in base_schema:
+            if col not in out.columns:
+                out[col] = ''
+        return out
+
+    safe_write(OUT_SUMMARY, schema_safe(today))
+    safe_write(OUT_ARTICLE, schema_safe(today))
+    safe_write(OUT_CUMULATIVE, schema_safe(combined))
     safe_write(OUT_EXCLUDED, exc.drop(columns=['_url','_title'], errors='ignore'))
     safe_write(OUT_AUDIT, aud.drop(columns=['_url','_title'], errors='ignore'))
     if not cumulative_removed.empty:
@@ -987,7 +1011,7 @@ def main():
         safe_write(cumulative_removed_path, cumulative_removed)
 
     print(f'[STEP3-1] raw={len(raw)} selected={len(sel)} new={len(today)} excluded={len(exc)} cumulative={len(combined)}')
-    print('GTI v6.1 STEP3-1 DGFT-STABLE IDENTITY DONE')
+    print('GTI v6.2 STEP3-1 KST-ZERO-ROW-SAFE IDENTITY DONE')
 
 if __name__ == '__main__':
     main()

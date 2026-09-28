@@ -20,7 +20,7 @@ from pathlib import Path
 import pandas as pd
 
 from gti_quality_contract import apply_quality_contract, VERSION as CONTRACT_VERSION
-from gti_report_window import previous_kst_day_mask
+from gti_report_window import kst_now, previous_kst_day_mask
 
 
 BASE = Path(os.getenv("GTI_BASE_DIR", r"C:\Temp"))
@@ -307,7 +307,7 @@ def write_xlsx(path: Path, rows: pd.DataFrame) -> None:
 # ---------------------------------------------------------------------------
 # v50 fixed-form executive report contract
 # ---------------------------------------------------------------------------
-ENGINE_VERSION = "v50.6 KST-PRIOR-DAY-QUALITY"
+ENGINE_VERSION = "v50.8 KST-AWARE-ZERO-ROW-SAFE"
 HEALTH_FILE = BASE / "1.site_crawl_health.xlsx"
 
 
@@ -818,8 +818,10 @@ def main() -> int:
     ap = argparse.ArgumentParser(); ap.add_argument("--preview", action="store_true"); ap.add_argument("--no-email", action="store_true"); ap.add_argument("--date")
     ap.add_argument("--regulation-input", default=str(REG_FILE)); ap.add_argument("--news-input", default=str(NEWS_FILE)); ap.add_argument("--output-dir", default=str(OUT_DIR))
     args = ap.parse_args()
-    now_text = os.getenv("GTI_NOW", "").strip()
-    now = datetime.fromisoformat(now_text) if now_text else datetime.now()
+    # GitHub-hosted Windows runners use UTC.  datetime.now() is naive there
+    # and was previously misread as KST, shifting the report window back one
+    # extra day and marking all valid prior-KST-day rows as stale.
+    now = kst_now()
     run_date = args.date or now.strftime("%Y-%m-%d")
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)

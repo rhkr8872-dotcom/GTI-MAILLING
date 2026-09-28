@@ -7,7 +7,7 @@ from urllib.parse import urlparse
 import pandas as pd
 
 
-VERSION = "2026.09.07-gold1"
+VERSION = "2026.09.23-gold4"
 
 
 def _s(value) -> str:
@@ -59,7 +59,11 @@ def classify_nature(row: pd.Series) -> str:
     if _has(t, "차업계", "車업계", "자동차", "중국차", "하이브리드", "드론", "ai칩 지정학", "무역 적자"):
         return "INDUSTRY_ANALYSIS"
     concrete = _has(x, "시행", "발효", "부과", "관세율", "고시", "circular no.", "effective", "entered into force")
-    proposal = _has(x, "검토", "압박", "예고", "추진", "가능성", "proposal", "consider", "would impose")
+    proposal = _has(
+        x, "검토", "압박", "예고", "추진", "가능성", "기본 합의", "실질적 합의",
+        "협상 마무리", "proposal", "consider", "would impose", "agreement reached",
+        "substantial agreement",
+    )
     if concrete:
         return "POLICY_MEASURE"
     if proposal:
@@ -69,6 +73,18 @@ def classify_nature(row: pd.Series) -> str:
 
 def event_key(row: pd.Series) -> str:
     x, t = _native(row), _title(row)
+    if _has(x, "필리핀", "philippines") and _has(x, "eu", "유럽연합") and _has(x, "fta", "자유무역협정"):
+        return "EU_PHILIPPINES_FTA_NEGOTIATION_2026"
+    if _has(x, "eu customs reform", "eu 관세 개혁", "통합 관세 코드", "union customs code"):
+        return "EU_CUSTOMS_REFORM_EFFECTIVE_2026"
+    if _has(x, "변압기", "transformer") and _has(x, "철심", "코어", "core") and _has(x, "세이프가드", "safeguard"):
+        return "EU_TRANSFORMER_CORE_SAFEGUARD_2026"
+    if _has(x, "신고 포상금", "신고포상금") and _has(x, "상한", "내부 신고", "내부신고"):
+        return "KR_CUSTOMS_REPORTING_REWARD_REFORM_2026"
+    if _has(x, "cptpp") and _has(x, "제주", "농어민", "농수산"):
+        return "KR_CPTPP_JEJU_AGRI_OPPOSITION_2026"
+    if _has(x, "이차전지") and _has(x, "우회수출", "불법 수출", "불법수출", "4800억", "4천800억"):
+        return "KR_BATTERY_TRANSSHIPMENT_ENFORCEMENT_2026"
     # Headline anchors win over incidental background references in the body.
     if _has(t, "현대제철", "포스코", "제철소", "고부가 철강"):
         return "US_KR_STEEL_LOUISIANA"
@@ -96,7 +112,12 @@ def event_key(row: pd.Series) -> str:
 
 
 def policy_family(row: pd.Series) -> str:
-    x = _native(row)
+    x, t = _native(row), _title(row)
+    if _has(t, "신고 포상금", "신고포상금"): return "CUSTOMS_PROCEDURE"
+    if _has(t, "라면", "식품안전", "수산물") and not _has(t, "관세", "tariff"): return "OTHER"
+    if _has(t, "cptpp", "fta", "자유무역협정"): return "ORIGIN_FTA"
+    if _has(t, "세이프가드", "safeguard", "반덤핑", "anti-dumping", "countervailing"): return "TRADE_REMEDY"
+    if _has(t, "우회수출", "불법 수출", "수출통제", "export control"): return "EXPORT_CONTROL"
     if _has(x, "반도체", "semiconductor") and _has(x, "관세", "tariff"): return "SEMICONDUCTOR_TARIFF"
     if _has(x, "smart border", "스마트 국경", "통관", "customs"): return "CUSTOMS_PROCEDURE"
     if _has(x, "원산지", "origin", "환적", "transshipment"): return "ORIGIN_TRANSshipment"
